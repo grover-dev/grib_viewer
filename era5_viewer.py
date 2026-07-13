@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 import warnings
 from dataclasses import dataclass, field
 
@@ -47,7 +48,13 @@ def use_interactive_backend() -> None:
 
 
 import matplotlib.pyplot as plt  # noqa: E402  (after backend selection helper)
-from matplotlib.widgets import Button, RadioButtons, Slider  # noqa: E402
+from matplotlib.widgets import (  # noqa: E402
+    Button,
+    CheckButtons,
+    RadioButtons,
+    RectangleSelector,
+    Slider,
+)
 
 Y_NAMES = ("latitude", "lat", "y")
 X_NAMES = ("longitude", "lon", "x")
@@ -190,8 +197,12 @@ def build_layer(key: str, da: xr.DataArray) -> Layer:
 # ---------------------------------------------------------------------------
 
 
-def load_grib(path: str) -> dict[str, xr.DataArray]:
+def open_grib(path: str) -> dict[str, xr.DataArray]:
     """Flatten a GRIB into {name: DataArray(time, y, x)}, keeping every field.
+
+    Nothing is read here beyond the GRIB index and coordinates: the arrays come
+    back lazily-indexed, so this stays cheap even on a multi-GB file. That is
+    what lets us show the user the time axis *before* committing to loading it.
 
     A single GRIB can hold incompatible hypercubes (different level types or
     step conventions), so cfgrib returns a *list* of datasets; we take the
@@ -227,12 +238,21 @@ def load_grib(path: str) -> dict[str, xr.DataArray]:
                     sub.attrs = dict(da.attrs)
                     fields[f"{name}_{tag}"] = sub
 
-    # Derived wind speed for any u/v pair present (u10/v10, u100/v100, u/v, ...)
+    if not fields:
+        raise SystemExit(f"No (time, y, x) fields found in {path}")
+    return fields
+
+
+def derive_fields(fields: dict[str, xr.DataArray]) -> dict[str, xr.DataArray]:
+    """Add wind speed for any u/v pair present (u10/v10, u100/v100, u/v, ...).
+
+    Runs *after* time subsetting: np.hypot forces the arrays into memory, so
+    doing it on the full cube would defeat the point of asking the user what to
+    load.
+    """
     for uname in list(fields):
-        if not uname.startswith("u"):
-            continue
         vname = "v" + uname[1:]
-        if vname not in fields:
+        if not uname.startswith("u") or vname not in fields:
             continue
         ws = np.hypot(fields[uname], fields[vname])
         ws.attrs = {
@@ -240,10 +260,107 @@ def load_grib(path: str) -> dict[str, xr.DataArray]:
             "units": fields[uname].attrs.get("units", "m s**-1"),
         }
         fields[f"ws{uname[1:]}"] = ws
-
-    if not fields:
-        raise SystemExit(f"No (time, y, x) fields found in {path}")
     return fields
+
+
+# ---------------------------------------------------------------------------
+# Time selection — what to load, decided before anything is read
+# ---------------------------------------------------------------------------
+
+
+def available_times(fields: dict[str, xr.DataArray]) -> np.ndarray:
+    """Every valid time present in the file, across all fields."""
+    return np.unique(np.concatenate([f["time"].values for f in fields.values()]))
+
+
+def estimate_bytes(fields: dict[str, xr.DataArray], n_times: int) -> int:
+    """Rough RAM cost of loading n_times steps of every field."""
+    return sum(
+        int(np.prod([s for d, s in f.sizes.items() if d != "time"])) * n_times * f.dtype.itemsize
+        for f in fields.values()
+    )
+
+
+def subset_times(
+    fields: dict[str, xr.DataArray], start, end, stride: int = 1
+) -> dict[str, xr.DataArray]:
+    """Restrict every field to [start, end] (inclusive) with an optional stride.
+
+    Fields whose axes differ are each sliced on their own time coordinate, so a
+    field offset from the others still lands in the requested window.
+    """
+    out = {}
+    for k, f in fields.items():
+        sel = f.sel(time=slice(start, end))
+        if stride > 1:
+            sel = sel.isel(time=slice(None, None, stride))
+        if sel.sizes.get("time", 0):
+            out[k] = sel
+    if not out:
+        raise SystemExit(f"No data in the window {start} .. {end}")
+    return out
+
+
+def subset_area(fields: dict[str, xr.DataArray], bbox: tuple | None) -> dict[str, xr.DataArray]:
+    """Crop every field to bbox = (west, east, south, north), in degrees.
+
+    Latitude is sliced in whatever direction the grid actually scans (ERA5 runs
+    north -> south), since xarray's slice() follows coordinate order, not value
+    order — slicing (south, north) against a descending axis returns nothing.
+    """
+    if bbox is None:
+        return fields
+    west, east, south, north = bbox
+    out = {}
+    for k, f in fields.items():
+        ydim = next(d for d in f.dims if d in Y_NAMES)
+        xdim = next(d for d in f.dims if d in X_NAMES)
+        lat = f[ydim].values
+        ysel = slice(north, south) if lat[0] > lat[-1] else slice(south, north)
+        sel = f.sel({ydim: ysel, xdim: slice(west, east)})
+        if sel.sizes[ydim] and sel.sizes[xdim]:
+            out[k] = sel
+    if not out:
+        raise SystemExit(f"No data inside bbox {bbox}")
+    return out
+
+
+def _fmt(t) -> str:
+    return np.datetime_as_string(t, unit="m") + "Z"
+
+
+def choose_window(fields: dict[str, xr.DataArray], times: np.ndarray) -> tuple:
+    """Interactive prompt: how much of the time axis should we actually load?"""
+    full = estimate_bytes(fields, len(times)) / 1e9
+    print(f"\n  {len(fields)} fields: {', '.join(sorted(fields))}")
+    print(f"  {len(times)} time steps: {_fmt(times[0])} .. {_fmt(times[-1])}")
+    print(f"  loading all of it costs roughly {full:.2f} GB of RAM\n")
+    print("  [a] load all")
+    print("  [r] load a range")
+    print("  [n] load every Nth step (thin the whole run)")
+
+    choice = input("\n  choose [a/r/n] (default a): ").strip().lower() or "a"
+
+    if choice == "n":
+        stride = max(1, int(input("  keep every Nth step, N = ").strip() or 1))
+        return times[0], times[-1], stride
+
+    if choice == "r":
+        print(f"\n  enter times as YYYY-MM-DD[THH:MM]; blank = keep the end of the range")
+        s = input(f"  start [{_fmt(times[0])}]: ").strip()
+        e = input(f"  end   [{_fmt(times[-1])}]: ").strip()
+        start = np.datetime64(s) if s else times[0]
+        end = np.datetime64(e) if e else times[-1]
+        if end < start:
+            raise SystemExit("end is before start")
+        kept = int(((times >= start) & (times <= end)).sum())
+        if not kept:
+            raise SystemExit(f"no steps between {_fmt(start)} and {_fmt(end)}")
+        cost = estimate_bytes(fields, kept) / 1e9
+        print(f"\n  -> {kept} steps, roughly {cost:.2f} GB")
+        return start, end, 1
+
+    return times[0], times[-1], 1
 
 
 # ---------------------------------------------------------------------------
@@ -258,8 +375,23 @@ class Player:
         start_var: str | None,
         quiver: bool,
         basemap: bool = True,
+        global_colors: bool = False,
+        chrome: bool = True,
     ):
-        self.layers = {k: build_layer(k, v) for k, v in sorted(fields.items())}
+        # chrome=False builds an export-only figure: map, title, colorbar and
+        # nothing else. The widgets would otherwise be baked into every frame of
+        # a saved video, frozen and useless.
+        self.chrome = chrome
+        # Keep the uncropped fields: every zoom re-crops from these, so repeated
+        # zooms don't compound, and zooming back out is lossless.
+        self.source = dict(sorted(fields.items()))
+        self.global_colors = global_colors
+        self.bbox = None
+
+        self.layers = {k: build_layer(k, v) for k, v in self.source.items()}
+        # Colour limits over the whole domain, kept for --global-colors so the
+        # scale doesn't shift under you when you zoom.
+        self.full_limits = {k: (lay.vmin, lay.vmax) for k, lay in self.layers.items()}
         self.keys = list(self.layers)
         self.key = start_var if start_var in self.layers else self.keys[0]
         self.frame = 0
@@ -291,7 +423,8 @@ class Player:
         self.fig = plt.figure(figsize=(13, 7))
         self.fig.canvas.manager.set_window_title("ERA5 viewer")
 
-        rect = (0.26, 0.16, 0.70, 0.76)
+        # no widgets to make room for -> give the map the whole frame
+        rect = (0.26, 0.16, 0.70, 0.76) if chrome else (0.06, 0.05, 0.86, 0.88)
         self.crs = ccrs.PlateCarree() if basemap else None
         self.ax = self.fig.add_axes(rect, projection=self.crs) if basemap \
             else self.fig.add_axes(rect)
@@ -312,6 +445,9 @@ class Player:
         self._relabel()
 
         # --- widgets -----------------------------------------------------
+        if not chrome:
+            return
+
         h = min(0.62, 0.035 * len(self.keys) + 0.04)
         ax_radio = self.fig.add_axes((0.01, 0.92 - h, 0.22, h))
         ax_radio.set_title("variable", fontsize=9)
@@ -333,8 +469,67 @@ class Player:
         self.btn = Button(self.fig.add_axes((0.88, 0.06, 0.08, 0.05)), "▶ play")
         self.btn.on_clicked(self.toggle)
 
+        self.btn_reset = Button(self.fig.add_axes((0.88, 0.005, 0.08, 0.045)), "⤢ reset zoom")
+        self.btn_reset.label.set_fontsize(7)
+        self.btn_reset.on_clicked(lambda _e: self.set_bbox(None))
+
+        # Colour limits: re-fit to the zoomed area (default), or pin to the
+        # full domain so the scale stays comparable across zooms.
+        ax_check = self.fig.add_axes((0.01, 0.16, 0.22, 0.06))
+        ax_check.set_frame_on(False)
+        self.check = CheckButtons(ax_check, ["global colors"], [self.global_colors])
+        for lbl in self.check.labels:
+            lbl.set_fontsize(8)
+        self.check.on_clicked(self.toggle_global_colors)
+
+        # Drag a box on the map to crop the data to it.
+        self.selector = RectangleSelector(
+            self.ax, self._on_select, useblit=False, button=[1],
+            minspanx=0.5, minspany=0.5, spancoords="data", interactive=False,
+            props=dict(facecolor="none", edgecolor="yellow", linewidth=1.4),
+        )
+
         self.timer = self.fig.canvas.new_timer(interval=120)
         self.timer.add_callback(self.tick)
+
+    # -- zoom -------------------------------------------------------------
+    def toggle_global_colors(self, _label):
+        """Flip between full-domain and visible-area colour limits, in place."""
+        self.global_colors = not self.global_colors
+        self.set_bbox(self.bbox)  # rebuild layers under the new limit policy
+
+    def _on_select(self, eclick, erelease):
+        west, east = sorted((eclick.xdata, erelease.xdata))
+        south, north = sorted((eclick.ydata, erelease.ydata))
+        self.set_bbox((west, east, south, north))
+
+    def set_bbox(self, bbox: tuple | None):
+        """Re-crop the data to bbox (None = full domain) and redraw.
+
+        The crop is applied to the *source* arrays and the layers rebuilt, so
+        this genuinely narrows what gets rendered — not just the axis limits.
+        """
+        self.bbox = bbox
+        cropped = subset_area(self.source, bbox)
+        self.layers = {k: build_layer(k, v) for k, v in cropped.items()}
+        if self.global_colors:  # keep the full-domain scale
+            for k, lay in self.layers.items():
+                lay.vmin, lay.vmax = self.full_limits[k]
+
+        if self.key not in self.layers:
+            self.key = next(iter(self.layers))
+        cur = self.current
+        lat, lon = cur.data[cur.ydim].values, cur.data[cur.xdim].values
+        self.extent = (float(lon.min()), float(lon.max()), float(lat.min()), float(lat.max()))
+
+        self.im.set_extent(self.extent)
+        self.im.set_clim(cur.vmin, cur.vmax)
+        if self.crs is not None:
+            self.ax.set_extent(self.extent, crs=self.crs)
+        else:
+            self.ax.set_xlim(self.extent[:2])
+            self.ax.set_ylim(self.extent[2:])
+        self.render()
 
     # -- state ----------------------------------------------------------
     @property
@@ -389,7 +584,10 @@ class Player:
         if actual != self.now:
             # this layer has no step at the master time; say so rather than lie
             title += f"  (layer valid {self._stamp(actual)})"
-        self.ax.set_title(title, fontsize=13)
+        # y is pinned deliberately: cartopy auto-places the title above the
+        # gridline labels, and with draw_labels=True that calculation can come
+        # back as inf, putting the title off-canvas entirely.
+        self.ax.set_title(title, fontsize=13, y=1.02)
         self.cbar.set_label(c.units)
         if self.crs is None:  # cartopy gridlines already label the axes
             self.ax.set_xlabel("longitude")
@@ -424,6 +622,8 @@ class Player:
 
     def _retick(self):
         """Slider reads as a wall clock, with the span of the run alongside it."""
+        if not self.chrome:
+            return
         span = f"{self._stamp(self.times[0])} → {self._stamp(self.times[-1])}"
         self.slider.valtext.set_text(f"{self._stamp()}   [{self.frame + 1}/{self.n}]")
         self.slider.label.set_text(f"time\n{span}")
@@ -452,7 +652,12 @@ class Player:
     def show(self):
         plt.show()
 
-    def save(self, out: str, fps: int = 8):
+    def save(self, out: str, fps: int = 8, dpi: int = 110):
+        """Render one frame per loaded time step to a video/GIF.
+
+        Expects a chrome-free figure (Player(..., chrome=False)); saving the
+        interactive one bakes the frozen widgets into every frame.
+        """
         from matplotlib.animation import FuncAnimation
 
         def update(i):
@@ -460,8 +665,10 @@ class Player:
             self.render()
             return (self.im,)
 
-        FuncAnimation(self.fig, update, frames=self.n, blit=False).save(out, fps=fps, dpi=110)
-        print(f"wrote {out}")
+        anim = FuncAnimation(self.fig, update, frames=self.n, blit=False)
+        anim.save(out, fps=fps, dpi=dpi)
+        print(f"wrote {out}: {self.n} frames @ {fps} fps "
+              f"({self._stamp(self.times[0])} .. {self._stamp(self.times[-1])})")
 
 
 def main():
@@ -474,9 +681,18 @@ def main():
                    help="disable the coastline/border basemap")
     p.add_argument("--save", metavar="OUT.mp4", help="render an animation instead of opening the UI")
     p.add_argument("--fps", type=int, default=8)
+    p.add_argument("--dpi", type=int, default=110, help="resolution of the saved animation")
+    p.add_argument("--start", help="load from this time (YYYY-MM-DD[THH:MM])")
+    p.add_argument("--end", help="load up to this time (inclusive)")
+    p.add_argument("--stride", type=int, default=1, help="keep every Nth step")
+    p.add_argument("--all", action="store_true", help="load the whole run without prompting")
+    p.add_argument("--bbox", type=float, nargs=4, metavar=("W", "E", "S", "N"),
+                   help="only load data inside this area, in degrees")
     args = p.parse_args()
 
-    fields = load_grib(args.grib)
+    # Stage 1: open lazily — index + coords only, no field data read yet.
+    fields = open_grib(args.grib)
+    times = available_times(fields)
 
     if args.list:
         for k, da in fields.items():
@@ -488,12 +704,28 @@ def main():
             )
         return
 
+    # Stage 2: decide how much of the time axis to actually load.
+    start, end, stride = times[0], times[-1], args.stride
+    if args.start or args.end:
+        start = np.datetime64(args.start) if args.start else start
+        end = np.datetime64(args.end) if args.end else end
+    elif not args.all and sys.stdin.isatty():
+        start, end, stride = choose_window(fields, times)
+
+    # Stage 3: subset time+area first, *then* derive/convert — those materialize.
+    fields = subset_area(subset_times(fields, start, end, stride), tuple(args.bbox) if args.bbox else None)
+    fields = derive_fields(fields)
+    kept = len(available_times(fields))
+    print(f"loading {kept} of {len(times)} steps "
+          f"({_fmt(start)} .. {_fmt(end)}, stride {stride})")
+
     if not args.save:
         use_interactive_backend()  # before the figure is created
 
-    player = Player(fields, args.var, args.quiver, basemap=args.basemap)
+    player = Player(fields, args.var, args.quiver, basemap=args.basemap,
+                    chrome=not args.save)
     if args.save:
-        player.save(args.save, args.fps)
+        player.save(args.save, args.fps, args.dpi)
     else:
         player.show()
 
