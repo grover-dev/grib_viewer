@@ -35,9 +35,9 @@ the very first render needs a network connection. They're cached afterwards.
 Worth reading once, because nearly every awkward thing in this codebase is a
 direct consequence of the format.
 
-**A GRIB file is not a cube. It's a flat pile of independent records**, called
-*messages*, concatenated back to back. There is no header, no index, no table of
-contents — just message after message, each one self-describing.
+**A GRIB file is a flat pile of independent records**, called *messages*,
+concatenated back to back. There is no header, no index, no table of contents —
+just message after message, each one self-describing.
 
 **One message = one 2-D field at one instant.** It carries a small block of
 metadata keys plus a packed grid of values:
@@ -53,22 +53,27 @@ metadata keys plus a packed grid of values:
 ```
 
 So a month of hourly ERA5 with 14 variables isn't one array — it's
-`744 × 14 ≈ 10,000 separate messages` in one file. The 3-D "cube" you think of
-(`time × lat × lon`) doesn't exist on disk; **cfgrib reconstructs it** by reading
-every message's headers and working out which ones stack together.
+`744 × 14 ≈ 10,000 separate messages` in one file. A "variable" is not a thing
+that exists on disk: it's whatever you get by collecting the messages that share
+a parameter and stacking them in time order.
 
 That single fact explains most of this project's design:
 
-**Why there are two layers.** `grib_utils.py` has a *message layer* and an
-*xarray layer*. Slicing works on raw messages — to cut a file down you just copy
-the messages you want and skip the rest. No decoding, no cube, and every original
-metadata key survives into the output. (Going the other way, through xarray, is
-lossy: cfgrib's writer needs the original `GRIB_*` attrs intact, and unit
-conversions destroy them.)
+**Why we index instead of loading.** Startup reads every message's *headers* —
+what it is, when it's valid, and its byte offset — and nothing else. That's
+`index_grib()`, and it's a few seconds even on 16 GB, because the packed values
+are skipped entirely. A frame is then served by seeking to its offset and
+decoding that one message. Nothing else is ever read.
 
-**Why scanning is cheap but loading is expensive.** Reading every message's
-*headers* to list the time axis takes seconds even on 16 GB, because the packed
-values are skipped. Reading the *values* means decompressing gigabytes.
+**Why scanning is cheap but loading is expensive.** Headers are tiny; values are
+compressed and large. Any tool that has to touch all the values to *open* a file
+will be slow, and the fix is always to avoid doing that.
+
+**Why slicing works on raw messages.** To cut a file down you copy the messages
+you want and skip the rest — no decoding, and every original metadata key
+survives verbatim into the output. Going the other way, through xarray, is lossy:
+a GRIB writer needs the original `GRIB_*` attrs intact, and unit conversion
+destroys them.
 
 **Why the time axis is a minefield.** Each message states the hour it's valid for
 (`validityDate`/`validityTime`) — but *accumulated* fields (precipitation,
@@ -82,10 +87,10 @@ tsr:  dataDate/dataTime  20250104 1800   +   endStep 10h
 (That's a real message out of `data.grib`, not a hypothetical.)
 
 Read the reference time and your rainfall lands 10 hours away from your wind.
-Worse, cfgrib presents these as a rectangular `(time × step)` grid, which implies
-combinations the file never contained — so the cube grows phantom all-NaN frames
-at the edges. This project reads `validityDate`/`validityTime` from the messages
-and treats them as ground truth.
+This project reads `validityDate`/`validityTime` straight off each message and
+treats them as ground truth, so an accumulation lands on the hour it describes by
+construction — there is no step ladder to unfold and no chance of inventing a
+frame the file doesn't contain.
 
 **Why longitudes are a minefield too.** Each message declares its own grid
 corners. ERA5's global fields start at longitude 0 and run east to 359.75 — not
@@ -97,12 +102,12 @@ can be on completely different grids: in a real ERA5 download the wave fields
 (`swh`, `mwp`, `mwd`) arrive at 0.5° while the atmospheric fields are at 0.25°.
 Nothing forbids it, so the tooling has to cope.
 
-**Names are not stable.** A message identifies its parameter by a numeric
-`paramId` (165), and its `shortName` in the file is `10u` — but cfgrib hands it to
-xarray as `u10`. So the same field has three names depending on which layer you're
-standing in, and none of them is safe to key behaviour off. This is why the viewer
-infers presentation from *units* and the long name rather than matching variable
-names.
+**One field, several names.** A message identifies its parameter by a numeric
+`paramId` (165). Its `shortName` is `10u`, but its `cfVarName` — the CF-style name
+everyone actually writes — is `u10`. The loader keys fields on `cfVarName`, so
+`u10`/`t2m`/`d2m` are what you see; but none of these names is safe to key
+*behaviour* off, which is why the viewer infers presentation from units and the
+long name instead of matching variable names.
 
 **GRIB1 vs GRIB2** are different encodings of the same idea; ecCodes reads both
 and this project doesn't care which you have. (Your file is edition 1.)
@@ -122,12 +127,13 @@ grib_dump -O data.grib      # every key of every message (very verbose)
 | `slice_grib.py` | Cut a big GRIB down by time and/or area, writing a new GRIB. |
 | `era5_viewer.py` | Animate the data, switch variables, zoom, export video or GRIB. |
 
-They share `grib_utils.py`, which holds both the message-level GRIB handling and
-the xarray loading layer.
+They share `grib_utils.py`: the message index and on-demand frame reader that all
+three sit on.
 
 ### Start here: `grib_info.py`
 
-Reads headers and coordinates only, so it's safe to point at a 16 GB file.
+Reads headers only, so it's safe to point at a 16 GB file (a few seconds the
+first time, well under a second once the index is cached).
 
 ```bash
 uv run grib_info.py data/data.grib
@@ -263,7 +269,7 @@ metadata plus the data's own distribution:
   `Blues_r`, wind speed `turbo`, signed components `RdBu_r`, temperature
   `coolwarm`.
 - Colour limits are the 2nd/98th percentile, **sampled** (≤8 time slices, ≤40k
-  points each) rather than read exhaustively — reading whole cubes just to pick
+  points each) rather than read exhaustively — decoding every frame just to pick
   limits is what made startup slow and memory-hungry.
 
 An unrecognised field still renders, just with generic styling.
@@ -305,21 +311,19 @@ tidy fixtures would pass no matter what the code did.
 - **Area subsetting requires a `regular_ll` grid** (ERA5's default lat/lon
   download). A Gaussian-grid file is rejected with a clear error rather than
   silently mangled.
-- **Accumulations are folded onto valid time.** ERA5 stores `tp`/`tsr`/`cdir`
-  against a reference time plus a step; the hour they describe is `time + step`.
-  The loader folds that ladder onto a single time axis and vets it against the
-  message headers, which are ground truth — cfgrib otherwise presents
-  `(time × step)` as a rectangle and invents edge frames the file doesn't hold.
-- **Opening is index-only, and the index is cached.** There is no cfgrib in the
-  read path — a message index (what each message is, when it's valid, its byte
-  offset) is built in one header pass and pickled to `.cache/`. A frame is then a
-  seek plus one message decode. On the 16 GB file: **~16 s to index cold, ~1.6 s
-  warm, ~50 ms per frame**, in ~250 MB of RAM. cfgrib's `open_datasets`
-  reconstructs the whole cube geometry up front and took **~140 s every run** on
-  the same file — its own index cache can't help, because it compares mtimes and
-  a GRIB whose mtime is in the future (a zip extracted across a timezone, like
-  this dataset) is always judged newer than its index. Our cache key is
-  path + size + mtime, which doesn't care what the clock says.
+- **Accumulations sit on their valid time automatically.** ERA5 stores
+  `tp`/`tsr`/`cdir` against a reference time plus a step; the hour they describe
+  is `time + step`. Since each message is read individually, its
+  `validityDate`/`validityTime` is taken at face value, and the field lands on the
+  right hour with no unfolding step and no risk of a frame that isn't in the file.
+- **Opening is index-only, and the index is cached.** A message index (what each
+  message is, when it's valid, its byte offset) is built in one header pass and
+  pickled to `.cache/`; a frame is then a seek plus one message decode. On the
+  16 GB file: **~16 s to index cold, ~1.6 s warm, ~50 ms per frame**, in ~250 MB
+  of RAM. The cache key is **path + size + mtime**, deliberately not a
+  newer-than-the-file mtime comparison — a GRIB whose mtime is in the future (a
+  zip extracted across a timezone, as this dataset was) would then invalidate its
+  index on every single run.
 - **Fields are dask-backed**, one task per frame, so nothing is read until a
   frame is actually drawn.
 - **Mixed resolutions are fine.** Wave fields (0.5°) and atmospheric fields
