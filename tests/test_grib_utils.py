@@ -7,6 +7,9 @@ reintroduces one gets an explanation rather than just a red X.
 
 from __future__ import annotations
 
+import os
+import time
+
 import numpy as np
 import pytest
 
@@ -197,6 +200,61 @@ def test_write_subset_refuses_to_write_nothing(global_grib, tmp_path):
 # ---------------------------------------------------------------------------
 # Misc
 # ---------------------------------------------------------------------------
+
+
+def test_index_cache_hits_and_is_reused(global_grib, tmp_path, monkeypatch):
+    """A second open must not re-index: that's the whole point of the cache."""
+    monkeypatch.setattr(gu, "CACHE_DIR", tmp_path / "cache")
+
+    calls = []
+    real_index = gu.index_grib
+    monkeypatch.setattr(gu, "index_grib", lambda p: (calls.append(p), real_index(p))[1])
+
+    gu.open_grib(str(global_grib))
+    assert len(calls) == 1, "first open should build the index"
+
+    gu.open_grib(str(global_grib))
+    assert len(calls) == 1, "second open must reuse the cached index"
+
+
+def test_index_cache_invalidates_when_the_file_changes(global_grib, tmp_path, monkeypatch):
+    """Cache key is path+size+mtime, so a changed file must be re-indexed.
+
+    Deliberately not cfgrib's mtime comparison, which never validates an index
+    against a GRIB whose mtime is in the future (a zip extracted across a
+    timezone does exactly that) and so silently re-indexes on every single run.
+    """
+    monkeypatch.setattr(gu, "CACHE_DIR", tmp_path / "cache")
+    copy = tmp_path / "copy.grib"
+    copy.write_bytes(global_grib.read_bytes())
+
+    key_before = gu._index_key(str(copy))
+    gu.open_grib(str(copy))
+
+    # rewrite it with fewer messages -> different size -> different key
+    gu.write_subset(str(global_grib), str(copy), keep=set(gu.scan_times(str(global_grib))[:1]))
+    assert gu._index_key(str(copy)) != key_before
+
+    fields = gu.open_grib(str(copy))
+    assert len(gu.available_times(fields)) == 1, "must re-index the changed file"
+
+
+def test_future_mtime_does_not_defeat_the_cache(global_grib, tmp_path, monkeypatch):
+    """The exact condition that made cfgrib re-index every run on the real data."""
+    monkeypatch.setattr(gu, "CACHE_DIR", tmp_path / "cache")
+    copy = tmp_path / "future.grib"
+    copy.write_bytes(global_grib.read_bytes())
+
+    future = time.time() + 4 * 3600  # 4 hours ahead, like the real download
+    os.utime(copy, (future, future))
+
+    calls = []
+    real_index = gu.index_grib
+    monkeypatch.setattr(gu, "index_grib", lambda p: (calls.append(p), real_index(p))[1])
+
+    gu.open_grib(str(copy))
+    gu.open_grib(str(copy))
+    assert len(calls) == 1, "a future mtime must not invalidate the cache"
 
 
 def test_coord_tag_formats_timedeltas_as_hours():

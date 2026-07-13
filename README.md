@@ -310,8 +310,18 @@ tidy fixtures would pass no matter what the code did.
   The loader folds that ladder onto a single time axis and vets it against the
   message headers, which are ground truth — cfgrib otherwise presents
   `(time × step)` as a rectangle and invents edge frames the file doesn't hold.
-- **Fields are dask-backed**, so opening a file is a recipe, not a read. That's
-  what makes a 16 GB file describable in ~200 MB of RAM.
+- **Opening is index-only, and the index is cached.** There is no cfgrib in the
+  read path — a message index (what each message is, when it's valid, its byte
+  offset) is built in one header pass and pickled to `.cache/`. A frame is then a
+  seek plus one message decode. On the 16 GB file: **~16 s to index cold, ~1.6 s
+  warm, ~50 ms per frame**, in ~250 MB of RAM. cfgrib's `open_datasets`
+  reconstructs the whole cube geometry up front and took **~140 s every run** on
+  the same file — its own index cache can't help, because it compares mtimes and
+  a GRIB whose mtime is in the future (a zip extracted across a timezone, like
+  this dataset) is always judged newer than its index. Our cache key is
+  path + size + mtime, which doesn't care what the clock says.
+- **Fields are dask-backed**, one task per frame, so nothing is read until a
+  frame is actually drawn.
 - **Mixed resolutions are fine.** Wave fields (0.5°) and atmospheric fields
   (0.25°) coexist in one file; switching between them works.
 - **Longitudes:** a *global* 0–360 grid is rolled onto −180…180. A *regional*

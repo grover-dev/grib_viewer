@@ -1,25 +1,33 @@
 """Shared GRIB handling for the viewer, the slicer and the info tool.
 
-Two layers live here, and they exist for different reasons:
+Everything here works on raw GRIB messages via ecCodes. There is no cfgrib in the
+read path, and that is the point:
 
-* an **xarray layer** (open_grib and friends) that decodes a GRIB into lazily
-  indexed (time, y, x) fields for rendering, and
+* **Opening** builds a message index -- one header pass recording what each
+  message is, when it is valid for, and its byte offset -- then caches it. On a
+  16 GB file that is ~5s cold and a fraction of a second warm. cfgrib's
+  open_datasets reconstructs the entire cube geometry up front and takes ~140s on
+  the same file, every single run.
 
-* a **message layer** (scan_times, write_subset) that manipulates raw GRIB
-  messages without decoding them. Subsetting has to live down here: cfgrib's
-  writer needs the original GRIB_* attrs intact, which the unit conversions and
-  derived fields of the xarray layer destroy. Working on the raw messages keeps
-  every bit of the source metadata and stays cheap on multi-GB files.
+* **Reading a frame** is a seek to that offset plus one message decode, wrapped
+  in dask so the xarray API downstream (.sel, subsetting, unit conversion) still
+  works and stays lazy. Frames are decoded only when something asks for them.
+
+* **Subsetting** (write_subset) copies messages verbatim. Going through xarray
+  would be lossy -- cfgrib's writer needs the original GRIB_* attrs intact, and
+  unit conversion destroys them.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
+import pickle
 import warnings
 from pathlib import Path
 
-import cfgrib
+import dask
+import dask.array
 import eccodes as ec
 import numpy as np
 import xarray as xr
@@ -204,145 +212,168 @@ def normalize_lons(da: xr.DataArray) -> xr.DataArray:
     return da.sortby(xdim)
 
 
-def collapse_step(da: xr.DataArray) -> xr.DataArray:
-    """Fold an accumulation's (time, step) axes into a single valid-time axis."""
-    stacked = [d for d in ("time", "step") if d in da.dims]
-    valid = da["valid_time"] if "valid_time" in da.coords else da["time"] + da["step"]
+def _index_key(path: str) -> str:
+    """Cache key for a file: path + size + mtime.
 
-    da = da.stack(_vt=stacked)
-    times = valid.stack(_vt=stacked).values if set(stacked) <= set(valid.dims) else valid.values
-
-    # drop the MultiIndex the stack created, then relabel with the real times
-    da = da.reset_index("_vt", drop=True).drop_vars(
-        [c for c in ("time", "step", "valid_time") if c in da.coords], errors="ignore"
-    )
-    da = da.assign_coords(_vt=("_vt", times)).rename(_vt="time")
-
-    # a step ladder overlaps at the boundaries (18Z+6h == 00Z+0h); keep one
-    da = da.drop_duplicates("time").sortby("time")
-    da = da.transpose("time", ydim_of(da), xdim_of(da))
-    da.attrs["_folded_step"] = True  # tells open_grib to vet these times
-    return da
-
-
-def use_valid_time(da: xr.DataArray) -> xr.DataArray:
-    """Put a field on its *valid* time axis — the hour it actually describes.
-
-    Must run BEFORE squeeze(): a field with a single step carries step/valid_time
-    as scalar coords, and squeeze would drop them, silently leaving the field on
-    its reference time. That is a different hour, so it would land on a phantom
-    timestamp of its own, separate from the instantaneous fields.
+    Deliberately not cfgrib's scheme. cfgrib compares the index's mtime against
+    the GRIB's and rebuilds if the index looks older -- which never succeeds on a
+    file whose mtime is in the future (a zip extracted across a timezone will do
+    it, as this project's own sample does), so it silently re-indexes every run.
+    Hashing the stat instead is immune: a file that has not changed produces the
+    same key no matter what the clock says.
     """
-    if "step" in da.dims:
-        return collapse_step(da)
-    if "valid_time" not in da.coords:
-        return da
+    st = os.stat(path)
+    stamp = f"{os.path.abspath(path)}|{st.st_size}|{st.st_mtime_ns}"
+    return hashlib.sha1(stamp.encode()).hexdigest()[:16]
 
-    vt = da["valid_time"]
-    drop = [c for c in ("time", "step", "valid_time") if c in da.coords]
-    if vt.ndim == 0:  # single step: scalar valid_time
-        return da.drop_vars(drop).expand_dims(time=[vt.values])
-    if "time" in da.dims and vt.dims == ("time",):
-        return da.drop_vars(drop).assign_coords(time=vt.values)
-    return da
+
+def _read_frame(path: str, offset: int, shape: tuple[int, int]) -> np.ndarray:
+    """Decode one message's values by seeking straight to it.
+
+    This is the whole data path: a frame costs one seek plus one message decode,
+    no matter how big the file is.
+    """
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        h = ec.codes_grib_new_from_file(fh)
+        if h is None:
+            raise IOError(f"no GRIB message at offset {offset} in {path}")
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                ec.codes_set_double(h, "missingValue", float("nan"))
+            return ec.codes_get_values(h).reshape(shape).astype("float32")
+        finally:
+            ec.codes_release(h)
+
+
+def index_grib(path: str) -> dict:
+    """One header pass: what is in the file, and where.
+
+    Records, per message, the variable it belongs to, the hour it is valid for,
+    its grid, and its byte offset. That is everything needed to serve any frame
+    on demand -- and it costs a single sweep of the headers (~5s on 16 GB),
+    because the packed values are skipped entirely.
+
+    This replaces cfgrib's open_datasets, which reconstructs the whole cube
+    geometry up front and takes ~140s on the same file.
+    """
+    fields: dict[str, dict] = {}
+
+    with open(path, "rb") as fh:
+        while True:
+            offset = fh.tell()
+            h = ec.codes_grib_new_from_file(fh)
+            if h is None:
+                break
+            try:
+                # cfVarName is the CF-style name (u10), shortName is the GRIB one
+                # (10u). cfgrib exposes the former, so use it too -- otherwise
+                # every downstream reference to u10/t2m breaks.
+                short = ec.codes_get(h, "shortName")
+                try:
+                    name = ec.codes_get(h, "cfVarName") or short
+                except ec.KeyValueNotFoundError:
+                    name = short
+                if name in ("unknown", ""):
+                    name = short
+
+                level_type = ec.codes_get(h, "typeOfLevel")
+                level = ec.codes_get(h, "level")
+
+                # one field per level, so each is independently renderable
+                key = name if level_type in ("surface", "meanSea", "entireAtmosphere") \
+                    or level in (0, 1) else f"{name}_{level_type}{level}"
+
+                nj, ni = ec.codes_get(h, "Nj"), ec.codes_get(h, "Ni")
+                grid = (
+                    nj, ni,
+                    ec.codes_get(h, "latitudeOfFirstGridPointInDegrees"),
+                    ec.codes_get(h, "latitudeOfLastGridPointInDegrees"),
+                    ec.codes_get(h, "longitudeOfFirstGridPointInDegrees"),
+                    ec.codes_get(h, "longitudeOfLastGridPointInDegrees"),
+                )
+
+                field = fields.setdefault(key, {
+                    "grid": grid,
+                    "attrs": {
+                        "long_name": ec.codes_get(h, "name"),
+                        "units": ec.codes_get(h, "units"),
+                        "paramId": ec.codes_get(h, "paramId"),
+                        "shortName": short,
+                    },
+                    "frames": {},   # valid time -> offset
+                })
+                # validityDate/Time already accounts for the forecast step, so
+                # accumulations land on the hour they describe with no folding,
+                # no rectangular (time x step) grid, and no phantom frames.
+                field["frames"].setdefault(message_valid_time(h), offset)
+            finally:
+                ec.codes_release(h)
+
+    if not fields:
+        raise SystemExit(f"no GRIB messages found in {path}")
+    return fields
+
+
+def _load_index(path: str) -> dict:
+    """The index, from cache if the file hasn't changed since we built it."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache = CACHE_DIR / f"{_index_key(path)}.index"
+    if cache.exists():
+        try:
+            with open(cache, "rb") as fh:
+                return pickle.load(fh)
+        except Exception:
+            cache.unlink(missing_ok=True)  # corrupt or stale format: rebuild
+
+    index = index_grib(path)
+    tmp = cache.with_suffix(".tmp")
+    with open(tmp, "wb") as fh:
+        pickle.dump(index, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.replace(cache)  # atomic: a killed run can't leave a half-written index
+    return index
 
 
 def open_grib(path: str, chunks: dict | None = None) -> dict[str, xr.DataArray]:
     """Flatten a GRIB into {name: DataArray(time, y, x)}, keeping every field.
 
-    Backed by dask (one chunk per time step by default), so the fields are a
-    recipe rather than data: nothing is read until a caller asks for a specific
-    frame. That is not just an optimisation. Putting accumulations onto their
-    valid-time axis needs stack/sortby/drop_duplicates, and on a plain
-    numpy-backed array xarray must materialize the *whole cube* to reorder it --
-    ~3 GB per accumulated field on a month of global ERA5, which OOMs the machine
-    before the file is even described. Under dask those become graph nodes.
-
-    A single GRIB can hold incompatible hypercubes (different level types or step
-    conventions), so cfgrib returns a *list* of datasets; we take the variables
-    from all of them. A variable on multiple levels is split into one field per
-    level so each is independently renderable.
+    Backed by the message index rather than cfgrib: opening reads headers only
+    (and on a second open, not even those -- the index is cached), and each frame
+    is decoded from its file offset when something actually asks for it. The
+    arrays are dask-backed, one task per frame, so all the xarray downstream
+    (.sel, subsetting, unit conversion) keeps working and stays lazy.
     """
-    # Let cfgrib keep the index it builds; re-opening is much cheaper than
-    # re-walking every message header.
-    #
-    # The {path} in the template is load-bearing: cfgrib's {short_hash} hashes the
-    # *backend options*, not the file, so a template without {path} makes every
-    # GRIB collide on one index filename and the cache silently never hits.
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    tag = hashlib.sha1(os.path.abspath(path).encode()).hexdigest()[:12]
-    indexpath = str(CACHE_DIR / f"{tag}.{{short_hash}}.idx")
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", FutureWarning)  # cfgrib's xr.merge compat warning
-        datasets = cfgrib.open_datasets(
-            path,
-            backend_kwargs={"indexpath": indexpath},
-            chunks=chunks if chunks is not None else {"time": 1},
-        )
+    index = _load_index(path)
     fields: dict[str, xr.DataArray] = {}
 
-    for ds in datasets:
-        for name, da in ds.data_vars.items():
-            if "valid_time" in da.dims:
-                da = da.rename(valid_time="time")
-            da = use_valid_time(da)
-            # squeeze only the nuisance dims (number, surface, ...): a blanket
-            # squeeze would also eat a length-1 time axis, e.g. a 1-frame file
-            junk = [d for d in da.dims
-                    if da.sizes[d] == 1 and d not in ("time",) + Y_NAMES + X_NAMES]
-            da = da.squeeze(junk, drop=True)
-            da = normalize_lons(da)
-            if "time" not in da.dims:
-                da = da.expand_dims("time")
+    for key, field in index.items():
+        times = np.array(sorted(field["frames"]))
+        nj, ni, lat0, lat1, lon0, lon1 = field["grid"]
+        lats = np.linspace(lat0, lat1, nj)
+        lons = np.linspace(lon0, lon1, ni)
 
-            spatial = [d for d in da.dims if d in Y_NAMES + X_NAMES]
-            if len(spatial) != 2:
-                continue
+        # one dask task per frame: nothing is read until a frame is asked for
+        blocks = [
+            dask.array.from_delayed(
+                dask.delayed(_read_frame)(path, field["frames"][t], (nj, ni)),
+                shape=(nj, ni),
+                dtype="float32",
+            )
+            for t in times
+        ]
+        data = dask.array.stack(blocks, axis=0)  # -> (time, y, x), one chunk per frame
 
-            extra = [d for d in da.dims if d not in spatial + ["time"]]
-            if not extra:
-                fields[str(name)] = da
-            else:
-                for idx in np.ndindex(*(da.sizes[d] for d in extra)):
-                    sub = da.isel({d: int(i) for d, i in zip(extra, idx)})
-                    tag = "_".join(coord_tag(d, sub[d].values) for d in extra)
-                    sub.attrs = dict(da.attrs)
-                    fields[f"{name}_{tag}"] = sub
+        da = xr.DataArray(
+            data,
+            dims=("time", "latitude", "longitude"),
+            coords={"time": times, "latitude": lats, "longitude": lons},
+            attrs=field["attrs"],
+            name=key,
+        )
+        fields[key] = normalize_lons(da)
 
-    if not fields:
-        raise SystemExit(f"No (time, y, x) fields found in {path}")
-
-    return _drop_phantom_times(path, fields)
-
-
-def _drop_phantom_times(path: str, fields: dict[str, xr.DataArray]) -> dict[str, xr.DataArray]:
-    """Remove valid times that no GRIB message actually backs.
-
-    cfgrib presents an accumulation as a rectangular (time x step) grid, but the
-    file only holds the combinations that were actually produced. Folding that
-    rectangle onto valid time therefore invents slots at the edges -- a reference
-    time of 18:00Z with a 1 h step yields 19:00Z even when no such message exists
-    -- and they surface as all-NaN frames, and as a time axis longer than the
-    file's own. The message headers are ground truth, and scanning them is cheap
-    (headers only), so anything they don't vouch for is dropped.
-    """
-    stepped = [k for k, f in fields.items() if f.attrs.get("_folded_step")]
-    if not stepped:
-        return fields
-
-    # compare as datetime64[ns] arrays: .item() on a datetime64[ns] returns an
-    # int (ns since epoch), while .tolist() on a coarser dtype returns datetime
-    # objects, so a set-membership test across the two never matches
-    real = scan_times(path).astype("datetime64[ns]")
-    for k in stepped:
-        f = fields[k]
-        mask = np.isin(f["time"].values.astype("datetime64[ns]"), real)
-        if not mask.all():
-            fields[k] = f.isel(time=np.flatnonzero(mask))
     return fields
-
-
 def derive_fields(fields: dict[str, xr.DataArray]) -> dict[str, xr.DataArray]:
     """Add wind speed for any u/v pair present (u10/v10, u100/v100, u/v, ...).
 
