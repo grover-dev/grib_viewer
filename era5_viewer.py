@@ -19,9 +19,12 @@ import sys
 import warnings
 from dataclasses import dataclass, field
 
+from pathlib import Path
+
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import cfgrib
+import eccodes as ec
 import matplotlib
 import numpy as np
 import xarray as xr
@@ -197,6 +200,95 @@ def build_layer(key: str, da: xr.DataArray) -> Layer:
 # ---------------------------------------------------------------------------
 
 
+def _coord_tag(dim: str, value) -> str:
+    """Readable suffix for a layer split out along an extra dim (e.g. a level).
+
+    Timedeltas get formatted as hours rather than raw nanoseconds — a coordinate
+    printed as '10800000000000 nanoseconds' is unusable as a variable name.
+    """
+    if np.issubdtype(np.asarray(value).dtype, np.timedelta64):
+        return f"{dim}{int(np.asarray(value) / np.timedelta64(1, 'h'))}h"
+    v = np.asarray(value).item()
+    return f"{dim}{v:g}" if isinstance(v, float) else f"{dim}{v}"
+
+
+def normalize_lons(da: xr.DataArray) -> xr.DataArray:
+    """Put a global 0..360 grid onto -180..180, and leave everything else alone.
+
+    ERA5 ships *global* fields on 0..360, which renders with the Atlantic torn
+    down the middle unless it is rolled onto -180..180.
+
+    A regional grid must NOT be touched. A Pacific window written by slice_grib
+    runs e.g. 170..190: wrapping that into -180..180 and sorting scatters it into
+    two clumps (-180..-170 and 170..180) with a hole in between, and imshow --
+    which assumes uniform spacing -- would smear it across the whole map. Such a
+    grid is already contiguous in its own frame, so it is left as it is; the
+    Player re-centres the projection instead.
+    """
+    xdim = next((d for d in da.dims if d in X_NAMES), None)
+    if xdim is None:
+        return da
+
+    lons = da[xdim].values
+    if lons.max() <= 180.0:
+        return da
+
+    step = float(np.median(np.diff(lons))) if lons.size > 1 else 0.0
+    spans_globe = lons.size > 1 and (lons.max() - lons.min() + abs(step)) >= 359.9
+    if not spans_globe:
+        return da  # regional window: already contiguous in its own frame
+
+    da = da.assign_coords({xdim: ((lons + 180.0) % 360.0) - 180.0})
+    return da.sortby(xdim)
+
+
+def use_valid_time(da: xr.DataArray) -> xr.DataArray:
+    """Put the field on its *valid* time axis — the hour it actually describes.
+
+    ERA5 accumulations (tp, ssrd, tsr, cdir) are stored against a reference time
+    plus a forecast step; valid time is time + step. Must run BEFORE squeeze():
+    a field with a single step has step/valid_time as scalar coords, and squeeze
+    would drop them, silently leaving the field on its reference time — which is
+    a different hour, so it lands on a phantom timestamp of its own.
+    """
+    if "step" in da.dims:
+        return collapse_step(da)
+
+    if "valid_time" not in da.coords:
+        return da
+
+    vt = da["valid_time"]
+    drop = [c for c in ("time", "step", "valid_time") if c in da.coords]
+
+    if vt.ndim == 0:  # single step: scalar valid_time
+        return da.drop_vars(drop).expand_dims(time=[vt.values])
+    if "time" in da.dims and vt.dims == ("time",):
+        return da.drop_vars(drop).assign_coords(time=vt.values)
+    return da
+
+
+def collapse_step(da: xr.DataArray) -> xr.DataArray:
+    """Fold an accumulation's (time, step) axes into a single valid-time axis."""
+    stacked = [d for d in ("time", "step") if d in da.dims]
+    valid = da["valid_time"] if "valid_time" in da.coords else da["time"] + da["step"]
+
+    da = da.stack(_vt=stacked)
+    times = valid.stack(_vt=stacked).values if set(stacked) <= set(valid.dims) else valid.values
+
+    # drop the MultiIndex the stack created, then relabel with the real times
+    da = da.reset_index("_vt", drop=True).drop_vars(
+        [c for c in ("time", "step", "valid_time") if c in da.coords], errors="ignore"
+    )
+    da = da.assign_coords(_vt=("_vt", times)).rename(_vt="time")
+
+    # a step ladder overlaps at the boundaries (18Z+6h == 00Z+0h); keep one
+    da = da.drop_duplicates("time").sortby("time")
+
+    ydim = next(d for d in da.dims if d in Y_NAMES)
+    xdim = next(d for d in da.dims if d in X_NAMES)
+    return da.transpose("time", ydim, xdim)
+
+
 def open_grib(path: str) -> dict[str, xr.DataArray]:
     """Flatten a GRIB into {name: DataArray(time, y, x)}, keeping every field.
 
@@ -216,9 +308,15 @@ def open_grib(path: str) -> dict[str, xr.DataArray]:
 
     for ds in datasets:
         for name, da in ds.data_vars.items():
-            da = da.squeeze(drop=True)
             if "valid_time" in da.dims:
                 da = da.rename(valid_time="time")
+            da = use_valid_time(da)  # BEFORE squeeze: it would drop scalar step coords
+            # squeeze only the nuisance dims (number, surface, ...): a blanket
+            # squeeze would also eat a length-1 time axis, e.g. a 1-frame file
+            junk = [d for d in da.dims
+                    if da.sizes[d] == 1 and d not in ("time",) + Y_NAMES + X_NAMES]
+            da = da.squeeze(junk, drop=True)
+            da = normalize_lons(da)
             if "time" not in da.dims:
                 da = da.expand_dims("time")  # single snapshot still plays
 
@@ -234,7 +332,7 @@ def open_grib(path: str) -> dict[str, xr.DataArray]:
                 for idx in np.ndindex(*(da.sizes[d] for d in extra)):
                     sel = {d: int(i) for d, i in zip(extra, idx)}
                     sub = da.isel(sel)
-                    tag = "_".join(f"{d}{sub[d].values}" for d in extra)
+                    tag = "_".join(_coord_tag(d, sub[d].values) for d in extra)
                     sub.attrs = dict(da.attrs)
                     fields[f"{name}_{tag}"] = sub
 
@@ -364,6 +462,98 @@ def choose_window(fields: dict[str, xr.DataArray], times: np.ndarray) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# Export — carve a smaller GRIB out of the source
+# ---------------------------------------------------------------------------
+
+
+def export_grib(src: str, dst: str, bbox: tuple | None, start=None, end=None, stride: int = 1) -> int:
+    """Write a new GRIB containing only the requested area and time window.
+
+    Works on the raw messages rather than going back through xarray: cfgrib's
+    writer needs the original GRIB_* attrs intact, which our unit conversions
+    and derived fields have already destroyed. Cropping the message values and
+    rewriting the grid headers keeps the output a valid GRIB that any tool
+    (including this viewer) can read.
+
+    Returns the number of messages written.
+    """
+    kept_times: dict = {}
+    written = 0
+
+    with open(src, "rb") as fin, open(dst, "wb") as fout:
+        while (h := ec.codes_grib_new_from_file(fin)) is not None:
+            try:
+                grid = ec.codes_get(h, "gridType")
+                if grid != "regular_ll":
+                    raise SystemExit(
+                        f"can only subset regular lat/lon grids, got {grid!r}. "
+                        "Re-download with a regular_ll grid, or export without --bbox."
+                    )
+
+                # valid time of this message (validity*, not dataDate: accumulated
+                # fields carry a step offset from their reference time)
+                vd = ec.codes_get(h, "validityDate")  # YYYYMMDD
+                vt = ec.codes_get(h, "validityTime")  # HHMM
+                when = np.datetime64(
+                    f"{vd // 10000:04d}-{vd // 100 % 100:02d}-{vd % 100:02d}"
+                    f"T{vt // 100:02d}:{vt % 100:02d}"
+                )
+                if (start is not None and when < start) or (end is not None and when > end):
+                    continue
+
+                if stride > 1:
+                    # index each distinct time we see, keep every Nth
+                    idx = kept_times.setdefault(when, len(kept_times))
+                    if idx % stride:
+                        continue
+
+                ni = ec.codes_get(h, "Ni")
+                nj = ec.codes_get(h, "Nj")
+                lat_first = ec.codes_get(h, "latitudeOfFirstGridPointInDegrees")
+                lat_last = ec.codes_get(h, "latitudeOfLastGridPointInDegrees")
+                lon_first = ec.codes_get(h, "longitudeOfFirstGridPointInDegrees")
+                lon_last = ec.codes_get(h, "longitudeOfLastGridPointInDegrees")
+
+                lats = np.linspace(lat_first, lat_last, nj)
+                lons = np.linspace(lon_first, lon_last, ni)
+                values = ec.codes_get_values(h).reshape(nj, ni)
+
+                if bbox is not None:
+                    west, east, south, north = bbox
+                    # handle a 0..360 source against a -180..180 request
+                    req_lons = lons if lons.max() <= 180 else np.where(lons > 180, lons - 360, lons)
+                    jm = (lats >= south) & (lats <= north)
+                    im = (req_lons >= west) & (req_lons <= east)
+                    if not jm.any() or not im.any():
+                        continue
+                    j0, j1 = np.flatnonzero(jm)[[0, -1]]
+                    i0, i1 = np.flatnonzero(im)[[0, -1]]
+
+                    values = values[j0:j1 + 1, i0:i1 + 1]
+                    lats, lons = lats[j0:j1 + 1], lons[i0:i1 + 1]
+                    nj, ni = values.shape
+
+                    ec.codes_set(h, "Ni", ni)
+                    ec.codes_set(h, "Nj", nj)
+                    ec.codes_set(h, "latitudeOfFirstGridPointInDegrees", float(lats[0]))
+                    ec.codes_set(h, "latitudeOfLastGridPointInDegrees", float(lats[-1]))
+                    ec.codes_set(h, "longitudeOfFirstGridPointInDegrees", float(lons[0]))
+                    ec.codes_set(h, "longitudeOfLastGridPointInDegrees", float(lons[-1]))
+                    ec.codes_set_values(h, values.ravel())
+
+                ec.codes_write(h, fout)
+                written += 1
+            finally:
+                ec.codes_release(h)
+
+    if not written:
+        raise SystemExit("nothing matched the requested area/time window")
+    size = Path(dst).stat().st_size / 1e6
+    print(f"wrote {dst}: {written} messages, {size:.1f} MB")
+    return written
+
+
+# ---------------------------------------------------------------------------
 # Viewer
 # ---------------------------------------------------------------------------
 
@@ -377,7 +567,10 @@ class Player:
         basemap: bool = True,
         global_colors: bool = False,
         chrome: bool = True,
+        src: str | None = None,
     ):
+        # source GRIB, so the export button can re-carve it at message level
+        self.src = src
         # chrome=False builds an export-only figure: map, title, colorbar and
         # nothing else. The widgets would otherwise be baked into every frame of
         # a saved video, frozen and useless.
@@ -425,12 +618,17 @@ class Player:
 
         # no widgets to make room for -> give the map the whole frame
         rect = (0.26, 0.16, 0.70, 0.76) if chrome else (0.06, 0.05, 0.86, 0.88)
-        self.crs = ccrs.PlateCarree() if basemap else None
+
+        # The data is always plain lat/lon, so that is what we transform *from*.
+        # The map we draw *onto* is re-centred on the data's own longitudes: a
+        # Pacific window runs past 180, and a 0-centred map would split it.
+        self.data_crs = ccrs.PlateCarree() if basemap else None
+        self.lon0 = round((self.extent[0] + self.extent[1]) / 2 / 10) * 10 if basemap else 0
+        self.crs = ccrs.PlateCarree(central_longitude=self.lon0) if basemap else None
         self.ax = self.fig.add_axes(rect, projection=self.crs) if basemap \
             else self.fig.add_axes(rect)
 
-        # data is on a plain lat/lon grid, so everything is drawn in PlateCarree
-        geo = {"transform": self.crs} if basemap else {}
+        geo = {"transform": self.data_crs} if basemap else {}
 
         self.im = self.ax.imshow(
             self._frame_data(), extent=self.extent, origin=self.origin,
@@ -482,6 +680,13 @@ class Player:
             lbl.set_fontsize(8)
         self.check.on_clicked(self.toggle_global_colors)
 
+        if self.src:
+            self.btn_export = Button(
+                self.fig.add_axes((0.01, 0.09, 0.22, 0.05)), "⬇ export selection to GRIB"
+            )
+            self.btn_export.label.set_fontsize(7)
+            self.btn_export.on_clicked(self.export_selection)
+
         # Drag a box on the map to crop the data to it.
         self.selector = RectangleSelector(
             self.ax, self._on_select, useblit=False, button=[1],
@@ -492,6 +697,27 @@ class Player:
         self.timer = self.fig.canvas.new_timer(interval=120)
         self.timer.add_callback(self.tick)
 
+    # -- export -----------------------------------------------------------
+    def export_selection(self, _event):
+        """Carve the visible area + loaded time window out into a new GRIB."""
+        stem = Path(self.src).stem
+        w, e, s, n = (round(v, 3) for v in (self.extent[0], self.extent[1],
+                                            self.extent[2], self.extent[3]))
+        dst = Path(self.src).parent / (
+            f"{stem}_{self._stamp(self.times[0])[:13]}_{w}_{e}_{s}_{n}.grib"
+            .replace(":", "").replace("-", "")
+        )
+        self.ax.set_title(f"exporting to {dst.name} ...", fontsize=11, y=1.02)
+        self.fig.canvas.draw()
+        try:
+            export_grib(self.src, str(dst), (w, e, s, n), self.times[0], self.times[-1])
+            msg = f"exported {dst.name}"
+        except SystemExit as exc:  # export_grib refuses non-regular_ll grids
+            msg = f"export failed: {exc}"
+        print(msg)
+        self.ax.set_title(msg, fontsize=11, y=1.02)
+        self.fig.canvas.draw()
+
     # -- zoom -------------------------------------------------------------
     def toggle_global_colors(self, _label):
         """Flip between full-domain and visible-area colour limits, in place."""
@@ -499,8 +725,12 @@ class Player:
         self.set_bbox(self.bbox)  # rebuild layers under the new limit policy
 
     def _on_select(self, eclick, erelease):
+        # Mouse coords come back in *projection* space. With a re-centred map
+        # that is offset from true longitude by lon0, so undo it before cropping.
         west, east = sorted((eclick.xdata, erelease.xdata))
         south, north = sorted((eclick.ydata, erelease.ydata))
+        if self.crs is not None:
+            west, east = west + self.lon0, east + self.lon0
         self.set_bbox((west, east, south, north))
 
     def set_bbox(self, bbox: tuple | None):
@@ -525,7 +755,7 @@ class Player:
         self.im.set_extent(self.extent)
         self.im.set_clim(cur.vmin, cur.vmax)
         if self.crs is not None:
-            self.ax.set_extent(self.extent, crs=self.crs)
+            self.ax.set_extent(self.extent, crs=self.data_crs)
         else:
             self.ax.set_xlim(self.extent[:2])
             self.ax.set_ylim(self.extent[2:])
@@ -561,7 +791,7 @@ class Player:
         span = max(lon1 - lon0, lat1 - lat0)
         res = "10m" if span <= 15 else "50m" if span <= 60 else "110m"
 
-        self.ax.set_extent(self.extent, crs=self.crs)
+        self.ax.set_extent(self.extent, crs=self.data_crs)  # extent is in data lons
         self.ax.add_feature(
             cfeature.LAND.with_scale(res), facecolor="none", edgecolor="none", zorder=1
         )
@@ -609,7 +839,7 @@ class Player:
         self.qv = self.ax.quiver(
             us[xdim].values, us[ydim].values, us.values, vs.values,
             color="white", alpha=0.7, scale=400, width=0.0018, zorder=2,
-            **({"transform": self.crs} if self.crs else {}),
+            **({"transform": self.data_crs} if self.data_crs else {}),
         )
 
     # -- callbacks --------------------------------------------------------
@@ -688,6 +918,8 @@ def main():
     p.add_argument("--all", action="store_true", help="load the whole run without prompting")
     p.add_argument("--bbox", type=float, nargs=4, metavar=("W", "E", "S", "N"),
                    help="only load data inside this area, in degrees")
+    p.add_argument("--export", metavar="OUT.grib",
+                   help="write the selected area/time window to a new GRIB and exit")
     args = p.parse_args()
 
     # Stage 1: open lazily — index + coords only, no field data read yet.
@@ -712,6 +944,12 @@ def main():
     elif not args.all and sys.stdin.isatty():
         start, end, stride = choose_window(fields, times)
 
+    # Export works on the raw messages, so it never loads the fields at all.
+    if args.export:
+        export_grib(args.grib, args.export,
+                    tuple(args.bbox) if args.bbox else None, start, end, stride)
+        return
+
     # Stage 3: subset time+area first, *then* derive/convert — those materialize.
     fields = subset_area(subset_times(fields, start, end, stride), tuple(args.bbox) if args.bbox else None)
     fields = derive_fields(fields)
@@ -723,7 +961,7 @@ def main():
         use_interactive_backend()  # before the figure is created
 
     player = Player(fields, args.var, args.quiver, basemap=args.basemap,
-                    chrome=not args.save)
+                    chrome=not args.save, src=args.grib)
     if args.save:
         player.save(args.save, args.fps, args.dpi)
     else:
