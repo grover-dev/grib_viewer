@@ -16,18 +16,30 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-import warnings
 from dataclasses import dataclass, field
-
 from pathlib import Path
 
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
-import cfgrib
-import eccodes as ec
 import matplotlib
 import numpy as np
 import xarray as xr
+
+from grib_utils import (
+    X_NAMES,
+    Y_NAMES,
+    available_times,
+    derive_fields,
+    estimate_bytes,
+    fmt_time,
+    open_grib,
+    scan_times,
+    subset_area,
+    subset_times,
+    write_subset,
+    xdim_of,
+    ydim_of,
+)
 
 
 def use_interactive_backend() -> None:
@@ -59,8 +71,6 @@ from matplotlib.widgets import (  # noqa: E402
     Slider,
 )
 
-Y_NAMES = ("latitude", "lat", "y")
-X_NAMES = ("longitude", "lon", "x")
 
 
 # ---------------------------------------------------------------------------
@@ -80,11 +90,11 @@ class Layer:
 
     @property
     def ydim(self) -> str:
-        return next(d for d in self.data.dims if d in Y_NAMES)
+        return ydim_of(self.data)
 
     @property
     def xdim(self) -> str:
-        return next(d for d in self.data.dims if d in X_NAMES)
+        return xdim_of(self.data)
 
 
 def _norm_units(u: str) -> str:
@@ -123,10 +133,9 @@ def _limits(da: xr.DataArray, diverging: bool) -> tuple[float, float]:
     tstride = max(1, nt // 8)  # at most ~8 time slices
     sample = da.isel(time=slice(None, None, tstride))
 
-    ny, nx = (sample.sizes[d] for d in sample.dims if d in Y_NAMES + X_NAMES)
+    ydim, xdim = ydim_of(sample), xdim_of(sample)
+    ny, nx = sample.sizes[ydim], sample.sizes[xdim]
     sstride = max(1, int(np.sqrt(ny * nx / 40_000)))  # cap ~40k points per slice
-    ydim = next(d for d in sample.dims if d in Y_NAMES)
-    xdim = next(d for d in sample.dims if d in X_NAMES)
     sample = sample.isel({ydim: slice(None, None, sstride), xdim: slice(None, None, sstride)})
 
     values = np.asarray(sample.values)
@@ -149,11 +158,19 @@ def build_layer(key: str, da: xr.DataArray) -> Layer:
     units = _norm_units(attrs.get("units", ""))
     name = f"{key} {label}".lower()
 
-    # A field is diverging if it can meaningfully be negative about zero:
-    # vector components, anomalies, net fluxes.
+    # A field is diverging if it can meaningfully be negative about zero: vector
+    # components, anomalies, tendencies. Match the long name as well as the key
+    # -- ERA5 writes "10 metre U wind component", and keying off the short name
+    # alone misses anything not literally u10/v10 (GRIB also uses 10u/10v), which
+    # would put a signed field on a sequential colormap and hide the sign.
     diverging = bool(
-        re.search(r"\b(u|v)-?component|eastward|northward|anomaly|tendency", name)
-    ) or re.fullmatch(r"[uv]\d*", key.lower()) is not None
+        re.search(
+            r"\b[uv][- ]?(component|wind)\b"      # "U wind component", "u-component"
+            r"|\bcomponent of wind\b"
+            r"|eastward|northward|anomaly|tendency",
+            name,
+        )
+    ) or re.fullmatch(r"(10|100)?[uv](10|100|n)?", key.lower()) is not None
 
     # --- unit-driven conversions -------------------------------------------
     if units in ("k", "kelvin"):
@@ -193,245 +210,16 @@ def build_layer(key: str, da: xr.DataArray) -> Layer:
 
     da.attrs["display_units"] = units
     return Layer(key=key, data=da, label=label, units=units, cmap=cmap, vmin=vmin, vmax=vmax)
-
-
-# ---------------------------------------------------------------------------
-# Loading
-# ---------------------------------------------------------------------------
-
-
-def _coord_tag(dim: str, value) -> str:
-    """Readable suffix for a layer split out along an extra dim (e.g. a level).
-
-    Timedeltas get formatted as hours rather than raw nanoseconds — a coordinate
-    printed as '10800000000000 nanoseconds' is unusable as a variable name.
-    """
-    if np.issubdtype(np.asarray(value).dtype, np.timedelta64):
-        return f"{dim}{int(np.asarray(value) / np.timedelta64(1, 'h'))}h"
-    v = np.asarray(value).item()
-    return f"{dim}{v:g}" if isinstance(v, float) else f"{dim}{v}"
-
-
-def normalize_lons(da: xr.DataArray) -> xr.DataArray:
-    """Put a global 0..360 grid onto -180..180, and leave everything else alone.
-
-    ERA5 ships *global* fields on 0..360, which renders with the Atlantic torn
-    down the middle unless it is rolled onto -180..180.
-
-    A regional grid must NOT be touched. A Pacific window written by slice_grib
-    runs e.g. 170..190: wrapping that into -180..180 and sorting scatters it into
-    two clumps (-180..-170 and 170..180) with a hole in between, and imshow --
-    which assumes uniform spacing -- would smear it across the whole map. Such a
-    grid is already contiguous in its own frame, so it is left as it is; the
-    Player re-centres the projection instead.
-    """
-    xdim = next((d for d in da.dims if d in X_NAMES), None)
-    if xdim is None:
-        return da
-
-    lons = da[xdim].values
-    if lons.max() <= 180.0:
-        return da
-
-    step = float(np.median(np.diff(lons))) if lons.size > 1 else 0.0
-    spans_globe = lons.size > 1 and (lons.max() - lons.min() + abs(step)) >= 359.9
-    if not spans_globe:
-        return da  # regional window: already contiguous in its own frame
-
-    da = da.assign_coords({xdim: ((lons + 180.0) % 360.0) - 180.0})
-    return da.sortby(xdim)
-
-
-def use_valid_time(da: xr.DataArray) -> xr.DataArray:
-    """Put the field on its *valid* time axis — the hour it actually describes.
-
-    ERA5 accumulations (tp, ssrd, tsr, cdir) are stored against a reference time
-    plus a forecast step; valid time is time + step. Must run BEFORE squeeze():
-    a field with a single step has step/valid_time as scalar coords, and squeeze
-    would drop them, silently leaving the field on its reference time — which is
-    a different hour, so it lands on a phantom timestamp of its own.
-    """
-    if "step" in da.dims:
-        return collapse_step(da)
-
-    if "valid_time" not in da.coords:
-        return da
-
-    vt = da["valid_time"]
-    drop = [c for c in ("time", "step", "valid_time") if c in da.coords]
-
-    if vt.ndim == 0:  # single step: scalar valid_time
-        return da.drop_vars(drop).expand_dims(time=[vt.values])
-    if "time" in da.dims and vt.dims == ("time",):
-        return da.drop_vars(drop).assign_coords(time=vt.values)
-    return da
-
-
-def collapse_step(da: xr.DataArray) -> xr.DataArray:
-    """Fold an accumulation's (time, step) axes into a single valid-time axis."""
-    stacked = [d for d in ("time", "step") if d in da.dims]
-    valid = da["valid_time"] if "valid_time" in da.coords else da["time"] + da["step"]
-
-    da = da.stack(_vt=stacked)
-    times = valid.stack(_vt=stacked).values if set(stacked) <= set(valid.dims) else valid.values
-
-    # drop the MultiIndex the stack created, then relabel with the real times
-    da = da.reset_index("_vt", drop=True).drop_vars(
-        [c for c in ("time", "step", "valid_time") if c in da.coords], errors="ignore"
-    )
-    da = da.assign_coords(_vt=("_vt", times)).rename(_vt="time")
-
-    # a step ladder overlaps at the boundaries (18Z+6h == 00Z+0h); keep one
-    da = da.drop_duplicates("time").sortby("time")
-
-    ydim = next(d for d in da.dims if d in Y_NAMES)
-    xdim = next(d for d in da.dims if d in X_NAMES)
-    return da.transpose("time", ydim, xdim)
-
-
-def open_grib(path: str) -> dict[str, xr.DataArray]:
-    """Flatten a GRIB into {name: DataArray(time, y, x)}, keeping every field.
-
-    Nothing is read here beyond the GRIB index and coordinates: the arrays come
-    back lazily-indexed, so this stays cheap even on a multi-GB file. That is
-    what lets us show the user the time axis *before* committing to loading it.
-
-    A single GRIB can hold incompatible hypercubes (different level types or
-    step conventions), so cfgrib returns a *list* of datasets; we take the
-    variables from all of them. Variables on multiple levels are split into one
-    layer per level so each one is independently renderable.
-    """
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", FutureWarning)  # cfgrib's xr.merge compat warning
-        datasets = cfgrib.open_datasets(path, backend_kwargs={"indexpath": ""})
-    fields: dict[str, xr.DataArray] = {}
-
-    for ds in datasets:
-        for name, da in ds.data_vars.items():
-            if "valid_time" in da.dims:
-                da = da.rename(valid_time="time")
-            da = use_valid_time(da)  # BEFORE squeeze: it would drop scalar step coords
-            # squeeze only the nuisance dims (number, surface, ...): a blanket
-            # squeeze would also eat a length-1 time axis, e.g. a 1-frame file
-            junk = [d for d in da.dims
-                    if da.sizes[d] == 1 and d not in ("time",) + Y_NAMES + X_NAMES]
-            da = da.squeeze(junk, drop=True)
-            da = normalize_lons(da)
-            if "time" not in da.dims:
-                da = da.expand_dims("time")  # single snapshot still plays
-
-            spatial = [d for d in da.dims if d in Y_NAMES + X_NAMES]
-            if len(spatial) != 2:
-                continue
-
-            extra = [d for d in da.dims if d not in spatial + ["time"]]
-            if not extra:
-                fields[str(name)] = da
-            else:
-                # e.g. isobaricInhPa / number -> one layer per coordinate value
-                for idx in np.ndindex(*(da.sizes[d] for d in extra)):
-                    sel = {d: int(i) for d, i in zip(extra, idx)}
-                    sub = da.isel(sel)
-                    tag = "_".join(_coord_tag(d, sub[d].values) for d in extra)
-                    sub.attrs = dict(da.attrs)
-                    fields[f"{name}_{tag}"] = sub
-
-    if not fields:
-        raise SystemExit(f"No (time, y, x) fields found in {path}")
-    return fields
-
-
-def derive_fields(fields: dict[str, xr.DataArray]) -> dict[str, xr.DataArray]:
-    """Add wind speed for any u/v pair present (u10/v10, u100/v100, u/v, ...).
-
-    Runs *after* time subsetting: np.hypot forces the arrays into memory, so
-    doing it on the full cube would defeat the point of asking the user what to
-    load.
-    """
-    for uname in list(fields):
-        vname = "v" + uname[1:]
-        if not uname.startswith("u") or vname not in fields:
-            continue
-        ws = np.hypot(fields[uname], fields[vname])
-        ws.attrs = {
-            "long_name": f"wind speed{uname[1:] and f' ({uname[1:]} m)' or ''}",
-            "units": fields[uname].attrs.get("units", "m s**-1"),
-        }
-        fields[f"ws{uname[1:]}"] = ws
-    return fields
-
-
 # ---------------------------------------------------------------------------
 # Time selection — what to load, decided before anything is read
 # ---------------------------------------------------------------------------
-
-
-def available_times(fields: dict[str, xr.DataArray]) -> np.ndarray:
-    """Every valid time present in the file, across all fields."""
-    return np.unique(np.concatenate([f["time"].values for f in fields.values()]))
-
-
-def estimate_bytes(fields: dict[str, xr.DataArray], n_times: int) -> int:
-    """Rough RAM cost of loading n_times steps of every field."""
-    return sum(
-        int(np.prod([s for d, s in f.sizes.items() if d != "time"])) * n_times * f.dtype.itemsize
-        for f in fields.values()
-    )
-
-
-def subset_times(
-    fields: dict[str, xr.DataArray], start, end, stride: int = 1
-) -> dict[str, xr.DataArray]:
-    """Restrict every field to [start, end] (inclusive) with an optional stride.
-
-    Fields whose axes differ are each sliced on their own time coordinate, so a
-    field offset from the others still lands in the requested window.
-    """
-    out = {}
-    for k, f in fields.items():
-        sel = f.sel(time=slice(start, end))
-        if stride > 1:
-            sel = sel.isel(time=slice(None, None, stride))
-        if sel.sizes.get("time", 0):
-            out[k] = sel
-    if not out:
-        raise SystemExit(f"No data in the window {start} .. {end}")
-    return out
-
-
-def subset_area(fields: dict[str, xr.DataArray], bbox: tuple | None) -> dict[str, xr.DataArray]:
-    """Crop every field to bbox = (west, east, south, north), in degrees.
-
-    Latitude is sliced in whatever direction the grid actually scans (ERA5 runs
-    north -> south), since xarray's slice() follows coordinate order, not value
-    order — slicing (south, north) against a descending axis returns nothing.
-    """
-    if bbox is None:
-        return fields
-    west, east, south, north = bbox
-    out = {}
-    for k, f in fields.items():
-        ydim = next(d for d in f.dims if d in Y_NAMES)
-        xdim = next(d for d in f.dims if d in X_NAMES)
-        lat = f[ydim].values
-        ysel = slice(north, south) if lat[0] > lat[-1] else slice(south, north)
-        sel = f.sel({ydim: ysel, xdim: slice(west, east)})
-        if sel.sizes[ydim] and sel.sizes[xdim]:
-            out[k] = sel
-    if not out:
-        raise SystemExit(f"No data inside bbox {bbox}")
-    return out
-
-
-def _fmt(t) -> str:
-    return np.datetime_as_string(t, unit="m") + "Z"
 
 
 def choose_window(fields: dict[str, xr.DataArray], times: np.ndarray) -> tuple:
     """Interactive prompt: how much of the time axis should we actually load?"""
     full = estimate_bytes(fields, len(times)) / 1e9
     print(f"\n  {len(fields)} fields: {', '.join(sorted(fields))}")
-    print(f"  {len(times)} time steps: {_fmt(times[0])} .. {_fmt(times[-1])}")
+    print(f"  {len(times)} time steps: {fmt_time(times[0])} .. {fmt_time(times[-1])}")
     print(f"  loading all of it costs roughly {full:.2f} GB of RAM\n")
     print("  [a] load all")
     print("  [r] load a range")
@@ -444,16 +232,16 @@ def choose_window(fields: dict[str, xr.DataArray], times: np.ndarray) -> tuple:
         return times[0], times[-1], stride
 
     if choice == "r":
-        print(f"\n  enter times as YYYY-MM-DD[THH:MM]; blank = keep the end of the range")
-        s = input(f"  start [{_fmt(times[0])}]: ").strip()
-        e = input(f"  end   [{_fmt(times[-1])}]: ").strip()
+        print("\n  enter times as YYYY-MM-DD[THH:MM]; blank = keep the end of the range")
+        s = input(f"  start [{fmt_time(times[0])}]: ").strip()
+        e = input(f"  end   [{fmt_time(times[-1])}]: ").strip()
         start = np.datetime64(s) if s else times[0]
         end = np.datetime64(e) if e else times[-1]
         if end < start:
             raise SystemExit("end is before start")
         kept = int(((times >= start) & (times <= end)).sum())
         if not kept:
-            raise SystemExit(f"no steps between {_fmt(start)} and {_fmt(end)}")
+            raise SystemExit(f"no steps between {fmt_time(start)} and {fmt_time(end)}")
         cost = estimate_bytes(fields, kept) / 1e9
         print(f"\n  -> {kept} steps, roughly {cost:.2f} GB")
         return start, end, 1
@@ -461,99 +249,6 @@ def choose_window(fields: dict[str, xr.DataArray], times: np.ndarray) -> tuple:
     return times[0], times[-1], 1
 
 
-# ---------------------------------------------------------------------------
-# Export — carve a smaller GRIB out of the source
-# ---------------------------------------------------------------------------
-
-
-def export_grib(src: str, dst: str, bbox: tuple | None, start=None, end=None, stride: int = 1) -> int:
-    """Write a new GRIB containing only the requested area and time window.
-
-    Works on the raw messages rather than going back through xarray: cfgrib's
-    writer needs the original GRIB_* attrs intact, which our unit conversions
-    and derived fields have already destroyed. Cropping the message values and
-    rewriting the grid headers keeps the output a valid GRIB that any tool
-    (including this viewer) can read.
-
-    Returns the number of messages written.
-    """
-    kept_times: dict = {}
-    written = 0
-
-    with open(src, "rb") as fin, open(dst, "wb") as fout:
-        while (h := ec.codes_grib_new_from_file(fin)) is not None:
-            try:
-                grid = ec.codes_get(h, "gridType")
-                if grid != "regular_ll":
-                    raise SystemExit(
-                        f"can only subset regular lat/lon grids, got {grid!r}. "
-                        "Re-download with a regular_ll grid, or export without --bbox."
-                    )
-
-                # valid time of this message (validity*, not dataDate: accumulated
-                # fields carry a step offset from their reference time)
-                vd = ec.codes_get(h, "validityDate")  # YYYYMMDD
-                vt = ec.codes_get(h, "validityTime")  # HHMM
-                when = np.datetime64(
-                    f"{vd // 10000:04d}-{vd // 100 % 100:02d}-{vd % 100:02d}"
-                    f"T{vt // 100:02d}:{vt % 100:02d}"
-                )
-                if (start is not None and when < start) or (end is not None and when > end):
-                    continue
-
-                if stride > 1:
-                    # index each distinct time we see, keep every Nth
-                    idx = kept_times.setdefault(when, len(kept_times))
-                    if idx % stride:
-                        continue
-
-                ni = ec.codes_get(h, "Ni")
-                nj = ec.codes_get(h, "Nj")
-                lat_first = ec.codes_get(h, "latitudeOfFirstGridPointInDegrees")
-                lat_last = ec.codes_get(h, "latitudeOfLastGridPointInDegrees")
-                lon_first = ec.codes_get(h, "longitudeOfFirstGridPointInDegrees")
-                lon_last = ec.codes_get(h, "longitudeOfLastGridPointInDegrees")
-
-                lats = np.linspace(lat_first, lat_last, nj)
-                lons = np.linspace(lon_first, lon_last, ni)
-                values = ec.codes_get_values(h).reshape(nj, ni)
-
-                if bbox is not None:
-                    west, east, south, north = bbox
-                    # handle a 0..360 source against a -180..180 request
-                    req_lons = lons if lons.max() <= 180 else np.where(lons > 180, lons - 360, lons)
-                    jm = (lats >= south) & (lats <= north)
-                    im = (req_lons >= west) & (req_lons <= east)
-                    if not jm.any() or not im.any():
-                        continue
-                    j0, j1 = np.flatnonzero(jm)[[0, -1]]
-                    i0, i1 = np.flatnonzero(im)[[0, -1]]
-
-                    values = values[j0:j1 + 1, i0:i1 + 1]
-                    lats, lons = lats[j0:j1 + 1], lons[i0:i1 + 1]
-                    nj, ni = values.shape
-
-                    ec.codes_set(h, "Ni", ni)
-                    ec.codes_set(h, "Nj", nj)
-                    ec.codes_set(h, "latitudeOfFirstGridPointInDegrees", float(lats[0]))
-                    ec.codes_set(h, "latitudeOfLastGridPointInDegrees", float(lats[-1]))
-                    ec.codes_set(h, "longitudeOfFirstGridPointInDegrees", float(lons[0]))
-                    ec.codes_set(h, "longitudeOfLastGridPointInDegrees", float(lons[-1]))
-                    ec.codes_set_values(h, values.ravel())
-
-                ec.codes_write(h, fout)
-                written += 1
-            finally:
-                ec.codes_release(h)
-
-    if not written:
-        raise SystemExit("nothing matched the requested area/time window")
-    size = Path(dst).stat().st_size / 1e6
-    print(f"wrote {dst}: {written} messages, {size:.1f} MB")
-    return written
-
-
-# ---------------------------------------------------------------------------
 # Viewer
 # ---------------------------------------------------------------------------
 
@@ -710,9 +405,13 @@ class Player:
         self.ax.set_title(f"exporting to {dst.name} ...", fontsize=11, y=1.02)
         self.fig.canvas.draw()
         try:
-            export_grib(self.src, str(dst), (w, e, s, n), self.times[0], self.times[-1])
-            msg = f"exported {dst.name}"
-        except SystemExit as exc:  # export_grib refuses non-regular_ll grids
+            # Export exactly the frames on the timeline (which already reflect
+            # any --start/--end/--stride) and the visible area. self.times holds
+            # them, so there is no need to rescan the source.
+            keep = set(self.times.tolist())
+            written = write_subset(self.src, str(dst), keep, (w, e, s, n))
+            msg = f"exported {dst.name} ({written} messages)"
+        except SystemExit as exc:  # refuses non-regular_ll grids
             msg = f"export failed: {exc}"
         print(msg)
         self.ax.set_title(msg, fontsize=11, y=1.02)
@@ -944,18 +643,21 @@ def main():
     elif not args.all and sys.stdin.isatty():
         start, end, stride = choose_window(fields, times)
 
-    # Export works on the raw messages, so it never loads the fields at all.
+    # Export works on the raw messages, so it never decodes the fields at all.
     if args.export:
-        export_grib(args.grib, args.export,
-                    tuple(args.bbox) if args.bbox else None, start, end, stride)
+        keep = times[(times >= start) & (times <= end)][::stride]
+        written = write_subset(args.grib, args.export, set(keep.tolist()),
+                               tuple(args.bbox) if args.bbox else None)
+        print(f"wrote {args.export}: {written} messages, {len(keep)} steps "
+              f"({fmt_time(keep[0])} .. {fmt_time(keep[-1])})")
         return
 
     # Stage 3: subset time+area first, *then* derive/convert — those materialize.
-    fields = subset_area(subset_times(fields, start, end, stride), tuple(args.bbox) if args.bbox else None)
-    fields = derive_fields(fields)
+    bbox = tuple(args.bbox) if args.bbox else None
+    fields = derive_fields(subset_area(subset_times(fields, start, end, stride), bbox))
     kept = len(available_times(fields))
     print(f"loading {kept} of {len(times)} steps "
-          f"({_fmt(start)} .. {_fmt(end)}, stride {stride})")
+          f"({fmt_time(start)} .. {fmt_time(end)}, stride {stride})")
 
     if not args.save:
         use_interactive_backend()  # before the figure is created
