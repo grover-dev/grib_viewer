@@ -11,3 +11,6 @@ wheels/
 
 # GRIB inputs and rendered animations — large, regenerable via make_sample_grib.py
 data/
+
+# cfgrib message indexes
+.cache/

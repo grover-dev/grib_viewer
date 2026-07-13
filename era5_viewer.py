@@ -151,6 +151,43 @@ def _limits(da: xr.DataArray, diverging: bool) -> tuple[float, float]:
     return lo, hi
 
 
+class FrameCache:
+    """LRU cache of decoded frames, bounded by *bytes* rather than count.
+
+    Count-bounding is a trap here: a frame of a regional crop is ~30 KB, but a
+    global 0.25° frame is 8 MB, so "keep 64 frames" would silently hold half a
+    gigabyte and undo the point of loading lazily in the first place.
+    """
+
+    def __init__(self, budget_bytes: int = 256 << 20):  # 256 MB
+        self.budget = budget_bytes
+        self.used = 0
+        self._items: dict = {}  # insertion-ordered; oldest first
+
+    def get(self, key):
+        if key not in self._items:
+            return None
+        value = self._items.pop(key)  # reinsert to mark as most recently used
+        self._items[key] = value
+        return value
+
+    def put(self, key, value) -> None:
+        size = int(value.nbytes)
+        if size > self.budget:  # a single frame larger than the budget: don't cache
+            return
+        if key in self._items:
+            self.used -= int(self._items.pop(key).nbytes)
+        self._items[key] = value
+        self.used += size
+        while self.used > self.budget and len(self._items) > 1:
+            oldest = next(iter(self._items))  # dicts keep insertion order
+            self.used -= int(self._items.pop(oldest).nbytes)
+
+    def clear(self) -> None:
+        self._items.clear()
+        self.used = 0
+
+
 def build_layer(key: str, da: xr.DataArray) -> Layer:
     """Infer presentation entirely from the variable's own attributes + values."""
     attrs = da.attrs
@@ -276,6 +313,7 @@ class Player:
         self.global_colors = global_colors
         self.bbox = None
 
+        self.cache = FrameCache()
         self.layers = {k: build_layer(k, v) for k, v in self.source.items()}
         # Colour limits over the whole domain, kept for --global-colors so the
         # scale doesn't shift under you when you zoom.
@@ -439,6 +477,7 @@ class Player:
         this genuinely narrows what gets rendered — not just the axis limits.
         """
         self.bbox = bbox
+        self.cache.clear()  # cached frames are the previous crop's shape
         cropped = subset_area(self.source, bbox)
         self.layers = {k: build_layer(k, v) for k, v in cropped.items()}
         if self.global_colors:  # keep the full-domain scale
@@ -471,8 +510,18 @@ class Player:
         return self.times[self.frame]
 
     def _at(self, layer: Layer) -> xr.DataArray:
-        """This layer at the current wall-clock time (nearest step if it lags)."""
-        return layer.data.sel(time=self.now, method="nearest")
+        """This layer at the current wall-clock time (nearest step if it lags).
+
+        Decoded frames are cached, because the fields are lazy: without this,
+        every pass of the play loop re-reads and re-decompresses the same frames
+        off disk. The dask graph is only evaluated on a miss.
+        """
+        key = (layer.key, self.now)
+        hit = self.cache.get(key)
+        if hit is None:
+            hit = layer.data.sel(time=self.now, method="nearest").load()
+            self.cache.put(key, hit)
+        return hit
 
     def _frame_data(self) -> np.ndarray:
         return self._at(self.current).values

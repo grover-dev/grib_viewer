@@ -153,6 +153,56 @@ def test_pacific_window_recentres_the_projection():
 # ---------------------------------------------------------------------------
 
 
+def test_frame_cache_is_bounded_by_bytes_not_count():
+    """A global frame is 8 MB; bounding by count would quietly hold 100s of MB."""
+    cache = ev.FrameCache(budget_bytes=1000)
+
+    class Fake:
+        def __init__(self, n):
+            self.nbytes = n
+
+    for i in range(10):
+        cache.put(("v", i), Fake(300))
+
+    assert cache.used <= 1000, "cache must respect its byte budget"
+    assert cache.get(("v", 0)) is None, "oldest frames must be evicted"
+    assert cache.get(("v", 9)) is not None, "newest frame must survive"
+
+
+def test_frame_cache_evicts_least_recently_used():
+    cache = ev.FrameCache(budget_bytes=1000)
+
+    class Fake:
+        def __init__(self, n):
+            self.nbytes = n
+
+    for i in range(3):
+        cache.put(("v", i), Fake(300))
+    cache.get(("v", 0))          # touch the oldest, making it most recent
+    cache.put(("v", 3), Fake(300))  # forces an eviction
+
+    assert cache.get(("v", 0)) is not None, "a recently used frame must not be evicted"
+    assert cache.get(("v", 1)) is None, "the least recently used one should go"
+
+
+def test_zoom_invalidates_the_frame_cache(global_grib):
+    """Cached frames belong to the previous crop; reusing them would be a shape error."""
+    p = ev.Player(_fields(global_grib), "u10", False, basemap=False)
+    p.set_frame(0)
+    full_shape = p._frame_data().shape
+    assert p.cache.used > 0
+
+    p.set_bbox((0, 30, 0, 30))
+
+    # set_bbox clears the cache and then renders, so it legitimately holds one
+    # frame again -- what matters is that nothing of the OLD shape survived
+    cropped_shape = p.current.data.isel(time=0).shape
+    assert cropped_shape != full_shape
+    assert all(v.shape == cropped_shape for v in p.cache._items.values()), \
+        "no frame from the previous crop may survive the zoom"
+    assert p._frame_data().shape == cropped_shape
+
+
 def test_subset_then_derive_keeps_it_lazy(global_grib):
     """derive_fields materializes (np.hypot), so it must run AFTER subsetting."""
     fields = gu.open_grib(str(global_grib))

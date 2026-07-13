@@ -30,6 +30,90 @@ the very first render needs a network connection. They're cached afterwards.
 
 ---
 
+## What GRIB actually is
+
+Worth reading once, because nearly every awkward thing in this codebase is a
+direct consequence of the format.
+
+**A GRIB file is not a cube. It's a flat pile of independent records**, called
+*messages*, concatenated back to back. There is no header, no index, no table of
+contents — just message after message, each one self-describing.
+
+**One message = one 2-D field at one instant.** It carries a small block of
+metadata keys plus a packed grid of values:
+
+```
+┌─ message ────────────────────────────────────┐
+│ paramId 165  ("10 metre U wind component")   │  what
+│ validityDate 20250105, validityTime 0400     │  when
+│ gridType regular_ll, Ni 1440, Nj 721         │  where
+│ latitudeOfFirstGridPointInDegrees 90.0  ...  │
+│ [ 1,038,240 packed values ]                  │  the data
+└──────────────────────────────────────────────┘
+```
+
+So a month of hourly ERA5 with 14 variables isn't one array — it's
+`744 × 14 ≈ 10,000 separate messages` in one file. The 3-D "cube" you think of
+(`time × lat × lon`) doesn't exist on disk; **cfgrib reconstructs it** by reading
+every message's headers and working out which ones stack together.
+
+That single fact explains most of this project's design:
+
+**Why there are two layers.** `grib_utils.py` has a *message layer* and an
+*xarray layer*. Slicing works on raw messages — to cut a file down you just copy
+the messages you want and skip the rest. No decoding, no cube, and every original
+metadata key survives into the output. (Going the other way, through xarray, is
+lossy: cfgrib's writer needs the original `GRIB_*` attrs intact, and unit
+conversions destroy them.)
+
+**Why scanning is cheap but loading is expensive.** Reading every message's
+*headers* to list the time axis takes seconds even on 16 GB, because the packed
+values are skipped. Reading the *values* means decompressing gigabytes.
+
+**Why the time axis is a minefield.** Each message states the hour it's valid for
+(`validityDate`/`validityTime`) — but *accumulated* fields (precipitation,
+radiation) are stored against a **reference time plus a forecast step**:
+
+```
+tsr:  dataDate/dataTime  20250104 1800   +   endStep 10h
+      validityDate/Time  20250105 0400        ← the hour it actually describes
+```
+
+(That's a real message out of `data.grib`, not a hypothetical.)
+
+Read the reference time and your rainfall lands 10 hours away from your wind.
+Worse, cfgrib presents these as a rectangular `(time × step)` grid, which implies
+combinations the file never contained — so the cube grows phantom all-NaN frames
+at the edges. This project reads `validityDate`/`validityTime` from the messages
+and treats them as ground truth.
+
+**Why longitudes are a minefield too.** Each message declares its own grid
+corners. ERA5's global fields start at longitude 0 and run east to 359.75 — not
+−180…180 — so a European bounding box is *already* a wrap-around in the source
+data, spanning columns near 350 and columns near 5.
+
+**Other things messages don't have to agree on.** Two messages in the same file
+can be on completely different grids: in a real ERA5 download the wave fields
+(`swh`, `mwp`, `mwd`) arrive at 0.5° while the atmospheric fields are at 0.25°.
+Nothing forbids it, so the tooling has to cope.
+
+**Names are not stable.** A message identifies its parameter by a numeric
+`paramId` (165), and its `shortName` in the file is `10u` — but cfgrib hands it to
+xarray as `u10`. So the same field has three names depending on which layer you're
+standing in, and none of them is safe to key behaviour off. This is why the viewer
+infers presentation from *units* and the long name rather than matching variable
+names.
+
+**GRIB1 vs GRIB2** are different encodings of the same idea; ecCodes reads both
+and this project doesn't care which you have. (Your file is edition 1.)
+
+Handy for poking at a file directly, if you have ecCodes' CLI installed:
+
+```bash
+grib_ls  data.grib          # one line per message: param, date, time, grid
+grib_dump -O data.grib      # every key of every message (very verbose)
+```
+
 ## The three tools
 
 | tool | what it's for |

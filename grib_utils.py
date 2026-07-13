@@ -14,7 +14,10 @@ Two layers live here, and they exist for different reasons:
 
 from __future__ import annotations
 
+import hashlib
+import os
 import warnings
+from pathlib import Path
 
 import cfgrib
 import eccodes as ec
@@ -23,6 +26,9 @@ import xarray as xr
 
 Y_NAMES = ("latitude", "lat", "y")
 X_NAMES = ("longitude", "lon", "x")
+
+# where cfgrib's message indexes are kept (override with BOATFORGE_CACHE)
+CACHE_DIR = Path(os.environ.get("BOATFORGE_CACHE", Path(__file__).parent / ".cache"))
 
 
 def fmt_time(t) -> str:
@@ -257,11 +263,21 @@ def open_grib(path: str, chunks: dict | None = None) -> dict[str, xr.DataArray]:
     from all of them. A variable on multiple levels is split into one field per
     level so each is independently renderable.
     """
+    # Let cfgrib keep the index it builds; re-opening is much cheaper than
+    # re-walking every message header.
+    #
+    # The {path} in the template is load-bearing: cfgrib's {short_hash} hashes the
+    # *backend options*, not the file, so a template without {path} makes every
+    # GRIB collide on one index filename and the cache silently never hits.
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    tag = hashlib.sha1(os.path.abspath(path).encode()).hexdigest()[:12]
+    indexpath = str(CACHE_DIR / f"{tag}.{{short_hash}}.idx")
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", FutureWarning)  # cfgrib's xr.merge compat warning
         datasets = cfgrib.open_datasets(
             path,
-            backend_kwargs={"indexpath": ""},
+            backend_kwargs={"indexpath": indexpath},
             chunks=chunks if chunks is not None else {"time": 1},
         )
     fields: dict[str, xr.DataArray] = {}
