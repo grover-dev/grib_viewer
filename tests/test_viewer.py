@@ -224,6 +224,64 @@ def test_scalebar_accounts_for_latitude(global_grib):
         "length should come from the 1-2-5 ladder"
 
 
+def test_smooth_checkbox_toggles_interpolation(global_grib):
+    """The smooth box flips imshow between bilinear (default) and true cells."""
+    p = ev.Player(_fields(global_grib), "u10", False, basemap=False)
+    assert p.smooth is True
+    assert p.im.get_interpolation() == "bilinear"
+
+    p._on_check("smooth")
+    assert p.smooth is False
+    assert p.im.get_interpolation() == "nearest"
+
+    p._on_check("smooth")
+    assert p.im.get_interpolation() == "bilinear"
+
+
+def test_checkbox_routing_is_independent(global_grib):
+    """The shared handler must not cross-wire the two boxes."""
+    p = ev.Player(_fields(global_grib), "u10", False, basemap=False)
+
+    smooth_before = p.smooth
+    p._on_check("global colors")
+    assert p.smooth == smooth_before, "toggling colours must not touch smoothing"
+
+    colors_before = p.global_colors
+    p._on_check("smooth")
+    assert p.global_colors == colors_before, "toggling smoothing must not touch colours"
+
+
+def test_grid_resolution_readout(global_grib):
+    """Per-layer cell size, in degrees and latitude-corrected km."""
+    fields = _fields(global_grib)
+    p = ev.Player(fields, "u10", False, basemap=False)
+
+    text = p.grid_txt.get_text()
+    ny, nx = fields["u10"].isel(time=0).shape
+    assert f"{ny}×{nx}" in text
+    assert "°" in text and "km/cell" in text
+
+    # a 10° global grid: north-south cell is 10 * KM_PER_DEGREE
+    res = p.layers["u10"].resolution()
+    assert f"{10 * ev.KM_PER_DEGREE:.0f}" in res.replace(",", "")
+
+
+def test_grid_readout_tracks_the_current_layer(global_grib):
+    """Switching to a differently-gridded field must update the readout."""
+    import xarray as xr
+
+    coarse = xr.DataArray(
+        np.zeros((1, 3, 4)), dims=("time", "latitude", "longitude"),
+        coords={"time": [np.datetime64("2025-01-01")],
+                "latitude": [60.0, 30.0, 0.0], "longitude": [0.0, 30.0, 60.0, 90.0]},
+        attrs={"units": "m", "long_name": "coarse"},
+    )
+    p = ev.Player({**_fields(global_grib), "coarse": coarse}, "u10", False, basemap=False)
+    fine = p.grid_txt.get_text()
+    p.set_var("coarse")
+    assert p.grid_txt.get_text() != fine, "readout should change with the layer's grid"
+
+
 def test_scalebar_redraws_on_zoom(global_grib):
     p = ev.Player(_fields(global_grib), "u10", False, basemap=False)
     before = p._scalebar_artists[2].get_text()

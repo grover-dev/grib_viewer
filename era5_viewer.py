@@ -71,6 +71,12 @@ from matplotlib.widgets import (  # noqa: E402
     Slider,
 )
 
+# Kilometres per degree of latitude: mean meridional circumference (~40,075 km)
+# over 360°. Constant north-south; a degree of *longitude* is this only at the
+# equator and shrinks by cos(latitude), so callers apply that factor themselves.
+# Spherical approximation — the true value varies ~±0.5% with the Earth's oblateness.
+KM_PER_DEGREE = 111.32
+
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +101,26 @@ class Layer:
     @property
     def xdim(self) -> str:
         return xdim_of(self.data)
+
+    def resolution(self) -> str:
+        """Grid cell size, in degrees and (latitude-corrected) km.
+
+        Unlike the scale bar, this is per-cell and free of projection
+        distortion: a cell's north-south extent is dlat * KM_PER_DEGREE flat,
+        and its east-west extent shrinks by cos(lat), taken at the grid's
+        mid-latitude. Axes are shown separately only when they differ.
+        """
+        lat = self.data[self.ydim].values
+        lon = self.data[self.xdim].values
+        dlat = float(np.abs(np.diff(lat)).mean()) if lat.size > 1 else 0.0
+        dlon = float(np.abs(np.diff(lon)).mean()) if lon.size > 1 else 0.0
+
+        km_lat = dlat * KM_PER_DEGREE
+        km_lon = dlon * KM_PER_DEGREE * max(np.cos(np.deg2rad(float(lat.mean()))), 0.02)
+
+        deg = f"{dlat:g}°" if abs(dlat - dlon) < 1e-6 else f"{dlat:g}°×{dlon:g}°"
+        km = f"{km_lat:.0f} km" if abs(km_lat - km_lon) < 1 else f"{km_lat:.0f}×{km_lon:.0f} km"
+        return f"{lat.size}×{lon.size} @ {deg} (~{km}/cell)"
 
 
 def _norm_units(u: str) -> str:
@@ -330,6 +356,7 @@ class Player:
             None,
         )
         self.quiver_on = quiver and self.uv is not None
+        self.smooth = True  # bilinear display interpolation; off shows true cells
 
         # Master timeline = union of every layer's valid times. Layers are then
         # selected *by timestamp*, not by position: ERA5 accumulated fields
@@ -366,13 +393,21 @@ class Player:
         self.im = self.ax.imshow(
             self._frame_data(), extent=self.extent, origin=self.origin,
             cmap=cur.cmap, vmin=cur.vmin, vmax=cur.vmax,
-            interpolation="bilinear", aspect="auto", **geo,
+            interpolation="bilinear" if self.smooth else "nearest",
+            aspect="auto", **geo,
         )
         if basemap:
             self._draw_basemap()
         self.cbar = self.fig.colorbar(self.im, ax=self.ax, pad=0.02)
         self.qv = None
         self._scalebar_artists: list = []
+        # grid-resolution readout, top-left of the map; refreshed per layer since
+        # wave fields and atmospheric fields can be on different grids
+        self.grid_txt = self.ax.text(
+            0.01, 0.99, "", transform=self.ax.transAxes, va="top", ha="left",
+            fontsize=8, zorder=6,
+            bbox=dict(facecolor="white", edgecolor="none", alpha=0.6, pad=2),
+        )
         self._draw_scalebar()
         self._draw_quiver()
         self._relabel()
@@ -402,18 +437,20 @@ class Player:
         self.btn = Button(self.fig.add_axes((0.88, 0.06, 0.08, 0.05)), "▶ play")
         self.btn.on_clicked(self.toggle)
 
-        self.btn_reset = Button(self.fig.add_axes((0.88, 0.005, 0.08, 0.045)), "⤢ reset zoom")
+        self.btn_reset = Button(self.fig.add_axes((0.88, 0.005, 0.08, 0.045)), "⟳ reset zoom")
         self.btn_reset.label.set_fontsize(7)
         self.btn_reset.on_clicked(lambda _e: self.set_bbox(None))
 
-        # Colour limits: re-fit to the zoomed area (default), or pin to the
-        # full domain so the scale stays comparable across zooms.
-        ax_check = self.fig.add_axes((0.01, 0.16, 0.22, 0.06))
+        # global colors: pin colour limits to the full domain across zooms.
+        # smooth: bilinear display interpolation vs. true (nearest) grid cells.
+        ax_check = self.fig.add_axes((0.01, 0.15, 0.22, 0.08))
         ax_check.set_frame_on(False)
-        self.check = CheckButtons(ax_check, ["global colors"], [self.global_colors])
+        self.check = CheckButtons(
+            ax_check, ["global colors", "smooth"], [self.global_colors, self.smooth]
+        )
         for lbl in self.check.labels:
             lbl.set_fontsize(8)
-        self.check.on_clicked(self.toggle_global_colors)
+        self.check.on_clicked(self._on_check)
 
         if self.src:
             self.btn_export = Button(
@@ -457,11 +494,16 @@ class Player:
         self.ax.set_title(msg, fontsize=11, y=1.02)
         self.fig.canvas.draw()
 
-    # -- zoom -------------------------------------------------------------
-    def toggle_global_colors(self, _label):
-        """Flip between full-domain and visible-area colour limits, in place."""
-        self.global_colors = not self.global_colors
-        self.set_bbox(self.bbox)  # rebuild layers under the new limit policy
+    # -- checkboxes -------------------------------------------------------
+    def _on_check(self, label):
+        """Route a checkbox click by its label."""
+        if label == "global colors":
+            self.global_colors = not self.global_colors
+            self.set_bbox(self.bbox)  # rebuild layers under the new limit policy
+        elif label == "smooth":
+            self.smooth = not self.smooth
+            self.im.set_interpolation("bilinear" if self.smooth else "nearest")
+            self.fig.canvas.draw_idle()
 
     def _on_select(self, eclick, erelease):
         # Mouse coords come back in *projection* space. With a re-centred map
@@ -535,11 +577,11 @@ class Player:
     def _draw_scalebar(self):
         """Distance scale in the lower-left corner, sized for the current view.
 
-        A degree of longitude is 111.32 km only at the equator; at the latitude
-        the bar is drawn it shrinks by cos(lat). Sized there, not at the equator
-        -- at 60N the difference is a factor of two. Redrawn on every zoom, since
-        both the km/degree ratio and a sensible round length change with the
-        view.
+        A degree of longitude spans KM_PER_DEGREE only at the equator; at the
+        latitude the bar is drawn it shrinks by cos(lat). Sized there, not at the
+        equator -- at 60N the difference is a factor of two. Redrawn on every
+        zoom, since both the km/degree ratio and a sensible round length change
+        with the view.
         """
         for artist in self._scalebar_artists:
             artist.remove()
@@ -610,6 +652,8 @@ class Player:
         # back as inf, putting the title off-canvas entirely.
         self.ax.set_title(title, fontsize=13, y=1.02)
         self.cbar.set_label(c.units)
+        if getattr(self, "grid_txt", None) is not None:
+            self.grid_txt.set_text(c.resolution())
         if self.crs is None:  # cartopy gridlines already label the axes
             self.ax.set_xlabel("longitude")
             self.ax.set_ylabel("latitude")
@@ -663,7 +707,7 @@ class Player:
 
     def toggle(self, _event):
         self.playing = not self.playing
-        self.btn.label.set_text("⏸ pause" if self.playing else "▶ play")
+        self.btn.label.set_text("‖ pause" if self.playing else "▶ play")
         self.timer.start() if self.playing else self.timer.stop()
 
     def tick(self):
