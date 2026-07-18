@@ -203,6 +203,35 @@ def test_zoom_invalidates_the_frame_cache(global_grib):
     assert p._frame_data().shape == cropped_shape
 
 
+def test_scalebar_accounts_for_latitude(global_grib):
+    """A degree of longitude is 111.32 km only at the equator.
+
+    At 60N it is half that; a bar sized with the equatorial figure would claim
+    double the true distance. The bar's spanned degrees, converted at the
+    latitude it is drawn at, must equal its label.
+    """
+    p = ev.Player(_fields(global_grib), "u10", False, basemap=False)
+    p.set_bbox((-12, 5, 48, 62))  # UK-ish: cos(lat) ~ 0.6
+
+    line, _, label = p._scalebar_artists
+    x0, x1 = line.get_xdata()
+    lat = line.get_ydata()[0]
+    km = (x1 - x0) * 111.32 * np.cos(np.deg2rad(lat))
+    stated = float(label.get_text().replace(" km", "").replace(",", ""))
+
+    assert km == pytest.approx(stated, rel=1e-6)
+    assert stated in {s * 10 ** e for s in (1, 2, 5) for e in range(6)}, \
+        "length should come from the 1-2-5 ladder"
+
+
+def test_scalebar_redraws_on_zoom(global_grib):
+    p = ev.Player(_fields(global_grib), "u10", False, basemap=False)
+    before = p._scalebar_artists[2].get_text()
+    p.set_bbox((-30, 10, 40, 70))  # comfortably wider than the fixture's 10 deg grid
+    after = p._scalebar_artists[2].get_text()
+    assert before != after, "zooming in must shrink the scale bar"
+
+
 def test_subset_then_derive_keeps_it_lazy(global_grib):
     """derive_fields materializes (np.hypot), so it must run AFTER subsetting."""
     fields = gu.open_grib(str(global_grib))

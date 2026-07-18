@@ -372,6 +372,8 @@ class Player:
             self._draw_basemap()
         self.cbar = self.fig.colorbar(self.im, ax=self.ax, pad=0.02)
         self.qv = None
+        self._scalebar_artists: list = []
+        self._draw_scalebar()
         self._draw_quiver()
         self._relabel()
 
@@ -497,6 +499,7 @@ class Player:
         else:
             self.ax.set_xlim(self.extent[:2])
             self.ax.set_ylim(self.extent[2:])
+        self._draw_scalebar()  # both km/degree and a sensible length changed
         self.render()
 
     # -- state ----------------------------------------------------------
@@ -528,6 +531,46 @@ class Player:
 
     def _stamp(self, when=None) -> str:
         return np.datetime_as_string(when if when is not None else self.now, unit="m") + "Z"
+
+    def _draw_scalebar(self):
+        """Distance scale in the lower-left corner, sized for the current view.
+
+        A degree of longitude is 111.32 km only at the equator; at the latitude
+        the bar is drawn it shrinks by cos(lat). Sized there, not at the equator
+        -- at 60N the difference is a factor of two. Redrawn on every zoom, since
+        both the km/degree ratio and a sensible round length change with the
+        view.
+        """
+        for artist in self._scalebar_artists:
+            artist.remove()
+        self._scalebar_artists = []
+
+        west, east, south, north = self.extent
+        # anchor: 5% in from the lower-left corner of the visible area
+        y = south + 0.06 * (north - south)
+        x0 = west + 0.05 * (east - west)
+
+        km_per_deg = 111.32 * max(np.cos(np.deg2rad(y)), 0.02)  # floor near poles
+        view_km = (east - west) * km_per_deg
+
+        # a round 1-2-5 number close to a quarter of the view width
+        target = view_km / 4
+        mag = 10 ** np.floor(np.log10(target))
+        length_km = max(1, int(min((n for n in (1, 2, 5, 10)), key=lambda n: abs(n * mag - target)) * mag))
+        dx = length_km / km_per_deg
+
+        geo = {"transform": self.data_crs} if self.data_crs else {}
+        tick = 0.012 * (north - south)
+        line, = self.ax.plot([x0, x0 + dx], [y, y], color="black", lw=2.5,
+                             solid_capstyle="butt", zorder=6, **geo)
+        ends = self.ax.vlines([x0, x0 + dx], y - tick, y + tick,
+                              color="black", lw=1.5, zorder=6, **geo)
+        label = self.ax.text(
+            x0 + dx / 2, y + tick * 1.4, f"{length_km:,} km",
+            ha="center", va="bottom", fontsize=9, zorder=6,
+            bbox=dict(facecolor="white", edgecolor="none", alpha=0.65, pad=1.5), **geo,
+        )
+        self._scalebar_artists = [line, ends, label]
 
     def _draw_basemap(self):
         """Coastlines/borders clipped to the rendered area.
