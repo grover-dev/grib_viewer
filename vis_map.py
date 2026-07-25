@@ -57,12 +57,14 @@ Drag to rotate, scroll to zoom, `q` to quit.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, field
+from pathlib import Path
 
-import h3
 import numpy as np
 import pyvista as pv
+from h3.api import basic_int as h3
 from matplotlib.colors import LinearSegmentedColormap
+
+from map_utils import NavMap, lonlat_to_xyz
 
 # Palette: one sequential blue hue for magnitude, neutrals for everything that is
 # not data. Checked pairwise in OKLab under normal vision and simulated
@@ -81,6 +83,13 @@ MARGIN_CMAP = LinearSegmentedColormap.from_list(
     ["#3987e5", "#5598e7", "#6da7ec", "#86b6ef", "#9ec5f4", "#b7d3f6", "#cde2fb"],
 )
 
+# A second sequential context takes the next categorical hue, as its own one-hue
+# ramp -- orange, matching the track accent. Used for battery on the course.
+BATTERY_CMAP = LinearSegmentedColormap.from_list(
+    "battery",
+    ["#7d2f11", "#a8401a", "#d05523", "#eb6834", "#f28a5f", "#f7ac8b", "#fbcdb8"],
+)
+
 # layer altitudes, in earth radii -- each layer clears the one beneath it
 RADII = {
     "planet": 1.0,
@@ -92,25 +101,6 @@ RADII = {
 }
 
 
-def lonlat_to_xyz(lat, lng, r: float = 1.0) -> np.ndarray:
-    """(n, 3) points on a sphere of radius r. Degrees in, cartesian out."""
-    p, t = np.radians(np.asarray(lat, float)), np.radians(np.asarray(lng, float))
-    return np.column_stack([r * np.cos(p) * np.cos(t), r * np.cos(p) * np.sin(t), r * np.sin(p)])
-
-
-def great_circle(a: tuple[float, float], b: tuple[float, float], n: int = 64) -> np.ndarray:
-    """(n, 2) lat/lng along the great circle from a to b, by slerp."""
-    v1, v2 = lonlat_to_xyz(*[[x] for x in a])[0], lonlat_to_xyz(*[[x] for x in b])[0]
-    omega = np.arccos(np.clip(np.dot(v1, v2), -1, 1))
-    if omega < 1e-9:
-        return np.array([a, b])
-    s = np.linspace(0, 1, n)[:, None]
-    v = (np.sin((1 - s) * omega) * v1 + np.sin(s * omega) * v2) / np.sin(omega)
-    return np.column_stack(
-        [np.degrees(np.arcsin(v[:, 2])), np.degrees(np.arctan2(v[:, 1], v[:, 0]))]
-    )
-
-
 def cells_to_mesh(cells, radius: float) -> pv.PolyData:
     """One PolyData holding every H3 cell as a face, so it draws in a single pass.
 
@@ -118,8 +108,8 @@ def cells_to_mesh(cells, radius: float) -> pv.PolyData:
     """
     verts, faces = [], []
     offset = 0
-    for c in cells:
-        b = h3.cell_to_boundary(h3.int_to_str(int(c)))
+    for c in cells.tolist():
+        b = h3.cell_to_boundary(c)
         n = len(b)
         verts.append(lonlat_to_xyz([p[0] for p in b], [p[1] for p in b], radius))
         faces.append(np.r_[n, np.arange(offset, offset + n)])
@@ -130,71 +120,195 @@ def cells_to_mesh(cells, radius: float) -> pv.PolyData:
 
 
 # --------------------------------------------------------------------------
-# the artifact written by map_gen.py --save
+# time
 # --------------------------------------------------------------------------
 
 
-@dataclass
-class Artifact:
-    K: float
-    W: float
-    res_min: int
-    res_base: int
-    bbox: tuple[float, float, float, float] | None = None
-    levels: dict[int, tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
+class TimeLayer:
+    """A layer whose appearance depends on time.
+
+    Subclasses own their actor and mutate it in `update`. That is the whole
+    contract, so a new time-varying phenomenon -- a radiation frame, a current
+    field, a fleet of boats -- only has to answer "what do you look like at t".
+    """
+
+    name = "layer"
+
+    def span(self) -> tuple[float, float]:
+        """The closed interval this layer has data for."""
+        raise NotImplementedError
+
+    def update(self, t: float) -> None:
+        raise NotImplementedError
+
+
+class Timeline:
+    """The clock. Holds time layers and drives them together.
+
+    Playback is driven by a VTK timer event rather than a loop, which is what
+    keeps the camera live: the interactor goes on handling drag and scroll between
+    ticks, so the globe can be rotated mid-flight.
+    """
+
+    def __init__(self):
+        self.layers: list[TimeLayer] = []
+        self.t = 0.0
+        self.playing = True
+        self.speed = 1.0  # units of layer-time per second of wall clock
+
+    def add(self, layer: TimeLayer) -> TimeLayer:
+        self.layers.append(layer)
+        return layer
 
     @property
-    def centre(self) -> tuple[float, float]:
-        if self.bbox is None:
-            return 0.0, 0.0
-        lat0, lon0, lat1, lon1 = self.bbox
-        return (lat0 + lat1) / 2, (lon0 + lon1) / 2
+    def span(self) -> tuple[float, float]:
+        spans = [lyr.span() for lyr in self.layers]
+        if not spans:
+            return 0.0, 1.0
+        return min(s[0] for s in spans), max(s[1] for s in spans)
 
-    @property
-    def camera_distance(self) -> float:
-        """Pull back far enough to hold the built area, and to leave dark margin
-        around the globe for the title and scalar bar to sit on."""
-        if self.bbox is None:
-            return 4.6
-        lat0, lon0, lat1, lon1 = self.bbox
-        span = max(lat1 - lat0, lon1 - lon0)
-        return 2.6 + 2.0 * min(span, 180.0) / 180.0
+    def seek(self, t: float) -> None:
+        t0, t1 = self.span
+        self.t = min(max(t, t0), t1)
+        for lyr in self.layers:
+            lyr.update(self.t)
 
-    @classmethod
-    def load(cls, path: str) -> Artifact:
-        z = np.load(path)
-        art = cls(
-            K=float(z["K"]), W=float(z["W"]),
-            res_min=int(z["res_min"]), res_base=int(z["res_base"]),
-            bbox=tuple(z["bbox"]) if "bbox" in z else None,
+    def advance(self, dt: float, loop: bool = True) -> None:
+        t0, t1 = self.span
+        t = self.t + dt * self.speed
+        if t > t1:
+            t = t0 if loop else t1
+        self.seek(t)
+
+
+class TrackLayer(TimeLayer):
+    """A course drawn as it is sailed, with the boat at the head of it.
+
+    The full geometry is uploaded once; each update only rewrites the line
+    connectivity to expose the sailed prefix, and moves a one-point mesh to the
+    interpolated position. Nothing is rebuilt per frame.
+    """
+
+    name = "track"
+
+    def __init__(self, plotter, lat, lng, times, values=None, cmap=None,
+                 color=TRACK, width=5.0, boat_size=13.0, radius=None):
+        self.plotter = plotter
+        self.times = np.asarray(times, dtype=float)
+        self.pts = lonlat_to_xyz(lat, lng, radius or RADII["track"])
+        self.mesh = pv.PolyData(self.pts)
+        self.mesh.lines = np.empty(0, dtype=np.int64)
+        kw = dict(line_width=width, lighting=False, show_scalar_bar=False)
+        if values is not None:
+            self.mesh.point_data["value"] = np.asarray(values, dtype=float)
+            kw.update(scalars="value", cmap=cmap or BATTERY_CMAP, clim=(0.0, 1.0))
+        else:
+            kw["color"] = color
+        self.actor = plotter.add_mesh(self.mesh, **kw)
+
+        self.boat = pv.PolyData(self.pts[:1].copy())
+        self.boat_actor = plotter.add_points(
+            self.boat, color=INK, point_size=boat_size, render_points_as_spheres=True
         )
-        for r in range(art.res_min, art.res_base + 1):
-            if f"r{r}_id" in z:
-                art.levels[r] = (z[f"r{r}_id"], z[f"r{r}_mm"])
-        return art
 
-    def leaves(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """(legal ids, their margin, their travel budget, illegal ids).
+    def span(self) -> tuple[float, float]:
+        return float(self.times[0]), float(self.times[-1])
 
-        A cell is a leaf when it decided -- wholly legal or wholly illegal. Cells
-        that were undecided have children stored beneath them, so drawing only the
-        leaves tiles the area once. H3 does not nest exactly, so the tiling has
-        hairline seams and slivers of overlap; harmless for a picture.
+    def update(self, t: float) -> None:
+        k = int(np.searchsorted(self.times, t, side="right"))
+        if k >= 2:
+            self.mesh.lines = np.concatenate([[k], np.arange(k)]).astype(np.int64)
+        else:
+            self.mesh.lines = np.empty(0, dtype=np.int64)
+        # place the boat between the two bracketing samples
+        i = min(max(k - 1, 0), len(self.times) - 1)
+        j = min(i + 1, len(self.times) - 1)
+        dt = self.times[j] - self.times[i]
+        f = 0.0 if dt <= 0 else float(np.clip((t - self.times[i]) / dt, 0.0, 1.0))
+        p = self.pts[i] * (1 - f) + self.pts[j] * f
+        self.boat.points = (p / np.linalg.norm(p) * RADII["marker"])[None, :]
 
-        Margin and budget differ wherever a basin's entrance is narrower than its
-        interior: inside the Mediterranean the margin is pinned by Gibraltar while
-        the budget follows the local coastline. `--color-by budget` shows it.
-        """
-        legal, margin, budget, illegal = [], [], [], []
-        for _r, (ids, mm) in sorted(self.levels.items()):
-            lo, hi = mm[:, 0], mm[:, 1]
-            ok = lo >= 0
-            legal.append(ids[ok])
-            margin.append(lo[ok])
-            budget.append(mm[ok, 2] if mm.shape[1] > 2 else lo[ok])
-            illegal.append(ids[hi < 0])
-        cat = lambda xs, dt=float: np.concatenate(xs) if xs else np.array([], dt)  # noqa: E731
-        return cat(legal, np.uint64), cat(margin), cat(budget), cat(illegal, np.uint64)
+
+class CellFieldLayer(TimeLayer):
+    """A scalar over fixed cells that changes with time -- radiation, ice, sea state.
+
+    `frames` is (n_times, n_cells). Values are interpolated linearly between the
+    two bracketing frames, which is the same treatment Rad(t, p) gives a GRIB
+    field, so what is drawn matches what the simulator would sample.
+    """
+
+    name = "field"
+
+    def __init__(self, plotter, cells, frames, times, *, cmap=MARGIN_CMAP,
+                 clim=None, radius=None, opacity=1.0):
+        self.times = np.asarray(times, dtype=float)
+        self.frames = np.asarray(frames, dtype=float)
+        self.mesh = cells_to_mesh(cells, radius or RADII["cells"])
+        self.mesh.cell_data["value"] = self.frames[0].copy()
+        self.actor = plotter.add_mesh(
+            self.mesh, scalars="value", cmap=cmap,
+            clim=clim or (float(self.frames.min()), float(self.frames.max())),
+            lighting=False, opacity=opacity, show_scalar_bar=False,
+        )
+
+    def span(self) -> tuple[float, float]:
+        return float(self.times[0]), float(self.times[-1])
+
+    def update(self, t: float) -> None:
+        j = int(np.clip(np.searchsorted(self.times, t), 1, len(self.times) - 1))
+        i = j - 1
+        dt = self.times[j] - self.times[i]
+        f = 0.0 if dt <= 0 else float(np.clip((t - self.times[i]) / dt, 0.0, 1.0))
+        self.mesh.cell_data["value"] = self.frames[i] * (1 - f) + self.frames[j] * f
+
+
+class ClockLayer(TimeLayer):
+    """A heads-up readout of the current time."""
+
+    name = "clock"
+
+    def __init__(self, plotter, fmt=None, span=(0.0, 1.0)):
+        self.plotter = plotter
+        self.fmt = fmt or (lambda t: f"t = {t:.1f}")
+        self._span = span
+        self.update(span[0])
+
+    def span(self) -> tuple[float, float]:
+        return self._span
+
+    def update(self, t: float) -> None:
+        # name= replaces the existing actor rather than stacking a new one
+        self.plotter.add_text(
+            self.fmt(t), position="lower_left", font_size=11, color=INK, name="clock"
+        )
+
+
+# --------------------------------------------------------------------------
+# framing
+# --------------------------------------------------------------------------
+
+
+def camera_distance(bbox) -> float:
+    """Pull back far enough to hold the built area, and to leave dark margin
+    around the globe for the title and scalar bar to sit on."""
+    if bbox is None:
+        return 4.6
+    lat0, lon0, lat1, lon1 = bbox
+    return 2.6 + 2.0 * min(max(lat1 - lat0, lon1 - lon0), 180.0) / 180.0
+
+
+def load_track(path: str) -> dict[str, np.ndarray]:
+    """A track written by demo_run.py, or anything with the same keys.
+
+    `lat`, `lng` and `time` are required. Every other 1-D array of the same
+    length is offered as a plottable scalar, so a new channel is a new key.
+    """
+    z = np.load(path)
+    track = {k: z[k] for k in z.files}
+    missing = {"lat", "lng", "time"} - set(track)
+    if missing:
+        raise SystemExit(f"{path}: track is missing {sorted(missing)}")
+    return track
 
 
 # --------------------------------------------------------------------------
@@ -209,6 +323,8 @@ class GlobeView:
         self.plotter = pv.Plotter(window_size=list(size), off_screen=off_screen)
         self.plotter.set_background(SURFACE)
         self.actors: dict[str, object] = {}
+        self.timeline = Timeline()
+        self._slider = None
 
     # -- base layers -------------------------------------------------------
 
@@ -298,12 +414,26 @@ class GlobeView:
         lng,
         values=None,
         *,
+        times=None,
         name: str = "track",
         color: str = TRACK,
         width: float = 4.0,
         cmap=None,
     ):
-        """A course over the globe. `values` colours it by any per-point scalar."""
+        """A course over the globe.
+
+        `values` colours it by any per-point scalar. Passing `times` makes it a
+        time layer instead of a static line: the course is then drawn as it is
+        sailed, with the boat at the head, and it registers with the timeline.
+        """
+        if times is not None:
+            layer = TrackLayer(
+                self.plotter, lat, lng, times, values=values, cmap=cmap,
+                color=color, width=width,
+            )
+            self.timeline.add(layer)
+            self.actors[name] = layer.actor
+            return layer
         pts = lonlat_to_xyz(lat, lng, RADII["track"])
         line = pv.lines_from_points(pts)
         kw = dict(line_width=width, lighting=False, show_scalar_bar=False)
@@ -315,6 +445,17 @@ class GlobeView:
         a = self.plotter.add_mesh(line, **kw)
         self.actors[name] = a
         return a
+
+    def add_cell_field(self, cells, frames, times, **kw):
+        """A time-varying scalar over cells -- radiation, ice, sea state."""
+        layer = CellFieldLayer(self.plotter, cells, frames, times, **kw)
+        self.timeline.add(layer)
+        self.actors[layer.name] = layer.actor
+        return layer
+
+    def add_clock(self, fmt=None):
+        span = self.timeline.span
+        return self.timeline.add(ClockLayer(self.plotter, fmt=fmt, span=span))
 
     def add_markers(self, lat, lng, labels=None, *, name="markers", color=TRACK, size=9.0):
         pts = lonlat_to_xyz(lat, lng, RADII["marker"])
@@ -349,6 +490,94 @@ class GlobeView:
         self.plotter.screenshot(path)
         print(f"wrote {path}")
 
+    # -- playback ----------------------------------------------------------
+
+    def play(self, fps: int = 30, speed: float = 1.0, loop: bool = True,
+             title: str = "boatforge - ocean map"):
+        """Open the window and animate, with the camera live throughout.
+
+        Playback runs off a VTK timer event, not a loop. That is the part that
+        matters: a `for t in frames` loop owns the thread and the window freezes,
+        whereas the interactor keeps servicing drag and scroll between ticks, so
+        the globe can be rotated and zoomed while the boat is moving.
+        """
+        tl = self.timeline
+        if not tl.layers:
+            return self.show(title=title)
+
+        t0, t1 = tl.span
+        tl.speed = speed
+        tl.seek(t0)
+        step = 1.0 / fps
+
+        def on_slider(value):
+            tl.playing = False  # scrubbing takes over from playback
+            tl.seek(value)
+
+        self._slider = self.plotter.add_slider_widget(
+            on_slider, (t0, t1), value=t0, title="", color=COAST,
+            pointa=(0.30, 0.06), pointb=(0.70, 0.06), interaction_event="always",
+            slider_width=0.02, tube_width=0.004,
+        )
+
+        def sync_slider():
+            if self._slider is not None:
+                self._slider.GetRepresentation().SetValue(tl.t)
+
+        def toggle():
+            tl.playing = not tl.playing
+
+        def restart():
+            tl.seek(t0)
+            sync_slider()
+
+        def nudge(sign):
+            def go():
+                tl.playing = False
+                tl.seek(tl.t + sign * (t1 - t0) / 200.0)
+                sync_slider()
+            return go
+
+        def rate(factor):
+            def go():
+                tl.speed = float(np.clip(tl.speed * factor, 0.05, 200.0))
+            return go
+
+        self.plotter.add_key_event("space", toggle)
+        self.plotter.add_key_event("r", restart)
+        self.plotter.add_key_event("Left", nudge(-1))
+        self.plotter.add_key_event("Right", nudge(+1))
+        self.plotter.add_key_event("bracketleft", rate(0.5))
+        self.plotter.add_key_event("bracketright", rate(2.0))
+
+        def tick(_step):
+            if tl.playing:
+                tl.advance(step, loop=loop)
+                sync_slider()
+                self.plotter.render()
+
+        self.plotter.add_timer_event(max_steps=10**9, duration=int(1000 / fps), callback=tick)
+        print("  space play/pause   left/right step   [ ] speed   r restart   q quit")
+        self.plotter.show(title=title)
+
+    def record(self, path: str, n_frames: int = 240, fps: int = 30):
+        """Write the animation out. Interactive playback is `play`; this is export."""
+        t0, t1 = self.timeline.span
+        movie = path.endswith((".mp4", ".gif"))
+        if movie:
+            (self.plotter.open_gif if path.endswith(".gif") else self.plotter.open_movie)(path)
+        else:
+            Path(path).mkdir(parents=True, exist_ok=True)
+        self.plotter.show(auto_close=False)
+        for i, t in enumerate(np.linspace(t0, t1, n_frames)):
+            self.timeline.seek(t)
+            if movie:
+                self.plotter.write_frame()
+            else:
+                self.plotter.screenshot(str(Path(path) / f"frame_{i:05d}.png"))
+        self.plotter.close()
+        print(f"wrote {n_frames} frames to {path}")
+
 
 # --------------------------------------------------------------------------
 # CLI
@@ -367,7 +596,12 @@ def main() -> None:
         choices=("margin", "budget"),
         help="margin: how legal. budget: how far before the next map lookup.",
     )
-    p.add_argument("--demo-track", action="store_true", help="overlay an example course")
+    p.add_argument("--track", metavar="NPZ", help="a track from demo_run.py, animated")
+    p.add_argument(
+        "--track-scalar",
+        default="battery",
+        help="which channel of the track to shade it by (default battery)",
+    )
     p.add_argument("--coastlines", default="50m", choices=("10m", "50m", "110m", "none"))
     p.add_argument("--graticule", type=int, default=15, metavar="DEG", help="0 to disable")
     p.add_argument("--view", type=float, nargs=2, metavar=("LAT", "LON"))
@@ -375,10 +609,16 @@ def main() -> None:
         "--distance", type=float, help="camera distance in earth radii (default: fits the bbox)"
     )
     p.add_argument("--size", type=int, nargs=2, default=(1400, 1000), metavar=("W", "H"))
-    p.add_argument("--save", metavar="PNG", help="render off-screen to a file")
+    p.add_argument("--save", metavar="PNG", help="render a still off-screen to a file")
+    p.add_argument("--record", metavar="PATH", help="write the animation (.mp4, .gif, or a dir)")
+    p.add_argument("--fps", type=int, default=30)
+    p.add_argument("--frames", type=int, default=240, help="frames to write with --record")
+    p.add_argument(
+        "--speed", type=float, default=6.0, help="hours of course per second of playback"
+    )
     args = p.parse_args()
 
-    art = Artifact.load(args.npz)
+    art = NavMap.load(args.npz)
     legal, margin, budget, illegal = art.leaves()
     values = budget if args.color_by == "budget" else margin
     bar = {"margin": "clearance margin (km)", "budget": "travel budget (km)"}[args.color_by]
@@ -404,17 +644,21 @@ def main() -> None:
     if args.graticule:
         view.add_graticule(args.graticule)
 
-    if args.demo_track:
-        # An Atlantic course, kept clear of the strait so it stays in navigable
-        # water whatever (K, W) the map was built with. It is a placeholder for a
-        # real solver track: the scalar is arbitrary, and stands in for whatever
-        # gets plotted later -- battery, speed, collected energy.
-        legs = [(42.0, -10.5), (38.5, -11.0), (35.0, -9.5), (31.5, -11.5)]
-        pts = np.vstack([great_circle(a, b, 48) for a, b in zip(legs, legs[1:])])
-        view.add_track(pts[:, 0], pts[:, 1], width=5)
-        view.add_markers(
-            [legs[0][0], legs[-1][0]], [legs[0][1], legs[-1][1]], labels=["start", "goal"]
-        )
+    target = art.centre
+    if args.track:
+        tr = load_track(args.track)
+        lat, lng, hours = tr["lat"], tr["lng"], tr["time"]
+        # Centre on the course, not the bbox: the bbox centre is often over water
+        # the (K, W) rules excluded, which points the camera at nothing.
+        target = (float(np.mean(lat)), float(np.mean(lng)))
+        scalar = tr.get(args.track_scalar)
+        if scalar is not None and scalar.shape != lat.shape:
+            scalar = None  # e.g. speed_kmh, a header value rather than a channel
+        view.add_track(lat, lng, values=scalar, times=hours, width=5)
+        view.add_markers([lat[0], lat[-1]], [lng[0], lng[-1]], labels=["start", "goal"])
+        view.add_clock(lambda t: f"T+{t:5.1f} h   day {int(t // 24) + 1}")
+        channels = [k for k, v in tr.items() if getattr(v, "shape", None) == lat.shape]
+        print(f"track: {len(lat)} points over {hours[-1]:.1f} h, channels {channels}")
 
     view.add_title(
         f"navigable ocean   K={art.K:g} km   W={art.W:g} km",
@@ -422,11 +666,18 @@ def main() -> None:
         + ("   |   excluded water in grey" if args.show_excluded else ""),
     )
     view.look_at(
-        *(args.view if args.view else art.centre),
-        distance=args.distance or art.camera_distance,
+        *(args.view if args.view else target),
+        distance=args.distance or camera_distance(art.bbox),
     )
 
-    view.save(args.save) if args.save else view.show()
+    if args.record:
+        view.record(args.record, n_frames=args.frames, fps=args.fps)
+    elif args.save:
+        view.save(args.save)
+    elif view.timeline.layers:
+        view.play(fps=args.fps, speed=args.speed)
+    else:
+        view.show()
 
 
 if __name__ == "__main__":

@@ -109,7 +109,8 @@ from h3.api import basic_int as h3
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components, dijkstra
 
-EARTH_R_KM = 6371.0088
+from map_utils import GLOBAL_BBOX, ClearanceBudget, NavMap, great_circle_km
+
 CHUNK = 1 << 20  # rows per pass when building adjacency, to cap transient memory
 
 # (lat_min, lon_min, lat_max, lon_max): Gibraltar, the western Mediterranean, and
@@ -127,16 +128,6 @@ def _log(msg: str, t0: float | None = None) -> float:
     tail = "" if t0 is None else f"  [{now - t0:.1f}s, {peak_gb():.2f} GB peak]"
     print(f"  {msg}{tail}", flush=True)
     return now
-
-
-def great_circle_km(lat1, lng1, lat2, lng2) -> np.ndarray:
-    """Haversine, vectorised, in km."""
-    p1, p2 = np.radians(lat1), np.radians(lat2)
-    a = (
-        np.sin((p2 - p1) / 2) ** 2
-        + np.cos(p1) * np.cos(p2) * np.sin((np.radians(lng2) - np.radians(lng1)) / 2) ** 2
-    )
-    return 2 * EARTH_R_KM * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
 
 
 # --------------------------------------------------------------------------
@@ -186,9 +177,6 @@ class BaseMap:
     lng: np.ndarray
     dist_to_shore: np.ndarray  # km
     access_width: np.ndarray  # km
-
-
-GLOBAL_BBOX = (-90.0, -180.0, 90.0, 180.0)
 
 
 def enumerate_cells(bbox, res: int) -> np.ndarray:
@@ -451,68 +439,6 @@ def _access_width(src, dst, keep, dist, connected, seed_idx) -> np.ndarray:
 # --------------------------------------------------------------------------
 
 
-@dataclass
-class NavMap:
-    """The runtime artifact: signed clearance, at as coarse a level as will do.
-
-    Each cell stores the min and max margin over its footprint. A query walks
-    coarse to fine and stops at the first level that decides, so open water costs
-    one lookup and only coastlines need the descent. Children exist only under
-    cells that were undecided, which is what makes the pyramid smaller than a flat
-    map rather than larger.
-    """
-
-    K: float
-    W: float
-    res_min: int
-    res_base: int
-    levels: dict[int, dict[int, tuple[float, float, float]]]
-
-    @property
-    def n_entries(self) -> int:
-        return sum(len(v) for v in self.levels.values())
-
-    def decide(self, lat: float, lng: float) -> tuple[float, float, int]:
-        """(margin, travel budget, resolution that decided).
-
-        Both numbers are the deciding cell's bound rather than the point's exact
-        value -- a wholly-legal cell reports its minimum, so each is a guarantee
-        for every point in it.
-
-        Margin and budget are different quantities and it matters. Margin answers
-        "is this legal", and the `access_width` half of it is a property of the
-        whole basin: inside the Mediterranean it is fixed by the width of
-        Gibraltar no matter where you stand. Spending that as a travel budget
-        would force a lookup every couple of km across the entire basin. Once a
-        point is known legal, what limits movement is only the local shore
-        distance, because staying further than K + W/2 off the beach keeps the
-        corridor behind you at least W + 2K wide:
-
-            budget = dist_to_shore - (K + W/2)
-        """
-        for r in range(self.res_min, self.res_base + 1):
-            entry = self.levels[r].get(h3.latlng_to_cell(lat, lng, r))
-            if entry is None:
-                return float("-inf"), 0.0, r  # outside the built area
-            lo, hi, budget = entry
-            if lo >= 0.0:
-                return lo, budget, r
-            if hi < 0.0:
-                return hi, 0.0, r
-        return lo, budget, self.res_base
-
-    def clearance(self, lat: float, lng: float) -> float:
-        """Signed km of margin: >= 0 is navigable."""
-        return self.decide(lat, lng)[0]
-
-    def budget(self, lat: float, lng: float) -> float:
-        """How far the boat may travel in any direction before re-checking."""
-        return self.decide(lat, lng)[1]
-
-    def legal(self, lat: float, lng: float) -> bool:
-        return self.clearance(lat, lng) >= 0.0
-
-
 def build_map(base: BaseMap, K: float, W: float, res_min: int = 2, verbose: bool = True) -> NavMap:
     log = _log if verbose else (lambda *a, **k: time.time())
     t = log(f"building artifact for K={K} km, W={W} km")
@@ -571,41 +497,14 @@ def build_map(base: BaseMap, K: float, W: float, res_min: int = 2, verbose: bool
         live[order[np.repeat(settled, counts)]] = False
         t = log(f"res {r}: {len(levels[r]):,} stored, {live.sum():,} samples still live", t)
 
-    return NavMap(K=K, W=W, res_min=res_min, res_base=base.res, levels=levels)
+    return NavMap(
+        K=K, W=W, res_min=res_min, res_base=base.res, levels=levels, bbox=base.bbox
+    )
 
 
 # --------------------------------------------------------------------------
 # The clearance budget (Stage 3f)
 # --------------------------------------------------------------------------
-
-
-class ClearanceBudget:
-    """Skip the map lookup until the boat could plausibly have reached trouble.
-
-    One lookup certifies a disc around the current position, so nothing needs
-    checking until the accumulated travel exhausts it. Mid-ocean a single lookup
-    covers hundreds of km; near a coast the budget collapses and it checks almost
-    every step.
-    """
-
-    def __init__(self, nav: NavMap):
-        self.nav = nav
-        self.budget = 0.0
-        self.lookups = 0
-        self.steps = 0
-
-    def step(self, lat: float, lng: float, distance_km: float) -> bool:
-        self.steps += 1
-        self.budget -= distance_km
-        if self.budget > 0:
-            return True
-        self.lookups += 1
-        margin, budget, _ = self.nav.decide(lat, lng)
-        if margin < 0.0:
-            self.budget = 0.0
-            return False
-        self.budget = budget
-        return True
 
 
 # --------------------------------------------------------------------------
@@ -705,17 +604,7 @@ def main() -> None:
     demo_budget(nav, start=tuple(args.seed))
 
     if args.save:
-        out = {
-            "K": nav.K,
-            "W": nav.W,
-            "res_min": nav.res_min,
-            "res_base": nav.res_base,
-            "bbox": np.array(base.bbox),
-        }
-        for r, lvl in nav.levels.items():
-            out[f"r{r}_id"] = np.fromiter(lvl.keys(), dtype=np.uint64, count=len(lvl))
-            out[f"r{r}_mm"] = np.array(list(lvl.values()), dtype=np.float32)
-        np.savez_compressed(args.save, **out)
+        nav.save(args.save)
         print(f"\nwrote {args.save}")
 
 
