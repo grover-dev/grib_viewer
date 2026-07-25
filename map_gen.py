@@ -30,6 +30,43 @@ Three things here are easy to get subtly wrong, and are called out in the code:
   geometric containment; hexagons do not nest.
 * A cell on the edge of the requested bbox is not a shoreline, and a shoreline cell
   is not at distance zero. Getting either wrong invents geography.
+
+
+Running it
+----------
+
+    uv run python map_gen.py                       # defaults: K=0, W=10, res 7
+    uv run python map_gen.py -K 5 -W 30            # 5 km keep-out, 30 km channels
+    uv run python map_gen.py --res 6               # coarser and ~5x faster
+    uv run python map_gen.py --save med.npz        # write the artifact
+
+Each run builds the map, prints a probe table, and shows how many map lookups the
+clearance budget skips on a short run west from Gibraltar.
+
+Options:
+
+    -K KM            keep-out distance from shore (default 0)
+    -W KM            minimum navigable channel width (default 10)
+    --res N          H3 build resolution (default 7)
+    --res-min N      coarsest pyramid level (default 2)
+    --bbox LAT0 LON0 LAT1 LON1      area to build (default: western Med + Atlantic)
+    --seed LAT LON   a point in open ocean, used to define "connected to the sea"
+    --ne-res {10m,50m,110m}         Natural Earth coastline detail (default 10m)
+    --save NPZ       write the pyramid to an .npz
+
+The default area covers Gibraltar, so it doubles as the validation case: the strait
+measures ~14 km, and the Mediterranean should stay open at W=10 and seal at W=30.
+
+    uv run python map_gen.py -K 0 -W 10            # Alboran Sea legal
+    uv run python map_gen.py -K 0 -W 30            # Alboran Sea sealed
+
+Resolution matters more than it looks. W can only adjudicate passages the grid can
+resolve, so res 7 (~2.1 km spacing) is the coarsest that measures Gibraltar
+correctly -- res 6 reports it as 9 km wide and seals the Mediterranean at every W.
+The default bbox at res 7 takes ~25 s and ~1 GB; res 6 takes ~5 s.
+
+The first run downloads the Natural Earth ocean polygon (a few MB) into cartopy's
+data directory and caches it there.
 """
 
 from __future__ import annotations
