@@ -38,10 +38,11 @@ Running it
     uv run python map_gen.py                       # defaults: K=0, W=10, res 7
     uv run python map_gen.py -K 5 -W 30            # 5 km keep-out, 30 km channels
     uv run python map_gen.py --res 6               # coarser and ~5x faster
+    uv run python map_gen.py --global --res 5      # the whole planet
     uv run python map_gen.py --save med.npz        # write the artifact
 
 Each run builds the map, prints a probe table, and shows how many map lookups the
-clearance budget skips on a short run west from Gibraltar.
+clearance budget skips on a short run west from the seed.
 
 Options:
 
@@ -50,9 +51,30 @@ Options:
     --res N          H3 build resolution (default 7)
     --res-min N      coarsest pyramid level (default 2)
     --bbox LAT0 LON0 LAT1 LON1      area to build (default: western Med + Atlantic)
+    --global         build the whole planet, ignoring --bbox
     --seed LAT LON   a point in open ocean, used to define "connected to the sea"
     --ne-res {10m,50m,110m}         Natural Earth coastline detail (default 10m)
     --save NPZ       write the pyramid to an .npz
+
+Cost scales with cell count, at roughly 280 bytes and 17 us a cell (measured):
+
+    res    global cells    peak RAM    wall clock    furthest-from-land
+    4         288,122        0.3 GB         13 s        3541 km
+    5       2,016,842        0.7 GB         47 s        3381 km
+    6      14,117,882        3.9 GB       3m 56s        2854 km
+    7      98,825,162        ~27 GB       ~30 min            --
+
+That last column is the Point Nemo check, and it is the honest way to read the
+resolution: the true answer is 2690 km at 48.9S 123.4W. Coarse builds overshoot
+because a cell is classified by its centre, so small islands vanish and the
+nearest shore ends up further away than it really is. res 6 lands within 6% and
+in the right place (47.8S 131.7W).
+
+`--global --res 7` is what W needs to resolve Gibraltar, and it does not fit in a
+pure-Python prototype -- it wants a compiled implementation. Global res 6 is the
+practical ceiling here, and it is still too coarse to adjudicate a 14 km strait,
+so a global build seals the Mediterranean at any W. Build regionally when the
+answer near a narrow passage matters.
 
 The default area covers Gibraltar, so it doubles as the validation case: the strait
 measures ~14 km, and the Mediterranean should stay open at W=10 and seal at W=30.
@@ -72,16 +94,23 @@ data directory and caches it there.
 from __future__ import annotations
 
 import argparse
+import gc
+import resource
 import time
 from dataclasses import dataclass
 
-import h3
 import numpy as np
 import shapely
+
+# The integer API throughout. Cell ids as Python str cost ~130 bytes each in a
+# list and ~250 in a dict; as uint64 they cost 8 in a numpy array. At global
+# resolutions that difference is the whole memory budget.
+from h3.api import basic_int as h3
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components, dijkstra
 
 EARTH_R_KM = 6371.0088
+CHUNK = 1 << 20  # rows per pass when building adjacency, to cap transient memory
 
 # (lat_min, lon_min, lat_max, lon_max): Gibraltar, the western Mediterranean, and
 # enough Atlantic to be unambiguously open ocean.
@@ -89,9 +118,14 @@ GIBRALTAR_BBOX = (30.0, -12.0, 46.0, 20.0)
 ATLANTIC_SEED = (35.0, -10.0)
 
 
+def peak_gb() -> float:
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2
+
+
 def _log(msg: str, t0: float | None = None) -> float:
     now = time.time()
-    print(f"  {msg}{'' if t0 is None else f'  [{now - t0:.1f}s]'}", flush=True)
+    tail = "" if t0 is None else f"  [{now - t0:.1f}s, {peak_gb():.2f} GB peak]"
+    print(f"  {msg}{tail}", flush=True)
     return now
 
 
@@ -157,54 +191,78 @@ class BaseMap:
 GLOBAL_BBOX = (-90.0, -180.0, 90.0, 180.0)
 
 
-def enumerate_cells(bbox, res: int) -> list[str]:
-    """Every cell at `res` inside bbox, or the whole globe when bbox is None.
+def enumerate_cells(bbox, res: int) -> np.ndarray:
+    """Sorted uint64 ids of every cell at `res` inside bbox, or the whole globe.
 
     The global path descends from the 122 res-0 cells instead of filling a
     polygon, which sidesteps the antimeridian entirely -- there is no boundary to
     cross. It also means no cell is truncated, so the whole ocean is one connected
     body and a single seed reaches all of it.
+
+    Sorted, because every later lookup is a searchsorted into this array. A dict
+    keyed by cell id would cost ~30x the memory for the same answer.
     """
     if bbox is None:
-        cells: list[str] = []
-        for c in h3.get_res0_cells():
-            cells.extend(h3.cell_to_children(c, res))
-        return cells
-    lat0, lon0, lat1, lon1 = bbox
-    poly = h3.LatLngPoly([(lat0, lon0), (lat0, lon1), (lat1, lon1), (lat1, lon0)])
-    return list(h3.polygon_to_cells(poly, res))
+        parts = [
+            np.fromiter(h3.cell_to_children(c, res), dtype=np.uint64)
+            for c in h3.get_res0_cells()
+        ]
+        cells = np.concatenate(parts)
+    else:
+        lat0, lon0, lat1, lon1 = bbox
+        poly = h3.LatLngPoly([(lat0, lon0), (lat0, lon1), (lat1, lon1), (lat1, lon0)])
+        cells = np.fromiter(h3.polygon_to_cells(poly, res), dtype=np.uint64)
+    cells.sort()
+    return cells
 
 
 def global_cell_count(res: int) -> int:
     return 2 + 120 * 7**res
 
 
-def _neighbour_pairs(cells: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def estimate_gb(n_cells: int) -> float:
+    """Rough peak working set. ~230 bytes a cell, dominated by the Dijkstra CSR."""
+    return n_cells * 230 / 1024**3
+
+
+def _neighbour_pairs(cells: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Index pairs for cells adjacent within the set, plus a truncation flag.
 
     `truncated[i]` marks a cell with a neighbour outside the enumerated set, i.e.
     one on the bbox edge. Those are excluded from shoreline seeding so the box
-    boundary does not masquerade as a coast.
+    boundary does not masquerade as a coast. A global build truncates nothing.
+
+    Built in chunks into preallocated int32 arrays. The obvious version -- Python
+    lists of ints appended per neighbour -- costs ~28 bytes an entry plus list
+    overhead, which is several GB of garbage at global resolutions.
     """
-    index = {c: i for i, c in enumerate(cells)}
-    src, dst = [], []
-    truncated = np.zeros(len(cells), dtype=bool)
-    for i, c in enumerate(cells):
-        found = 0
-        for n in h3.grid_disk(c, 1):
-            if n == c:
-                continue
-            j = index.get(n)
-            if j is None:
-                truncated[i] = True
-            else:
-                found += 1
-                if j > i:
-                    src.append(i)
-                    dst.append(j)
-        if found < 5:  # pentagons legitimately have 5; fewer means truncation
-            truncated[i] = True
-    return np.asarray(src, dtype=np.int64), np.asarray(dst, dtype=np.int64), truncated
+    n = len(cells)
+    idx = np.empty(n * 6, dtype=np.int32)
+    truncated = np.zeros(n, dtype=bool)
+
+    for lo in range(0, n, CHUNK):
+        hi = min(lo + CHUNK, n)
+        ring = np.full(((hi - lo), 6), np.uint64(0), dtype=np.uint64)
+        for k, c in enumerate(cells[lo:hi].tolist()):
+            nb = [x for x in h3.grid_disk(c, 1) if x != c]
+            ring[k, : len(nb)] = nb
+            if len(nb) < 5:  # pentagons legitimately have 5
+                truncated[lo + k] = True
+        flat = ring.ravel()
+        pos = np.searchsorted(cells, flat)
+        np.clip(pos, 0, n - 1, out=pos)
+        hit = (cells[pos] == flat) & (flat != 0)
+        chunk_idx = np.where(hit, pos, -1).astype(np.int32)
+        # a real neighbour that is not in the set means the set has an edge
+        missing = (~hit & (flat != 0)).reshape(-1, 6).any(axis=1)
+        truncated[lo:hi] |= missing
+        idx[lo * 6 : hi * 6] = chunk_idx
+        del ring, flat, pos, hit, chunk_idx
+
+    src = np.repeat(np.arange(n, dtype=np.int32), 6)
+    dst = idx
+    keep = (dst >= 0) & (dst > src)  # each undirected pair once
+    return src[keep], dst[keep], truncated
 
 
 def build_base(
@@ -222,9 +280,11 @@ def build_base(
     ocean = load_ocean(ne_res)
     t = log(f"enumerating res-{res} cells", t)
     cells = enumerate_cells(bbox, res)
-    ll = np.array([h3.cell_to_latlng(c) for c in cells])
-    lat, lng = ll[:, 0], ll[:, 1]
     n = len(cells)
+    lat = np.empty(n, dtype=np.float64)
+    lng = np.empty(n, dtype=np.float64)
+    for i, c in enumerate(cells.tolist()):  # fill in place; no list of tuples
+        lat[i], lng[i] = h3.cell_to_latlng(c)
     t = log(f"{n:,} cells; classifying", t)
 
     # Classification has no metric, so a point test in lat/lon is safe. This is the
@@ -238,13 +298,16 @@ def build_base(
     # --- connectivity: keep only water reachable from the open-ocean seed ------
     both_ocean = is_ocean[src] & is_ocean[dst]
     adj = coo_matrix(
-        (np.ones(both_ocean.sum()), (src[both_ocean], dst[both_ocean])), shape=(n, n)
+        (np.ones(both_ocean.sum(), dtype=np.int8), (src[both_ocean], dst[both_ocean])),
+        shape=(n, n),
     )
-    n_comp, labels = connected_components(adj + adj.T, directed=False)
+    n_comp, labels = connected_components(adj, directed=False, connection="weak")
+    del adj
+    gc.collect()
     seed_cell = h3.latlng_to_cell(*seed_latlng, res)
-    if seed_cell not in cells:
+    seed_idx = int(np.searchsorted(cells, np.uint64(seed_cell)))
+    if seed_idx >= n or cells[seed_idx] != seed_cell:
         raise SystemExit(f"seed {seed_latlng} is outside the bbox")
-    seed_idx = cells.index(seed_cell)
     if not is_ocean[seed_idx]:
         raise SystemExit(f"seed {seed_latlng} is not ocean")
     connected = (labels == labels[seed_idx]) & is_ocean
@@ -271,15 +334,17 @@ def build_base(
     t = log(f"narrow band: {seeds.size:,} cells, median {np.median(offset):.1f} km", t)
 
     # One virtual node wired to each seed at its own offset turns the per-seed
-    # initial values into a single-source problem.
-    g = coo_matrix(
-        (
-            np.r_[w, offset],
-            (np.r_[src[keep], seeds], np.r_[dst[keep], np.full(seeds.size, n)]),
-        ),
-        shape=(n + 1, n + 1),
-    )
-    d = dijkstra((g + g.T).tocsr(), indices=n)[:n]
+    # initial values into a single-source problem. Both directions are written
+    # into one COO rather than built as g + g.T, which would hold three copies of
+    # the matrix at once.
+    a = np.r_[src[keep], seeds, dst[keep], np.full(seeds.size, n, dtype=np.int32)]
+    b = np.r_[dst[keep], np.full(seeds.size, n, dtype=np.int32), src[keep], seeds]
+    g = coo_matrix((np.r_[w, offset, w, offset], (a, b)), shape=(n + 1, n + 1)).tocsr()
+    del a, b
+    gc.collect()
+    d = dijkstra(g, indices=n)[:n]
+    del g
+    gc.collect()
     d[~connected] = np.nan
     far = int(np.nanargmax(d))
     t = log(
@@ -295,7 +360,7 @@ def build_base(
     return BaseMap(
         res=res,
         bbox=bbox if bbox is not None else GLOBAL_BBOX,
-        cells=np.array([h3.str_to_int(cells[i]) for i in idx], dtype=np.uint64),
+        cells=cells[idx],
         lat=lat[idx],
         lng=lng[idx],
         dist_to_shore=d[idx],
@@ -315,17 +380,28 @@ def _access_width(src, dst, keep, dist, connected, seed_idx) -> np.ndarray:
     joins the seed and keeps a width of nan.
     """
     n = len(dist)
-    order = [int(i) for i in np.argsort(-np.nan_to_num(dist, nan=-1.0)) if connected[i]]
+    o = np.argsort(-np.nan_to_num(dist, nan=-1.0))
+    order = o[connected[o]].astype(np.int64).tolist()
+    del o
 
     # CSR adjacency rather than a list of lists: at global res 6 the latter is 14M
     # Python list objects before a single neighbour is stored.
     a = np.r_[src[keep], dst[keep]]
-    b = np.r_[dst[keep], src[keep]]
-    o = np.argsort(a, kind="stable")
-    a, nbr = a[o], b[o]
-    indptr = np.searchsorted(a, np.arange(n + 1))
+    nbr = np.r_[dst[keep], src[keep]]
+    s = np.argsort(a, kind="stable")
+    a, nbr = a[s], nbr[s]
+    indptr = np.searchsorted(a, np.arange(n + 1)).astype(np.int64)
+    del a, s
+    gc.collect()
 
-    parent = np.arange(n, dtype=np.int64)
+    parent = np.arange(n, dtype=np.int32)
+    # Unlabelled members of each component, as an intrusive linked list over three
+    # int32 arrays. The readable version -- dict[root] -> list of members -- costs
+    # a Python list object per component and boxes every member.
+    head = np.full(n, -1, dtype=np.int32)
+    tail = np.full(n, -1, dtype=np.int32)
+    nxt = np.full(n, -1, dtype=np.int32)
+    size = np.ones(n, dtype=np.int32)
 
     def find(x: int) -> int:
         while parent[x] != x:
@@ -335,29 +411,38 @@ def _access_width(src, dst, keep, dist, connected, seed_idx) -> np.ndarray:
 
     aw = np.full(n, np.nan)
     added = np.zeros(n, dtype=bool)
-    pending: dict[int, list[int]] = {}  # unlabelled members, per component root
 
     for i in order:
         added[i] = True
-        pending[i] = [i]
-        for j in nbr[indptr[i] : indptr[i + 1]]:
-            j = int(j)
+        head[i] = tail[i] = i
+        for j in nbr[indptr[i] : indptr[i + 1]].tolist():
             if not added[j]:
                 continue
             ri, rj = find(i), find(j)
             if ri == rj:
                 continue
-            if len(pending[ri]) > len(pending[rj]):
+            if size[ri] > size[rj]:
                 ri, rj = rj, ri
             parent[ri] = rj
-            pending[rj].extend(pending[ri])
-            del pending[ri]
+            size[rj] += size[ri]
+            if head[ri] != -1:  # splice ri's pending chain onto rj's
+                if head[rj] == -1:
+                    head[rj], tail[rj] = head[ri], tail[ri]
+                else:
+                    nxt[tail[rj]] = head[ri]
+                    tail[rj] = tail[ri]
+                head[ri] = tail[ri] = -1
         if added[seed_idx]:
             root = find(i)
             if root == find(seed_idx):
-                for m in pending[root]:
-                    aw[m] = 2.0 * dist[i]
-                pending[root] = []
+                level = 2.0 * dist[i]
+                m = int(head[root])
+                while m != -1:
+                    aw[m] = level
+                    following = int(nxt[m])
+                    nxt[m] = -1
+                    m = following
+                head[root] = tail[root] = -1
     return aw
 
 
@@ -406,7 +491,7 @@ class NavMap:
             budget = dist_to_shore - (K + W/2)
         """
         for r in range(self.res_min, self.res_base + 1):
-            entry = self.levels[r].get(h3.str_to_int(h3.latlng_to_cell(lat, lng, r)))
+            entry = self.levels[r].get(h3.latlng_to_cell(lat, lng, r))
             if entry is None:
                 return float("-inf"), 0.0, r  # outside the built area
             lo, hi, budget = entry
@@ -449,7 +534,7 @@ def build_map(base: BaseMap, K: float, W: float, res_min: int = 2, verbose: bool
             # index truncation, and hexagons do not nest, so a parent's footprint
             # is not the union of its children's.
             ids = np.fromiter(
-                (h3.str_to_int(h3.latlng_to_cell(la, lo, r)) for la, lo in zip(base.lat, base.lng)),
+                (h3.latlng_to_cell(la, lo, r) for la, lo in zip(base.lat, base.lng)),
                 dtype=np.uint64,
                 count=len(base.lat),
             )
@@ -476,9 +561,9 @@ def build_map(base: BaseMap, K: float, W: float, res_min: int = 2, verbose: bool
         undecided = sid[starts][(lo < 0.0) & (hi >= 0.0)]
         if undecided.size:
             ring = {
-                h3.str_to_int(x)
-                for c in undecided
-                for x in h3.grid_disk(h3.int_to_str(int(c)), 1)
+                x
+                for c in undecided.tolist()
+                for x in h3.grid_disk(c, 1)
             }
             settled = ~np.isin(sid[starts], np.fromiter(ring, np.uint64, len(ring)))
         else:
@@ -544,7 +629,7 @@ def report(base: BaseMap, nav: NavMap) -> None:
     print("  d_shore/width are the res-{} sample; margin is the deciding cell's bound".format(base.res))
     print(f"\n  {'':28} {'legal':>6} {'d_shore':>8} {'width':>8} {'margin':>8} {'budget':>8} {'@res':>5}")
     for name, la, lo in PROBES:
-        cell = h3.str_to_int(h3.latlng_to_cell(la, lo, base.res))
+        cell = h3.latlng_to_cell(la, lo, base.res)
         hit = np.flatnonzero(base.cells == cell)
         ds = f"{base.dist_to_shore[hit[0]]:.1f}" if hit.size else "-"
         aw = f"{base.access_width[hit[0]]:.1f}" if hit.size else "-"
@@ -589,6 +674,9 @@ def main() -> None:
         action="store_true",
         help="build the whole planet, ignoring --bbox",
     )
+    p.add_argument(
+        "--force", action="store_true", help="build even if the memory estimate says no"
+    )
     p.add_argument("--seed", type=float, nargs=2, default=ATLANTIC_SEED, metavar=("LAT", "LON"))
     p.add_argument("--ne-res", default="10m", choices=("10m", "50m", "110m"))
     p.add_argument("--save", metavar="NPZ", help="write the artifact")
@@ -597,14 +685,17 @@ def main() -> None:
     bbox = None if args.whole_world else tuple(args.bbox)
     if bbox is None:
         n = global_cell_count(args.res)
-        print(f"building the whole planet at res {args.res}: {n:,} cells")
-        if n > 3_000_000:
-            print(
-                "  this prototype is pure Python and will be slow and memory-hungry\n"
-                "  above ~3M cells. res 5 is the comfortable global ceiling here;\n"
-                "  res 7 (98.8M cells), which is what W needs to resolve Gibraltar,\n"
-                "  wants a compiled implementation."
+        gb = estimate_gb(n)
+        print(f"building the whole planet at res {args.res}: {n:,} cells, ~{gb:.1f} GB")
+        if gb > 8.0 and not args.force:
+            raise SystemExit(
+                f"  refusing: ~{gb:.0f} GB is beyond this pure-Python prototype.\n"
+                f"  res 6 (14.1M cells, 3.9 GB, ~4 min) is the practical global ceiling.\n"
+                f"  res 7 is what W needs to resolve Gibraltar and wants a compiled build.\n"
+                f"  override with --force if you know your machine can take it."
             )
+        if gb > 2.0:
+            print(f"  expect several minutes; peak RSS around {gb:.0f} GB")
     else:
         print(f"building {bbox} at res {args.res}")
     base = build_base(bbox=bbox, res=args.res, ne_res=args.ne_res, seed_latlng=tuple(args.seed))
