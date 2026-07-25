@@ -1,154 +1,183 @@
-# Proposal: GRIB solar-radiation → traversable graph with landmass keep-out
+# Proposal: solar-radiation routing over a global ocean map
 
 ## Goal
 
-Route a vehicle across the sea using a graph traversal / shortest-path
-algorithm, where:
+Simulate a solar-powered vessel crossing the sea, where:
 
-- **surface solar radiation** (from GRIB, varying over space and time) drives the
-  cost/objective of a route;
-- **landmasses, inland water, and a configurable keep-out buffer** are excluded
-  from the traversable space — the focus is coastal / open-ocean operation, so
-  lakes and rivers are treated as land;
-- **the vehicle's own state** (power/battery, mode) affects how fast it moves,
-  and therefore how far it gets — a feedback loop, not a fixed edge cost;
-- **future models** (currents, wind, sea state, …) can be added later without
-  reworking the core.
+- surface solar radiation (from GRIB, varying in space and time) drives the objective;
+- landmasses, inland water, and a configurable keep-out buffer are excluded from the
+  navigable space — the target is coastal and open-ocean operation, so lakes and
+  rivers count as land;
+- the vehicle's own state (battery, mode) affects how fast it moves and therefore how
+  far it gets;
+- further models (currents, wind, sea state) can be added without reworking the core.
 
-This document is language- and library-agnostic: it describes the data model,
-the transformations, and the decisions, not the code.
+This document describes the data model, the transformations, and the decisions, not
+the code.
 
-### The central design decision: decouple everything from the GRIB grid
+### Why this is not a graph search
 
-The GRIB cells are coarse (~0.25° ≈ 25 km) and are the *wrong* unit for a route
-whose step size is 100s of metres to single-digit km. So the routing graph gets
-its **own geometry**, independent of the radiation grid, and the radiation grid
-is exposed only as a **sampled function** `Rad(t, lat, lon)` used to price edges.
+The GRIB cells are coarse (~0.25° ≈ 25 km), far too coarse for a route whose step is
+hundreds of metres to a few km. So the route lives in continuous position, and the
+radiation grid is exposed only as a sampled function `Rad(t, lat, lon)`.
 
-More importantly: because traversal *speed* depends on the vehicle's internal
-state, and that state depends on the whole path taken so far, a plain
-node-weighted graph cannot express the problem. The search state is not a node —
-it is `(node, time, battery, …)`. That single fact drives the data structures
-below.
+Speed depends on vehicle state, and that state depends on the whole track so far, so
+edge costs cannot be precomputed. The problem is a closed loop: a solver picks an
+action, the boat's dynamics say what that action achieves, and the ocean carries the
+boat somewhere.
 
-Three seams keep the pieces independent, and the search only ever touches the
-world through them:
+Four seams keep the pieces independent:
 
 ```
-neighbours(node)                        — geometry (the precomputed nav graph)
-field.sample(t, lat, lon)               — environment (radiation, later currents/wind)
-advance(state, edge, env, mode)         — dynamics (the boat, later other models)
+solve(state, env, value_fn)          — the decision
+advance(state, request, env)         — dynamics (the boat)
+propagate(state, velocity, env, dt)  — kinematics (drift and currents)
+field.sample(t, lat, lon)            — environment (radiation, later currents/wind)
 ```
 
-The map geometry (which water is navigable) is **baked once, ahead of time**;
-the environment and dynamics stay live at query time.
+Plus two map lookups, `legal(p)` and `value_fn(p)`. The map is built once ahead of
+time; everything else runs live.
 
 ---
 
 ## The pipeline in one picture
 
 ```
-                     ┌──────────── BUILD ONCE (geometry) ─────────────┐
-Ocean polygon ──▶ rasterize ──▶ ocean raster ──▶ distance transform
-                                     │                    │
-                                     ▼                    ▼
-                              is_ocean(p)          dist_to_shore(p)
-                                     │                    │
-                     flood-fill from open-ocean seed(s)  ─┘
+                     ┌──────────── BUILD ONCE (the map) ──────────────┐
+Ocean polygon ──▶ rasterize ──▶ ocean raster ──▶ is_ocean(p)
+                                                      │
+                     fast marching on the H3 grid ────┘
                                      ▼
-                   BASE graph: all ocean cells (H3) + per-node
-                              dist_to_shore + access_width
-                                     │
-                              prune(K, W)  ── keep-out + min channel width
+                              dist_to_shore(p)
                                      ▼
-                   RUNTIME artifact: compacted navigable graph
-                        nodes = navigable water cells
-                        edges = neighbour links (length, bearing only)
+                        access_width(p)  (max-bottleneck flood)
+                                     ▼
+                   H3 PYRAMID: per cell, min/max of dist_to_shore
+                              and access_width over its footprint
+                                     ▼
+                   RUNTIME artifact:  legal(p)   — K, W applied at query
+                                      value_fn(p) — cost-to-go per goal
                      └────────────────────────────────────────────────┘
                                      │
 GRIB messages ─index─▶ coarse fields │ Rad(t,p) sampler (bi/trilinear, W/m²)
                                      ▼            │
-   Vehicle dynamics  advance(state, edge, env, mode) -> (new_state, dt, cost)
+   Solver            solve(state, env, value_fn) -> request vector
+                                     ▼
+   Vehicle dynamics  advance(state, request, env) -> velocity through water, draw
         boat(time, mode) + internal state (battery); future models compose here
                                      ▼
-   State-augmented search  over labels (node, time, battery, …)
-        Dijkstra / A* on the augmented state space
+   Ocean kinematics  propagate(state, velocity, env, dt) -> end lat/lon, battery
+        drift and currents; swept path checked against legal(p)
 ```
 
-Each block is independent and testable in isolation. The GRIB indexing already
-exists in this codebase; the proposal is the rest.
+Each block is independent and testable in isolation. The GRIB indexing already exists
+in this codebase; the proposal is the rest.
 
 ---
 
-## Stage 1 — Radiation as a field sampler (not node data)
+## Stage 1 — Radiation as a sampled field
 
-The existing index already yields, per valid time, a radiation frame on a uniform
-lat/lon grid. Wrap it as a **sampler** rather than baking values into nodes:
+The existing index yields, per valid time, a radiation frame on a uniform lat/lon
+grid. Wrap it as a sampler:
 
-- **Interface:** `Rad(t, lat, lon) -> W/m²`. Internally: **bilinear** in lat/lon,
-  **linear** between the two time frames bracketing `t` (trilinear overall). This
-  is what decouples the fine route from the coarse grid — a caller gets a smooth
-  value at any point and any instant.
-- **Units** normalised at this boundary: accumulated J/m² → instantaneous W/m²
-  by dividing by the accumulation seconds (the viewer already does this). The
-  graph consumes a rate.
-- **Cache:** sampling at `t` needs only the two bracketing frames. The existing
-  `FrameCache` (byte-bounded LRU of decoded frames) is exactly the right
-  structure — keep those frames warm there.
-- **One interface, many fields:** radiation is *scalar*; future currents/wind are
-  *vector* (`-> (u, v)`). Define `ScalarField.sample` and `VectorField.sample` so
-  every runtime environmental input looks the same to the rest of the system. The
-  "environment" is then just a **list of fields**.
+- Interface: `Rad(t, lat, lon) -> W/m²`, bilinear in lat/lon and linear between the
+  two frames bracketing `t`. A caller gets a value at any point and any instant, so
+  nothing downstream inherits the 25 km grid.
+- Units are normalised here: accumulated J/m² becomes W/m² by dividing by the
+  accumulation seconds, as the viewer already does.
+- Timestamp each frame at the midpoint of its accumulation window, not at its valid
+  time. Dividing an accumulation by its window gives the mean rate over that window,
+  and for ERA5 the window is `(t − 1h, t]`, so the value describes `t − 30 min`.
+  Attributing it to `t` shifts the modelled diurnal cycle half a window late, moving
+  sunrise by 30 minutes and biasing every energy integral with it.
+- Sampling at `t` needs only the two bracketing frames, so the existing `FrameCache`
+  (byte-bounded LRU of decoded frames) is the right structure.
+- Radiation is scalar; currents and wind will be vector (`-> (u, v)`). Define
+  `ScalarField.sample` and `VectorField.sample` so the environment is just a list of
+  fields.
 
-(The land/ocean mask is *not* one of these runtime fields — it is consumed at
-build time to bake the graph geometry, Stage 2.)
+Known error, accepted for now: linear interpolation between hourly means does not
+reproduce the accumulated daily total, and it softens the sunrise and sunset knees
+where the error concentrates. If the objective is energy collected, that lands
+directly on the quantity being optimised. Two drop-in fixes if it proves to matter:
+interpolate the cumulative curve with a monotone spline (PCHIP) and differentiate it,
+which reproduces every frame's total by construction and cannot emit a negative rate;
+or interpolate a clear-sky index (the ratio to computed top-of-atmosphere irradiance)
+and re-multiply, which gets the diurnal shape closer. Neither changes the interface.
+
+Out of range is a hard stop. `Rad` is undefined past the last frame, before the first,
+or outside the GRIB's spatial subset. The sampler signals that rather than
+extrapolating or clamping, and the simulation terminates when it runs out of data. A
+rollout reaching the edge of the dataset ends there; that is the end of what can be
+evaluated, not a failure of the route.
+
+This runs on historical reanalysis. ERA5 describes weather that already happened, so
+the tool answers what a boat would have done over a past period — backtesting and
+design evaluation, not operational routing. Forecast horizon, forecast uncertainty,
+and update cadence are therefore out of scope. Going live would mean swapping the
+source for a forecast product (IFS, GFS) behind the same interface.
+
+The land/ocean mask is not one of these runtime fields; it is consumed at build time
+(Stage 2).
 
 ---
 
-## Stage 2 — Navigable-water selection (build time)
+## Stage 2 — The map (build time)
 
-This stage decides which water is navigable and bakes it into geometry. It never
-runs during search.
+This stage produces the two scalar fields that decide which water is navigable. It
+never runs at query time.
 
-### 2a. Source of "what is navigable": the ocean polygon
+### 2a. Ocean, not water
 
-Because inland water is to be treated as land, define the mask as **"is this
-ocean?"**, not "is this water?":
+Inland water counts as land, so the mask asks "is this ocean?", not "is this water?".
 
-- **Build the mask from an ocean polygon** (e.g. Natural Earth's `ocean` layer),
-  already the family of data used for the basemap. Lakes and rivers are simply
-  *not ocean*, so they are non-navigable **by construction** — no heuristics.
-- A generic water test can't do this: rivers and estuaries are topologically
-  connected to the sea, so any "any water" flood would flow up them. Inland water
-  is excluded by **classification**, which the ocean polygon gives for free.
-- **The ERA5 land–sea field is not sufficient here.** It marks a lake as water and
-  can't distinguish it from the sea, so it is at best a coarse fallback that would
-  need a separate lake mask bolted on. The ocean polygon is the primary source.
-- **Marginal seas** (Mediterranean, Baltic, Black Sea) *are* part of the ocean
-  polygon and are kept — whether they survive is governed by the `W` parameter
-  below, not by this classification.
+Build it from an ocean polygon (e.g. Natural Earth's `ocean` layer, already the family
+of data used for the basemap). Lakes and rivers are not ocean, so they are
+non-navigable by construction, with no heuristics involved. A generic water test
+cannot do this: rivers and estuaries connect to the sea, so any flood over "water"
+runs up them. Inland water has to be excluded by classification, which the ocean
+polygon supplies. The ERA5 land–sea field has the same problem — it marks a lake as
+water with no way to distinguish it from sea — so it is at best a coarse fallback
+needing a separate lake mask bolted on.
 
-### 2b. Rasterize once — one artifact serves the land test and the K field
+Marginal seas (Mediterranean, Baltic, Black Sea) are part of the ocean polygon and are
+kept. Whether they survive is decided by `W` below, not by classification.
 
-`is_ocean(lat, lon)` and `dist_to_shore(lat, lon)` are queried millions of times
-during the build, so precompute them as arrays rather than doing point-in-polygon
-per query:
+### 2b. Classify in lat/lon, measure on H3
 
-1. **Burn the ocean polygon into a boolean raster** at a resolution *finer* than
-   the H3 cells (so islands and narrow inlets aren't lost). `is_ocean` = a raster
-   lookup.
-2. **Distance transform** over the non-ocean region → every ocean pixel holds its
-   distance to the nearest non-ocean thing (continent, island, *or* lake edge).
-   Convert pixels → km with the cos-latitude factor (the scale bar's correction).
-   `dist_to_shore` = a raster lookup.
+Two jobs with different requirements; separating them is what removes a metric error.
 
-One raster + its distance transform powers both the ocean test and the keep-out
-field, as pure O(1) array lookups.
+Classification has no metric, so lat/lon is fine. Burn the ocean polygon into a
+boolean raster fine enough to resolve the narrowest passage that matters (~0.005° ≈
+500 m). Longitude wrapping handles the antimeridian, and the degenerate pole rows
+carry nothing a marine map needs. `is_ocean` is then a raster lookup.
 
-### 2c. Enumerate + connectivity: flood-fill from an open-ocean seed
+Distance has a metric, so it cannot be measured in lat/lon. A Euclidean distance
+transform on a lat/lon raster finds the nearest pixel in pixel space, but the true
+metric is anisotropic — 2:1 at 60°N — and no cos-latitude factor applied afterwards
+repairs a wrong nearest neighbour. The error runs between 1× and 1/cos φ depending on
+which way the coast lies. Since `K` is denominated in km and `W + 2K` inherits it,
+this would corrupt the one parameter the build exists to serve.
 
-Enumerate the navigable cells by BFS from a known open-ocean cell, expanding
-through ocean and refusing to cross non-ocean:
+Instead compute `dist_to_shore` by multi-source fast marching over the H3 grid,
+seeded from every ocean cell adjacent to a non-ocean cell. H3 cells are near-equal-area
+with near-uniform centre spacing, so the metric is isotropic at every latitude and
+across the antimeridian, with no projection involved.
+
+Build resolution is set by the narrowest passage `W` must adjudicate. Gibraltar at
+~14 km needs cells well under that: res 7 (~2.1 km centre spacing) puts about 7 cells
+across the strait, res 6 (~5.6 km) puts 2–3 and is marginal. At res 7 the global ocean
+is ~7×10⁷ cells, a few hundred MB of float32 as a one-time offline working set. The
+runtime artifact is far smaller, since the pyramid stores children only for mixed
+cells (3b).
+
+Validation: the maximum of `dist_to_shore` should land near Point Nemo at ~2690 km. A
+peak elsewhere, or much higher, means a missing landmass or a broken metric.
+
+### 2c. Connectivity: flood-fill from an open-ocean seed
+
+Enumerate the navigable cells from a known open-ocean cell, expanding through ocean
+and refusing to cross non-ocean:
 
 ```
 seed  = latlng_to_cell(open_ocean_point, R)
@@ -162,201 +191,234 @@ while queue:
         if n not in seen: seen.add(n); queue.append(n)
 ```
 
-Three properties fall out for free: enumeration + mask + connectivity in one pass;
-it never materialises land; and `grid_disk` handles the antimeridian and poles
-correctly in H3 space. Since the world ocean is one connected body, **one seed
-usually suffices**; use several if you operate across genuinely disconnected
-basins, and validate that the ocean-cell count matches the expected sea area (a
-missing seed drops a whole basin).
+This gives enumeration, mask, and connectivity in one pass, never materialises land,
+and leaves the antimeridian and poles to `grid_disk`. The world ocean is one connected
+body, so one seed usually suffices; use several for genuinely disconnected basins, and
+check the ocean-cell count against expected sea area, since a missing seed silently
+drops a whole basin.
 
-### 2d. The two selection parameters: K and W
+### 2d. K and W
 
-Two scalars decide the final navigable set. Both are computed from `dist_to_shore`
-and applied when the graph is **pruned** (Stage 3a) — the map is built once and
-reused, so these are build parameters, not per-query knobs.
+Two scalars decide the navigable set. Both are thresholds on fields computed here at
+build time but applied at query time, so one build serves any `(K, W)`.
 
-- **K — keep-out distance (km).** "No vehicle within K of shore."
-  `dist_to_shore(cell) >= K`. `K = 0` (hug the coast) is valid.
-- **W — minimum navigable channel width (km).** A body of water counts only if it
-  connects to open ocean through a channel at least `W` wide. This is a
-  morphological *opening* of the ocean by radius `W/2`, and it is what selectively
-  masks marginal seas: the Strait of Gibraltar is ~14 km wide, so `W = 30 km`
-  seals it and the whole Mediterranean drops out, while `W = 10 km` keeps it. It
-  is a **uniform rule** — `W` closes *every* passage narrower than `W`, trimming
-  narrow coastal inlets as well as severing marginal seas.
+K, the keep-out distance in km: no vehicle within K of shore, `dist_to_shore ≥ K`.
+`K = 0` (hug the coast) is valid.
 
-`W` is realised through a per-cell **`access_width`**: the widest bottleneck on
-the best path to open ocean,
+W, the minimum navigable channel width in km: a body of water counts only if it
+connects to open ocean through a channel at least `W` wide. This is a morphological
+opening of the ocean by radius `W/2`, and it is what selectively masks marginal seas —
+Gibraltar is ~14 km wide, so `W = 30 km` seals it and the Mediterranean drops out,
+while `W = 10 km` keeps it. The rule is uniform: `W` closes every passage narrower
+than itself, trimming coastal inlets as well as severing marginal seas.
+
+W is realised through a per-cell `access_width`, the widest bottleneck on the best
+path to open ocean:
 
 ```
 access_width(c) = max over paths P from c to an open-ocean seed
                      of  2 · min_{x in P} dist_to_shore(x)
 ```
 
-computed once with a **maximum-bottleneck flood** (sort cells by `dist_to_shore`
-descending, union-find them, and record the `dist_to_shore` at which each first
-connects to a seed × 2). This same flood *is* the connectivity pass — a truly
-enclosed lake never connects to a seed, so its `access_width` is 0 and it is
-masked for any `W > 0`, on top of already being excluded by the ocean polygon.
+computed with a maximum-bottleneck flood: sort cells by `dist_to_shore` descending,
+union-find them, and record twice the `dist_to_shore` at which each first connects to
+a seed. This flood is also the connectivity pass — an enclosed lake never connects to
+a seed, so its `access_width` is 0 and any `W > 0` masks it, on top of the ocean
+polygon already excluding it.
 
-**Coupled K→W semantics.** Because K and W are applied at build time, do it in the
-physically correct order: apply K first (remove the near-shore band), recompute
-`access_width` on the remaining water, then apply W. Then `W` means the width of
-the corridor you can *actually use after the keep-out*, not the raw shore-to-shore
-width — a 30 km strait with a 5 km keep-out on each side is effectively 20 km of
-navigable water.
+Coupled K→W, in closed form. `W` should mean the width of the corridor usable after
+the keep-out, not the raw shore-to-shore width: a 30 km strait with a 5 km keep-out
+each side leaves 20 km of navigable water. That reads as a two-pass procedure — erode
+the near-shore band, recompute `access_width` on what remains, then threshold — but it
+is not necessary. Eroding by `K` shifts every bottleneck in by exactly `K` on each
+side, and subtracting a constant preserves the ordering the max-bottleneck flood
+depends on, so `access_width_after_keepout(p) = access_width(p) − 2K` exactly. The only
+exception is corridors whose raw bottleneck was already below `K`, which the
+`dist_to_shore` test excludes anyway. So the coupling reduces to one comparison
+against the unmodified field:
+
+```
+legal(p)  ≡  dist_to_shore(p) ≥ K   and   access_width(p) ≥ W + 2K
+```
+
+There is no second flood, no prune pass, and no per-`(K, W)` artifact, which is what
+makes both parameters free to change at query time.
 
 ---
 
-## Stage 3 — Navigation graph + state-augmented search
+## Stage 3 — Runtime map and the simulation loop
 
-Three parts: **geometry** (built + pruned), **state**, and **search**.
+### 3a. What runtime gets
 
-### 3a. Graph geometry — H3, built once, pruned to a runtime artifact
-
-The graph's spacing is *yours*, chosen for a 100 m – few-km step, unrelated to the
-25 km grid.
-
-**Cell geometry** (Open Question 3):
-
-- **Geodesic hex grid (H3)** — *recommended.* Cells are near-equal-area
-  everywhere, so pole distortion and the antimeridian seam disappear, and every
-  cell has **6 edge-adjacent neighbours at one uniform distance** — no √2
-  bookkeeping, no directional bias. A cell id is a 64-bit integer, giving node
-  identity for free (no floats-as-keys trap). Resolution sets the step: res 7 ≈
-  1.2 km, res 8 ≈ 460 m, res 9 ≈ 170 m — your whole target range.
-- **Fine regular lattice** — simplest, but cos-latitude distortion returns in every
-  distance and the square grid biases paths toward the axes/diagonals.
-- **Navmesh / visibility graph from coastline polygons** — sparse; a bigger build.
-
-**On H3 and the library question.** H3's hex *math* is simple; what needs the
-library is tiling a **sphere** with hexagons globally without seams (icosahedron
-projection, cross-face transforms, the 12 unavoidable pentagon cells, exact index
-encoding). Those failures are *silent* — a precision slip near a face boundary
-mislabels a cell's neighbours and the search returns a subtly wrong path with no
-error, which is why the tested library is worth it when the domain is global.
-**If the routing domain is bounded** (a basin, a coastline, one crossing), you can
-skip the dependency: project the region to a local gnomonic / equal-area plane,
-lay a flat hex grid there, and map cell centres back to lat/lon — a few hundred
-lines that keep the uniform-hex benefit within the region, at the cost of
-distortion far from centre and no poles/dateline.
-
-**Build once, then prune.** The geometry seam is *static* — which cells are
-navigable never depends on time, radiation, or boat state. Split it in two so the
-expensive coastline work is done once and only the cheap parameter step reruns:
+Stage 2 emits two scalar fields over position:
 
 ```
-BASE build (K/W-agnostic, uses H3):
-  1. ocean cells   = flood-fill from seed(s)                 # Stage 2c
-  2. per cell:  dist_to_shore, access_width                  # Stage 2b/2d
-  3. edges         = grid_disk(c,1) neighbours also ocean    # ≤6 per cell
-  4. per edge:  length + bearing from cell-centre great-circle distance
-  5. keep H3 id per cell
-
-PRUNE(K, W)  ── coupled K→W (Stage 2d):
-  6. keep cells with dist_to_shore ≥ K
-  7. recompute access_width on survivors; keep those with access_width ≥ W
-  8. drop components no longer connected to a seed
-  9. RECOMPACT: renumber survivors 0..N'-1, rebuild adjacency + point index
-
-RUNTIME artifact:  a plain navigable graph, no K/W/mask awareness, smaller
+dist_to_shore(p)   — km to the nearest non-ocean thing (continent, island, lake edge)
+access_width(p)    — narrowest bottleneck on the widest corridor from p to open ocean
 ```
 
-Only **geometry** is serialised — never costs, times, or radiation, which stay in
-`advance`/`field.sample`. Pruning yields a smaller graph and a hot loop with **no
-per-expansion mask predicate**: excluded cells simply aren't there, edges are
-pre-severed, and dropping stranded components means the search can't wander into
-dead-end pockets. Because H3 is hierarchical, the base build can also go
-**adaptive** — fine cells near the coast, coarse in open water — baked into the
-same flat integer graph.
+Legality is the pair of comparisons derived in 2d, evaluated per query. Nothing about
+`K` or `W` is baked into the artifact.
 
-**Node ids are not stable across prunes.** Recompaction renumbers everything, so a
-node id in the `K=5` map is a different cell in the `K=10` map. Persist anything
-durable — saved routes, waypoints, start/goal — by **H3 id or lat/lon**, and
-re-resolve against whichever pruned map is loaded. Keep the **base artifact**
-around so trying a new `(K, W)` is a cheap re-prune, never a re-rasterize of the
-coastline. (A lightweight version stamp on each artifact — inputs it was built
-from — lets a stale one rebuild; detailed caching is out of scope for now.)
+### 3b. Legality at the resolution the situation demands
 
-**Edges carry geometry only** — length and bearing. **No time, no cost stored on
-the edge**; both are computed per traversal, because they depend on state.
-
-### 3b. Search state — why nodes aren't enough
-
-Traversal time over an edge = `length ÷ speed(state)`, and speed depends on
-battery, which depends on every edge crossed before it. So the thing the search
-explores is an **augmented state**:
+`legal(p)` is a property of two continuous fields, so it can be answered at whatever
+resolution is sufficient: coarse in open water, fine near a coast. Store a pyramid
+over H3 resolutions holding, per cell, the min and max of each field over that cell's
+footprint:
 
 ```
-State = (node, time, battery, …future state…)
+cell -> (min_d, max_d, min_a, max_a)
 ```
 
-This is the **resource-constrained shortest path** shape. Two ways to keep a
-standard algorithm applicable:
-
-- **Bucketed state** — discretize battery into N levels (and time into steps). The
-  search space becomes a **product graph** `node × battery × time`, and ordinary
-  Dijkstra / A\* runs unchanged. Simple, bounded memory, approximate. *Start
-  here.*
-- **Continuous state with Pareto labels** (label-setting) — each node keeps a
-  **frontier of non-dominated labels** `(arrival_time, battery, cost)`; one label
-  dominates another if it arrives no later, no more depleted, and no costlier.
-  Exact, but frontiers can grow. *Move here if buckets prove too coarse.*
-
-Data structures for the search:
-
-- a **priority queue of labels** (the frontier), ordered by cost or time;
-- a **per-node label set** with a dominance check — a short sorted list per node
-  is usually enough;
-- the pruned **adjacency** from 3a;
-- a **came-from map** keyed by *label*, not node, to reconstruct the path.
-
-### 3c. Vehicle dynamics — the `advance` seam
-
-The boat, and every future model, lives behind one function the search calls per
-edge:
+A query descends from a coarse level:
 
 ```
-advance(state, edge, environment, mode) -> (new_state, dt, cost)
+if min_d ≥ K and min_a ≥ W + 2K:   LEGAL    — whole cell is clear, stop
+if max_d < K  or  max_a < W + 2K:  ILLEGAL  — whole cell is excluded, stop
+else:                              descend
 ```
 
-- samples whatever fields it needs at `state.time` and the edge location
-  (radiation now; current/wind later);
-- computes **speed** from state + mode (low battery → slower), then
-  `dt = edge.length / speed`, and integrates **battery** over the crossing (solar
-  in via `Rad`, propulsion out) to produce `new_state`;
-- returns the incremental `cost` for whatever objective is chosen (Open
-  Question 1).
+Mid-Atlantic this settles at res 2–3 on the first comparison; approaching a coastline
+it descends until the mixed cells resolve. Query cost scales with proximity to land.
 
-**Future rate models compose here** as a small **pipeline of speed modifiers** —
-each reads the environment and scales or caps speed (a current pushes you along;
-heavy seas slow you). The search never learns they exist; it only ever calls
-`advance`.
+Only mixed cells need children stored, so uniform cells are leaves and the pyramid is
+a compressed encoding of the two fields rather than an index bolted on top of them.
+That is what makes global coverage affordable: a fine global raster of `dist_to_shore`
+at 500 m would be ~3×10⁹ samples.
 
-Two modelling notes:
+Aggregate each level directly from the source, never by combining children. H3
+hexagons do not nest — a res-`r+1` cell is not contained in its res-`r` parent, and
+`cellToChildren` returns 7 cells whose union only approximates it — so taking a cell's
+`min_d` as the min over its children is unsound near cell boundaries, which is exactly
+where coastlines sit. Computing each level over its own footprint reduces the
+resolution ladder to an indexing convenience with no correctness role. Descent
+re-indexes at each level rather than following child links, for the same reason.
 
-- **Fixed-space stepping fits graph search:** edges are geometric segments and
-  `dt` is derived. (The alternative — fixed-time stepping where you land between
-  nodes — is a simulation, not a graph traversal, and doesn't fit Dijkstra/A\*.)
-- **Admissible A\* heuristic:** `remaining_great_circle_distance ÷ max_speed` is a
-  valid lower bound on time, because no model can exceed top speed. It keeps A\*
-  correct even with state-dependent edge times.
+### 3c. Why H3
+
+Near-equal-area cells everywhere, so a resolution level means the same thing at every
+latitude and a distance measured on the grid is isotropic; global seamlessness,
+including the antimeridian and both poles; and 64-bit integer ids that double as
+spatial hash keys. Uniform neighbour spacing, which motivated the original choice, no
+longer matters now that motion is continuous and headings are not quantized.
+
+The domain is global, so the library is not optional. What needs a tested
+implementation is exactly what global demands: tiling a sphere without seams —
+icosahedron projection, cross-face transforms, the 12 pentagons, exact index encoding.
+Those failures are silent, a precision slip near a face boundary mislabelling geometry
+with nothing raised.
+
+Pentagons will be hit here, unlike in most H3 applications. The icosahedron is
+oriented so that all 12 fall in water, which spares land-based users and guarantees a
+marine map meets every one. They have 5 neighbours and off-nominal area, so the flood
+(2c), the fast marching (2b), and the cost-to-go (3d) each need the special case.
+
+### 3d. Cost-to-go
+
+A solver that looks only a few steps ahead will route into culs-de-sac and around the
+wrong side of a peninsula. Precompute a terminal value function per goal: take the
+legal cells at a working resolution, connect each to its `grid_disk(c, 1)` neighbours,
+and run one Dijkstra from the goal, storing distance-to-goal per cell. It is a lookup
+for "how much further from here", not a route, and it is the only remaining use of
+cell adjacency.
+
+Its resolution is bounded below by `W`, not free. `value_fn` is only a heuristic, so
+the instinct is to compute it coarse: global res 5 is ~1.4×10⁶ ocean cells against res
+7's ~7×10⁷. But res 5 centres sit ~15 km apart, so Gibraltar is not traversable on
+that grid, and `value_fn` would report the Mediterranean reachable only around Africa
+while `legal(p)` admits it. A heuristic that disagrees with legality about which
+passages exist steers the solver away from the correct route rather than merely
+slowing it down. So `value_fn` must resolve every passage the `(K, W)` in use admits,
+which puts it at res 6 (~1×10⁷ ocean cells) at the coarsest.
+
+### 3e. The seams
+
+```
+solve(state, env, value_fn)          -> request vector  (desired heading + speed, or mode)
+advance(state, request, env)         -> achievable velocity through water, power draw
+propagate(state, velocity, env, dt)  -> end lat/lon, battery, t + dt
+legal(p) / value_fn(p)               -> map lookups
+```
+
+`solve` owns the decision and is deliberately unspecified here; see Stage 4.
+
+`advance` owns the boat: what speed through water is achievable given battery and
+mode, and what it costs in power. Future rate models (sea-state drag, hull fouling)
+compose here as a pipeline of speed modifiers.
+
+`propagate` owns the ocean. It samples the environment's vector fields and integrates
+achievable velocity plus drift over `dt` to a new position, integrating battery across
+the same interval (solar in via `Rad`, propulsion out). It is an integrator, not a
+field — it consumes fields — and holding that distinction is what keeps the fields
+pure, cacheable, and independently testable.
+
+Because the request is a vector, set-and-drift falls out correctly. Holding a course
+over ground against a current requires crabbing, and with speed through water `V` and
+the current decomposed into along-course `c∥` and cross-course `c⊥`:
+
+```
+speed_over_ground = c∥ + sqrt(V² − c⊥²),   feasible only if V > |c⊥| and the result > 0
+```
+
+Below that threshold the requested course is unachievable — a weak boat cannot cross a
+strong set. A scalar speed cannot express this; a vector can.
+
+### 3f. Stepping, collisions, termination
+
+`dt` is a chosen quantity, so four things a graph formulation would have given for
+free have to be specified.
+
+Swept-path legality: checking only the endpoint lets a step jump over a headland or an
+island. The pyramid supplies a cheap sufficient condition — if `min_d` at the
+terminating cell of the query exceeds the step distance, no collision is possible and
+the check can be skipped. Sample along the segment only when that fails, which is
+exactly when near land.
+
+Endpoint policy: drift can push the boat into illegal water from a legal request. Pick
+one contract and state it — reject the action, clamp to the legality boundary, or
+terminate the rollout as a failure. Solvers behave very differently under each.
+
+Arrival tolerance: continuous drift means never landing exactly on the goal, so
+arrival is a radius and the solver needs it as a termination condition.
+
+`dt` selection trades fidelity against rollout cost, and interacts with the radiation
+frame spacing (Stage 1) and with step distance relative to clearance. A step long
+enough to cross a channel is a step whose swept-path check cannot be skipped.
 
 ---
 
-## Stage 4 — Handoff to the traversal algorithm
+## Stage 4 — Handoff to the solver
 
-Keep the algorithm ignorant of GRIB, boats, and coastlines. It sees only:
+The solver reaches the world only through the seams in 3e, and nothing it touches
+knows about GRIB, coastlines, or H3:
 
-- `neighbours(node)` — expand the frontier over the pruned adjacency;
-- `advance(state, edge, env, mode)` — the true cost/time/state transition of a
-  step;
-- `sample`-backed fields, reached *through* `advance`, never directly;
-- a **coordinate ↔ node** mapping (nearest navigable node to an arbitrary
-  lat/lon) so callers give start/goal in real coordinates.
+- `solve` is called with the current state, the environment, and `value_fn`;
+- `legal(p)` answers navigability in near-constant time, `K` and `W` already applied;
+- `value_fn(p)` supplies distance-to-goal, so local decisions stay globally sane;
+- `advance` and `propagate` together form a simulator: given a request vector they
+  return the next state. Any solver that can call that in a loop can be swapped in
+  without touching anything else.
 
-Any uniform-cost (Dijkstra) or heuristic (A\*) search over the augmented state
-runs unmodified.
+Waiting needs no special machinery. A zero-speed request is an ordinary action:
+`advance` reports station-keeping power draw, `propagate` integrates solar in and drift
+over `dt`. Loitering to charge through the night is therefore expressible — but only
+if station-keeping draw is non-zero, since if holding is free the solver will loiter
+indefinitely to top up. That draw is what makes waiting a trade-off rather than a
+dominant strategy.
+
+The solver class is still open, and it changes what else is needed around it:
+
+- MPC / receding horizon wants cheap rollouts over a short horizon and leans hard on
+  `value_fn` as the terminal term.
+- Sampling-based (RRT\*, MCTS) wants a steering function toward a sampled target and
+  leans hard on the swept-path test; it needs the H3 id as a visited-state hash key,
+  since continuous positions give no free revisit pruning.
+- A learned policy (RL) wants `advance` and `propagate` fast enough to run millions of
+  times, which puts the pyramid's early-out on the hot path.
+
+All three want the same substrate, so Stages 1–3 can be built before the solver is
+chosen; only the phasing past that point depends on it.
 
 ---
 
@@ -364,68 +426,80 @@ runs unmodified.
 
 | Concern | Structure | Notes |
 |---|---|---|
-| Radiation / env input | **Field sampler** (`ScalarField` / `VectorField`) over the coarse grid | Trilinear interpolation; backed by `FrameCache`; scalar vs vector |
-| Ocean test + keep-out | **Boolean ocean raster + distance transform** | Built once from the ocean polygon; yields `is_ocean` and `dist_to_shore` lookups |
-| Basin selection | **`access_width` per cell** (max-bottleneck flood / union-find) | Powers `W`; the same flood is the connectivity pass |
-| Route space (base) | **All-ocean H3 graph** + per-node `dist_to_shore`, `access_width`, H3 id | Built once; input to pruning; kept for cheap re-prune |
-| Route space (runtime) | **Pruned, recompacted graph** — adjacency over contiguous int ids | K & W baked in; no mask predicate at search time; node ids not stable across prunes |
-| Search unit | **Augmented state** `(node, time, battery, …)` | Bucketed → product graph, or continuous → Pareto labels |
-| Frontier | **Priority queue of labels** + **per-node non-dominated label set** | Dominance check prunes; `came-from` keyed by label |
-| Vehicle + future models | **`advance` transition function** + **pipeline of speed modifiers** | Boat is the first; currents/wind/sea-state compose without touching search |
+| Radiation / env input | Field sampler (`ScalarField` / `VectorField`) over the coarse grid | Trilinear; frames stamped at accumulation midpoints; backed by `FrameCache` |
+| Ocean classification | Boolean ocean raster in lat/lon | Burned from the ocean polygon; no metric involved, so lat/lon is safe here |
+| Keep-out field | `dist_to_shore` by multi-source fast marching on the H3 grid | Measured on equal-area cells so the metric is isotropic |
+| Basin selection | `access_width` per cell, by max-bottleneck flood / union-find | Powers `W`; the same flood is the connectivity pass |
+| Legality | H3 pyramid of per-cell min/max of both fields | Thresholded at the coarsest sufficient resolution; K and W applied at query; only mixed cells store children |
+| Global guidance | Cost-to-go per cell, one Dijkstra from the goal | `value_fn(p)`; the only remaining use of cell adjacency; resolution bounded below by `W` |
+| Simulation state | Continuous `(lat, lon, time, battery, …)` | No discrete node; H3 id serves as the spatial hash key for revisit pruning |
+| Vehicle + future models | `advance`, plus a pipeline of speed modifiers | Boat is the first; sea-state and fouling compose without touching the solver |
+| Ocean interaction | `propagate`, an integrator over vector fields | Drift and currents to an end lat/lon; crabbing makes some courses infeasible |
 
 ---
 
 ## Recommended phasing
 
-1. **Ocean raster + fields.** Rasterize the ocean polygon; distance transform →
-   `dist_to_shore`; `Rad(t,p)` sampler with interpolation and `FrameCache`.
-   Visualise the ocean mask and distance field as overlays. *No graph yet.*
-2. **Base build + prune + distance-only path.** Flood-fill the H3 ocean graph with
-   `dist_to_shore` and `access_width`; prune with `(K, W)`; run shortest path at
-   fixed speed (no battery). Validates the build, connectivity, the K/W selection
-   (e.g. Gibraltar sealing the Med at `W = 30 km`), and coordinate round-tripping.
-3. **State-augmented routing (bucketed).** Introduce `advance`, battery state, and
-   the objective function; the low-power→slower feedback loop appears here.
-   Product-graph Dijkstra/A\*.
-4. **Refinements as needed.** Pareto labels if buckets are too coarse; additional
-   speed-modifier models (currents, wind); soft distance-to-shore costing.
+1. Fields. Burn the ocean raster; fast-march `dist_to_shore` on the res-7 H3 grid;
+   build the `Rad(t,p)` sampler with interpolation and `FrameCache`. Visualise the
+   ocean mask and distance field as overlays. No map artifact yet.
+2. The map. Flood for connectivity and `access_width`; build the min/max pyramid;
+   implement `legal(p)` with query-time `(K, W)` and the cost-to-go Dijkstra. Three
+   things to validate: `dist_to_shore` peaks near Point Nemo at ~2690 km; the K/W
+   selection behaves (Gibraltar sealing the Med at `W = 30 km`); and legality is
+   resolution-independent, meaning the same points classify identically whether the
+   query terminates coarse or descends to a leaf. This is also the phase where the 12
+   pentagons and the antimeridian either work or silently do not.
+3. The simulator. Battery state, mode to power draw, drift integration, swept-path
+   checking, endpoint policy. Drive it with a trivial hand-written policy (steer down
+   `value_fn`) rather than a real solver. The low-power-to-slower feedback loop appears
+   here, and this phase can be validated against known passages at fixed speed.
+4. The solver. Whichever class is chosen; it consumes the substrate from phases 1–3
+   unchanged.
+5. Refinements. Currents and wind as vector fields; sea-state speed modifiers; a soft
+   distance-to-shore preference on top of the hard `K`.
 
-Each phase is independently useful, and each reuses the previous one's seams
-unchanged.
+Each phase is independently useful, and each reuses the previous one's seams unchanged.
 
 ---
 
 ## Decisions so far
 
-- **Graph geometry — settled.** A **geodesic H3 hex grid**, built once and pruned
-  into a compacted runtime graph over contiguous integer node ids. Resolution
-  picks the step (res 7–9 ≈ 1.2 km – 170 m). If the operating domain is bounded,
-  the H3 library is optional — a local hex projection gives the same benefit
-  dependency free.
-- **What counts as navigable — settled.** Mask from the **ocean polygon**, so
-  **inland water (lakes, rivers) is treated as land**; the ERA5 land–sea field is
-  not used. Coastal / open-ocean operation is the target.
-- **Keep-out & basin selection — settled.** Two build-time parameters applied at
-  **prune** time to a reused map: **K** (keep-out distance from shore) and **W**
-  (minimum navigable channel width, via `access_width`), with **coupled K→W**
-  semantics (apply K, recompute width, apply W). `W` selectively masks marginal
-  seas (e.g. `W = 30 km` masks the Mediterranean via the Strait of Gibraltar).
-- **Inland-water connectivity — settled/closed.** Handled by the ocean polygon
-  plus the `access_width` flood; no separate connectivity question remains.
+- Route representation: continuous position with a closed-loop simulator, not a graph
+  search.
+- Domain extent: global. This makes the H3 library a hard dependency, forces
+  `dist_to_shore` onto the H3 grid rather than a raster, and guarantees the build meets
+  all 12 pentagons (3c).
+- Map indexing: an H3 pyramid, built at res 7, chosen for equal-area cells, global
+  seamlessness, and integer ids — not for neighbour uniformity (3c).
+- What counts as navigable: the ocean polygon, so inland water is treated as land; the
+  ERA5 land–sea field is not used (2a).
+- Keep-out and basin selection: `dist_to_shore ≥ K and access_width ≥ W + 2K`, which
+  carries the coupled K→W semantics exactly and leaves both as query-time parameters
+  over a single build (2d).
+- Inland-water connectivity: closed, handled by the ocean polygon plus the
+  `access_width` flood.
+- Data regime: historical ERA5 reanalysis, so this backtests rather than routes
+  operationally, and the simulation terminates when the data runs out (Stage 1).
+- Radiation interpolation: trilinear, on frames stamped at accumulation midpoints. It
+  does not conserve daily energy; that error is knowingly accepted, with two drop-in
+  upgrades noted if it proves material (Stage 1).
 
 ## Still open (need intent, not code)
 
-1. **Objective.** What does `advance` return as `cost` — maximise solar energy
-   collected, minimise travel time, minimise time subject to a battery floor, a
-   weighted blend? This defines the edge cost and possibly the label dimensions.
-   *(The single decision that most constrains `advance`.)*
-2. **Vehicle state model.** What exactly is in the boat's internal state beyond
-   battery, and how does `mode` map to power draw and speed? This fixes the
-   `advance` transition and how finely battery must be bucketed.
-3. **Domain extent.** Global (needs the H3 library and antimeridian handling) or a
-   bounded region (unlocks the dependency-free local-hex option)? And is
-   start/goal fixed, or arbitrary per query? This picks *H3-library vs local
-   projection*, not the grid type.
-4. **Time horizon.** Over how long a route does radiation change meaningfully
-   (hours? days?) — this sets how much the time axis of `Rad` actually matters and
-   how large the augmented state space gets.
+1. Solver class — MPC, sampling-based, or learned policy. Stage 4 lists what each
+   additionally needs. Everything in Stages 1–3 is common substrate, so this can be
+   deferred, but nothing past phase 3 can start without it. The largest open decision.
+2. Objective — maximise energy collected, minimise travel time, minimise time subject
+   to a battery floor, or a weighted blend. Since the solver is not Dijkstra this is
+   unconstrained in form: it need not be additive or non-negative, and maximising
+   objectives are fine. It still fixes what `solve` scores and what the vehicle model
+   must expose.
+3. Vehicle state model — what is in the boat's state beyond battery, and how `mode`
+   maps to power draw and speed. Must include station-keeping draw (Stage 4).
+4. Goal mobility — is the goal fixed per deployment or arbitrary per query? This
+   decides whether `value_fn` bakes into the artifact or is solved per request, and at
+   res 6–7 that is a 10⁷–10⁸-cell Dijkstra each time (3d).
+5. Time horizon — over how long a route does radiation change meaningfully? This sets
+   how much the time axis of `Rad` matters, and how much of the reanalysis a single
+   simulation consumes before it terminates.
