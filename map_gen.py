@@ -154,10 +154,29 @@ class BaseMap:
     access_width: np.ndarray  # km
 
 
+GLOBAL_BBOX = (-90.0, -180.0, 90.0, 180.0)
+
+
 def enumerate_cells(bbox, res: int) -> list[str]:
+    """Every cell at `res` inside bbox, or the whole globe when bbox is None.
+
+    The global path descends from the 122 res-0 cells instead of filling a
+    polygon, which sidesteps the antimeridian entirely -- there is no boundary to
+    cross. It also means no cell is truncated, so the whole ocean is one connected
+    body and a single seed reaches all of it.
+    """
+    if bbox is None:
+        cells: list[str] = []
+        for c in h3.get_res0_cells():
+            cells.extend(h3.cell_to_children(c, res))
+        return cells
     lat0, lon0, lat1, lon1 = bbox
     poly = h3.LatLngPoly([(lat0, lon0), (lat0, lon1), (lat1, lon1), (lat1, lon0)])
     return list(h3.polygon_to_cells(poly, res))
+
+
+def global_cell_count(res: int) -> int:
+    return 2 + 120 * 7**res
 
 
 def _neighbour_pairs(cells: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -196,6 +215,8 @@ def build_base(
     verbose: bool = True,
 ) -> BaseMap:
     log = _log if verbose else (lambda *a, **k: time.time())
+    if bbox is None:
+        log(f"global build: {global_cell_count(res):,} cells at res {res}")
 
     t = log("loading ocean polygon")
     ocean = load_ocean(ne_res)
@@ -260,7 +281,12 @@ def build_base(
     )
     d = dijkstra((g + g.T).tocsr(), indices=n)[:n]
     d[~connected] = np.nan
-    t = log(f"dist_to_shore from {seeds.size:,} shoreline cells, max {np.nanmax(d):.0f} km", t)
+    far = int(np.nanargmax(d))
+    t = log(
+        f"dist_to_shore from {seeds.size:,} shoreline cells; furthest {d[far]:.0f} km "
+        f"at {lat[far]:.1f} {lng[far]:.1f}",
+        t,
+    )
 
     aw = _access_width(src, dst, keep, d, connected, seed_idx)
     t = log(f"access_width computed, max {np.nanmax(aw):.0f} km", t)
@@ -268,7 +294,7 @@ def build_base(
     idx = np.flatnonzero(connected)
     return BaseMap(
         res=res,
-        bbox=bbox,
+        bbox=bbox if bbox is not None else GLOBAL_BBOX,
         cells=np.array([h3.str_to_int(cells[i]) for i in idx], dtype=np.uint64),
         lat=lat[idx],
         lng=lng[idx],
@@ -291,11 +317,13 @@ def _access_width(src, dst, keep, dist, connected, seed_idx) -> np.ndarray:
     n = len(dist)
     order = [int(i) for i in np.argsort(-np.nan_to_num(dist, nan=-1.0)) if connected[i]]
 
-    nbrs: list[list[int]] = [[] for _ in range(n)]
-    for a, b, k in zip(src, dst, keep):
-        if k:
-            nbrs[a].append(int(b))
-            nbrs[b].append(int(a))
+    # CSR adjacency rather than a list of lists: at global res 6 the latter is 14M
+    # Python list objects before a single neighbour is stored.
+    a = np.r_[src[keep], dst[keep]]
+    b = np.r_[dst[keep], src[keep]]
+    o = np.argsort(a, kind="stable")
+    a, nbr = a[o], b[o]
+    indptr = np.searchsorted(a, np.arange(n + 1))
 
     parent = np.arange(n, dtype=np.int64)
 
@@ -312,7 +340,8 @@ def _access_width(src, dst, keep, dist, connected, seed_idx) -> np.ndarray:
     for i in order:
         added[i] = True
         pending[i] = [i]
-        for j in nbrs[i]:
+        for j in nbr[indptr[i] : indptr[i + 1]]:
+            j = int(j)
             if not added[j]:
                 continue
             ri, rj = find(i), find(j)
@@ -352,33 +381,48 @@ class NavMap:
     W: float
     res_min: int
     res_base: int
-    levels: dict[int, dict[int, tuple[float, float]]]
+    levels: dict[int, dict[int, tuple[float, float, float]]]
 
     @property
     def n_entries(self) -> int:
         return sum(len(v) for v in self.levels.values())
 
-    def decide(self, lat: float, lng: float) -> tuple[float, int]:
-        """(margin, resolution that decided).
+    def decide(self, lat: float, lng: float) -> tuple[float, float, int]:
+        """(margin, travel budget, resolution that decided).
 
-        The margin is the deciding cell's bound, not the point's exact value: a
-        wholly-legal cell reports its minimum, so the number is a guarantee for
-        every point in it rather than a measurement at one. That is what makes it
-        safe to spend as a travel budget.
+        Both numbers are the deciding cell's bound rather than the point's exact
+        value -- a wholly-legal cell reports its minimum, so each is a guarantee
+        for every point in it.
+
+        Margin and budget are different quantities and it matters. Margin answers
+        "is this legal", and the `access_width` half of it is a property of the
+        whole basin: inside the Mediterranean it is fixed by the width of
+        Gibraltar no matter where you stand. Spending that as a travel budget
+        would force a lookup every couple of km across the entire basin. Once a
+        point is known legal, what limits movement is only the local shore
+        distance, because staying further than K + W/2 off the beach keeps the
+        corridor behind you at least W + 2K wide:
+
+            budget = dist_to_shore - (K + W/2)
         """
         for r in range(self.res_min, self.res_base + 1):
             entry = self.levels[r].get(h3.str_to_int(h3.latlng_to_cell(lat, lng, r)))
             if entry is None:
-                return float("-inf"), r  # outside the built area
-            lo, hi = entry
+                return float("-inf"), 0.0, r  # outside the built area
+            lo, hi, budget = entry
             if lo >= 0.0:
-                return lo, r
+                return lo, budget, r
             if hi < 0.0:
-                return hi, r
-        return lo, self.res_base
+                return hi, 0.0, r
+        return lo, budget, self.res_base
 
     def clearance(self, lat: float, lng: float) -> float:
+        """Signed km of margin: >= 0 is navigable."""
         return self.decide(lat, lng)[0]
+
+    def budget(self, lat: float, lng: float) -> float:
+        """How far the boat may travel in any direction before re-checking."""
+        return self.decide(lat, lng)[1]
 
     def legal(self, lat: float, lng: float) -> bool:
         return self.clearance(lat, lng) >= 0.0
@@ -391,9 +435,10 @@ def build_map(base: BaseMap, K: float, W: float, res_min: int = 2, verbose: bool
     d = np.nan_to_num(base.dist_to_shore, nan=-1e9)
     a = np.nan_to_num(base.access_width, nan=-1e9)
     margin = np.minimum(d - K, (a - W - 2.0 * K) / 2.0)
+    budget = d - (K + W / 2.0)  # see NavMap.decide for why this is not `margin`
     t = log(f"{(margin >= 0).sum():,} of {len(margin):,} samples navigable", t)
 
-    levels: dict[int, dict[int, tuple[float, float]]] = {}
+    levels: dict[int, dict[int, tuple[float, float, float]]] = {}
     live = np.ones(len(margin), dtype=bool)
 
     for r in range(res_min, base.res + 1):
@@ -414,15 +459,30 @@ def build_map(base: BaseMap, K: float, W: float, res_min: int = 2, verbose: bool
         counts = np.diff(np.r_[starts, len(sid)])
         lo = np.minimum.reduceat(margin[order], starts)
         hi = np.maximum.reduceat(margin[order], starts)
+        bud = np.minimum.reduceat(budget[order], starts)
         # store only cells something might still descend into
         keep = np.maximum.reduceat(live[order].astype(np.int8), starts) > 0
         levels[r] = {
-            int(u): (float(p), float(q))
-            for u, p, q, k in zip(sid[starts], lo, hi, keep)
+            int(u): (float(p), float(q), float(b))
+            for u, p, q, b, k in zip(sid[starts], lo, hi, bud, keep)
             if k
         }
-        # a cell that is wholly legal or wholly illegal settles its samples
-        settled = (lo >= 0.0) | (hi < 0.0)
+        # A cell that is wholly legal or wholly illegal settles its samples, so
+        # nothing below it needs storing. Dilate the undecided set by one ring
+        # first: levels are independent tilings, so a finer cell can straddle a
+        # decided cell and an undecided one, and if all its own samples sat on the
+        # decided side it would be pruned away -- leaving a descent that reaches
+        # for it and finds a hole.
+        undecided = sid[starts][(lo < 0.0) & (hi >= 0.0)]
+        if undecided.size:
+            ring = {
+                h3.str_to_int(x)
+                for c in undecided
+                for x in h3.grid_disk(h3.int_to_str(int(c)), 1)
+            }
+            settled = ~np.isin(sid[starts], np.fromiter(ring, np.uint64, len(ring)))
+        else:
+            settled = np.ones(len(starts), dtype=bool)
         live[order[np.repeat(settled, counts)]] = False
         t = log(f"res {r}: {len(levels[r]):,} stored, {live.sum():,} samples still live", t)
 
@@ -455,8 +515,12 @@ class ClearanceBudget:
         if self.budget > 0:
             return True
         self.lookups += 1
-        self.budget = self.nav.clearance(lat, lng)
-        return self.budget >= 0.0
+        margin, budget, _ = self.nav.decide(lat, lng)
+        if margin < 0.0:
+            self.budget = 0.0
+            return False
+        self.budget = budget
+        return True
 
 
 # --------------------------------------------------------------------------
@@ -478,26 +542,30 @@ def report(base: BaseMap, nav: NavMap) -> None:
     print(f"\nmap: res {base.res}, K={nav.K} km, W={nav.W} km")
     print(f"  {nav.n_entries:,} pyramid entries vs {flat:,} flat  ({nav.n_entries / flat:.2f}x)")
     print("  d_shore/width are the res-{} sample; margin is the deciding cell's bound".format(base.res))
-    print(f"\n  {'':28} {'legal':>6} {'d_shore':>8} {'width':>8} {'margin':>8} {'@res':>5}")
+    print(f"\n  {'':28} {'legal':>6} {'d_shore':>8} {'width':>8} {'margin':>8} {'budget':>8} {'@res':>5}")
     for name, la, lo in PROBES:
         cell = h3.str_to_int(h3.latlng_to_cell(la, lo, base.res))
         hit = np.flatnonzero(base.cells == cell)
         ds = f"{base.dist_to_shore[hit[0]]:.1f}" if hit.size else "-"
         aw = f"{base.access_width[hit[0]]:.1f}" if hit.size else "-"
-        c, r = nav.decide(la, lo)
+        c, b, r = nav.decide(la, lo)
         m = "outside" if c == float("-inf") else f"{c:.1f}"
-        print(f"  {name:28} {str(c >= 0):>6} {ds:>8} {aw:>8} {m:>8} {r:>5}")
+        bs = f"{b:.1f}" if c >= 0 else "-"
+        print(f"  {name:28} {str(c >= 0):>6} {ds:>8} {aw:>8} {m:>8} {bs:>8} {r:>5}")
 
 
-def demo_budget(nav: NavMap, lat=36.0, lng=-6.5, step_km=2.0, n=300) -> None:
+def demo_budget(nav: NavMap, start: tuple[float, float], step_km=2.0, n=400) -> None:
+    """Walk west from a known-good point, counting how often the map is consulted."""
+    lat, lng = start
     b = ClearanceBudget(nav)
     for _ in range(n):
         lng -= step_km / (111.32 * np.cos(np.radians(lat)))
         if not b.step(lat, lng, step_km):
             break
-    print(f"\nclearance budget, {step_km} km steps west from 36N 6.5W:")
+    print(f"\nclearance budget, {step_km:g} km steps west from {lat:.1f} {lng:.1f}:")
     print(f"  {b.steps} steps, {b.lookups} lookups (naive would be {b.steps})")
-    print(f"  {100 * (1 - b.lookups / b.steps):.0f}% of lookups skipped")
+    if b.steps:
+        print(f"  {100 * (1 - b.lookups / b.steps):.0f}% of lookups skipped")
 
 
 def main() -> None:
@@ -515,22 +583,44 @@ def main() -> None:
         default=GIBRALTAR_BBOX,
         metavar=("LAT0", "LON0", "LAT1", "LON1"),
     )
+    p.add_argument(
+        "--global",
+        dest="whole_world",
+        action="store_true",
+        help="build the whole planet, ignoring --bbox",
+    )
     p.add_argument("--seed", type=float, nargs=2, default=ATLANTIC_SEED, metavar=("LAT", "LON"))
     p.add_argument("--ne-res", default="10m", choices=("10m", "50m", "110m"))
     p.add_argument("--save", metavar="NPZ", help="write the artifact")
     args = p.parse_args()
 
-    print(f"building {tuple(args.bbox)} at res {args.res}")
-    base = build_base(
-        bbox=tuple(args.bbox), res=args.res, ne_res=args.ne_res, seed_latlng=tuple(args.seed)
-    )
+    bbox = None if args.whole_world else tuple(args.bbox)
+    if bbox is None:
+        n = global_cell_count(args.res)
+        print(f"building the whole planet at res {args.res}: {n:,} cells")
+        if n > 3_000_000:
+            print(
+                "  this prototype is pure Python and will be slow and memory-hungry\n"
+                "  above ~3M cells. res 5 is the comfortable global ceiling here;\n"
+                "  res 7 (98.8M cells), which is what W needs to resolve Gibraltar,\n"
+                "  wants a compiled implementation."
+            )
+    else:
+        print(f"building {bbox} at res {args.res}")
+    base = build_base(bbox=bbox, res=args.res, ne_res=args.ne_res, seed_latlng=tuple(args.seed))
     nav = build_map(base, K=args.K, W=args.W, res_min=args.res_min)
 
     report(base, nav)
-    demo_budget(nav)
+    demo_budget(nav, start=tuple(args.seed))
 
     if args.save:
-        out = {"K": nav.K, "W": nav.W, "res_min": nav.res_min, "res_base": nav.res_base}
+        out = {
+            "K": nav.K,
+            "W": nav.W,
+            "res_min": nav.res_min,
+            "res_base": nav.res_base,
+            "bbox": np.array(base.bbox),
+        }
         for r, lvl in nav.levels.items():
             out[f"r{r}_id"] = np.fromiter(lvl.keys(), dtype=np.uint64, count=len(lvl))
             out[f"r{r}_mm"] = np.array(list(lvl.values()), dtype=np.float32)
