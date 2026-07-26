@@ -181,6 +181,47 @@ class NavMap:
     def legal(self, lat: float, lng: float) -> bool:
         return self.clearance(lat, lng) >= 0.0
 
+    def shore_distance(self, lat: float, lng: float) -> float:
+        """Distance to the nearest coast, implied by the stored budget.
+
+        `budget = dist_to_shore - (K + W/2)`, so this inverts it. Two caveats,
+        both from the fact that the budget is a *cell* minimum rather than a point
+        measurement:
+
+        * It is a LOWER bound. Far offshore a coarse cell decides the query, and
+          its minimum understates the true distance badly -- a res-2 cell mid
+          Atlantic might report 60 km where the truth is 400.
+        * Near a coast, where cells resolve fine, it is tight. That is the only
+          region where it carries any weight, which is what makes it usable for
+          coastal steering despite the above.
+
+        Returns inf outside the built area and nan on non-navigable water, so a
+        caller cannot silently treat "no answer" as "close to shore".
+
+        Note this does NOT stop at the deciding level the way `decide` does.
+        Legality is answered by the coarsest cell that can answer it, which in open
+        water is res 2 -- and a res-2 budget is one number across a cell hundreds
+        of km wide, so every candidate heading a controller tries scores
+        identically. Here the descent runs to the deepest cell actually stored, so
+        the answer is as sharp as the artifact allows. That depth is what
+        map_gen's --floor-res buys; without a floor this still flattens out
+        offshore.
+        """
+        margin, _, _ = self.decide(lat, lng)
+        if margin == float("-inf"):
+            return float("inf")
+        if margin < 0.0:
+            return float("nan")
+        deepest = None
+        for r in range(self.res_min, self.res_base + 1):
+            entry = self.levels[r].get(h3.latlng_to_cell(lat, lng, r))
+            if entry is None:
+                break  # nothing finer was stored here
+            deepest = entry[2]
+        if deepest is None:
+            return float("inf")
+        return deepest + self.K + self.W / 2.0
+
     # -- persistence -------------------------------------------------------
 
     def save(self, path: str) -> None:

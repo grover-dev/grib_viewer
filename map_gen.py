@@ -439,7 +439,14 @@ def _access_width(src, dst, keep, dist, connected, seed_idx) -> np.ndarray:
 # --------------------------------------------------------------------------
 
 
-def build_map(base: BaseMap, K: float, W: float, res_min: int = 2, verbose: bool = True) -> NavMap:
+def build_map(
+    base: BaseMap,
+    K: float,
+    W: float,
+    res_min: int = 2,
+    floor_res: int = 5,
+    verbose: bool = True,
+) -> NavMap:
     log = _log if verbose else (lambda *a, **k: time.time())
     t = log(f"building artifact for K={K} km, W={W} km")
 
@@ -494,6 +501,14 @@ def build_map(base: BaseMap, K: float, W: float, res_min: int = 2, verbose: bool
             settled = ~np.isin(sid[starts], np.fromiter(ring, np.uint64, len(ring)))
         else:
             settled = np.ones(len(starts), dtype=bool)
+        # Nothing settles above the floor. Legality alone would stop at res 2 in
+        # open water, which leaves `budget` -- and so shore distance -- constant
+        # over cells hundreds of km across. Anything steering by distance to land
+        # then has no gradient to follow: a whole fan of candidate headings scores
+        # identically. The floor keeps a usable field at the cost of storing cells
+        # no legality query would ever need.
+        if r < floor_res:
+            settled[:] = False
         live[order[np.repeat(settled, counts)]] = False
         t = log(f"res {r}: {len(levels[r]):,} stored, {live.sum():,} samples still live", t)
 
@@ -561,6 +576,14 @@ def main() -> None:
     p.add_argument("--res", type=int, default=7, help="H3 build resolution (default 7)")
     p.add_argument("--res-min", type=int, default=2, help="coarsest pyramid level")
     p.add_argument(
+        "--floor-res",
+        type=int,
+        default=5,
+        help="always store down to this resolution, so shore distance has a "
+        "gradient to steer by (0 to disable; smaller artifact, but coastal "
+        "steering will not work)",
+    )
+    p.add_argument(
         "--bbox",
         type=float,
         nargs=4,
@@ -598,7 +621,9 @@ def main() -> None:
     else:
         print(f"building {bbox} at res {args.res}")
     base = build_base(bbox=bbox, res=args.res, ne_res=args.ne_res, seed_latlng=tuple(args.seed))
-    nav = build_map(base, K=args.K, W=args.W, res_min=args.res_min)
+    nav = build_map(
+        base, K=args.K, W=args.W, res_min=args.res_min, floor_res=args.floor_res
+    )
 
     report(base, nav)
     demo_budget(nav, start=tuple(args.seed))

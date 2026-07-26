@@ -90,14 +90,21 @@ BATTERY_CMAP = LinearSegmentedColormap.from_list(
     ["#7d2f11", "#a8401a", "#d05523", "#eb6834", "#f28a5f", "#f7ac8b", "#fbcdb8"],
 )
 
-# layer altitudes, in earth radii -- each layer clears the one beneath it
+# Layer altitudes in earth radii. These are deliberately tiny and tightly packed:
+# any radial gap between two layers is parallax under a perspective camera, so a
+# track floating well above the cells appears to slide across them as the globe
+# turns, and near the limb it looks like the course cuts through hexes it does
+# not. A gap of 0.006 (~38 km) was very visible; 0.0006 (~4 km) is not.
+#
+# Packing them this tightly is only safe because cells_to_mesh lifts each cell to
+# compensate for its own sagitta -- see there.
 RADII = {
-    "planet": 1.0,
-    "cells": 1.0015,
-    "coast": 1.0035,
-    "graticule": 1.0045,
-    "track": 1.0075,
-    "marker": 1.0095,
+    "planet": 0.9994,
+    "cells": 1.0,
+    "coast": 1.0004,
+    "graticule": 1.0002,
+    "track": 1.0008,
+    "marker": 1.0012,
 }
 
 
@@ -105,13 +112,25 @@ def cells_to_mesh(cells, radius: float) -> pv.PolyData:
     """One PolyData holding every H3 cell as a face, so it draws in a single pass.
 
     Faces are variable length: hexagons give 6 vertices, the 12 pentagons give 5.
+
+    Each cell is lifted by 1/cos(its angular radius) so that the *middle* of the
+    flat facet lands on `radius` rather than its corners. A polygon inscribed in a
+    sphere sags below it, and a coarse H3 cell is not small: res 2 spans ~200 km
+    and dips ~3 km at the centre. Without this the overlay layers would have to
+    float kilometres clear of the cells to avoid being swallowed by them, and that
+    gap is exactly what produces visible parallax as the globe rotates.
     """
     verts, faces = [], []
     offset = 0
     for c in cells.tolist():
         b = h3.cell_to_boundary(c)
         n = len(b)
-        verts.append(lonlat_to_xyz([p[0] for p in b], [p[1] for p in b], radius))
+        pts = lonlat_to_xyz([p[0] for p in b], [p[1] for p in b], 1.0)
+        centre = pts.mean(axis=0)
+        centre /= np.linalg.norm(centre)
+        # smallest cos over the corners == largest angle from the centre
+        cos_max = float(np.min(pts @ centre))
+        verts.append(pts * (radius / max(cos_max, 1e-9)))
         faces.append(np.r_[n, np.arange(offset, offset + n)])
         offset += n
     if not verts:
