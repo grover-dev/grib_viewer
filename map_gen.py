@@ -513,7 +513,13 @@ def build_map(
         t = log(f"res {r}: {len(levels[r]):,} stored, {live.sum():,} samples still live", t)
 
     return NavMap(
-        K=K, W=W, res_min=res_min, res_base=base.res, levels=levels, bbox=base.bbox
+        K=K,
+        W=W,
+        res_min=res_min,
+        res_base=base.res,
+        levels=levels,
+        bbox=base.bbox,
+        floor_res=floor_res,
     )
 
 

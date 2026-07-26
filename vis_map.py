@@ -501,8 +501,45 @@ class GlobeView:
     def look_at(self, lat: float, lng: float, distance: float = 3.0):
         eye = lonlat_to_xyz([lat], [lng], distance)[0]
         self.plotter.camera_position = [tuple(eye), (0, 0, 0), (0, 0, 1)]
+        self._scale_rotation()
+
+    def _scale_rotation(self, *_args) -> None:
+        """Slow the drag-to-rotate as the camera closes on the surface.
+
+        VTK's trackball turns the camera by a fixed *angle* per pixel dragged, so
+        the speed that feels right looking at the whole globe sends the view
+        skidding once zoomed into a coastline. Scaling the motion factor by height
+        above the surface keeps the ground speed under the cursor roughly constant
+        instead of the angular speed.
+        """
+        try:
+            style = self.plotter.iren.interactor.GetInteractorStyle()
+        except AttributeError:
+            return  # off-screen: no interactor to tune
+        if not hasattr(style, "SetMotionFactor"):
+            return
+        altitude = max(float(np.linalg.norm(self.plotter.camera.position)) - 1.0, 1e-3)
+        style.SetMotionFactor(float(np.clip(10.0 * altitude / 2.0, 0.35, 10.0)))
+
+    def _watch_zoom(self) -> None:
+        """Re-tune the rotation speed whenever the camera might have moved."""
+        try:
+            iren = self.plotter.iren
+        except AttributeError:
+            return
+        for event in (
+            "MouseWheelForwardEvent",
+            "MouseWheelBackwardEvent",
+            "EndInteractionEvent",
+            "InteractionEvent",
+        ):
+            try:
+                iren.add_observer(event, self._scale_rotation)
+            except Exception:  # noqa: BLE001 - observer set is best-effort
+                pass
 
     def show(self, title: str = "boatforge - ocean map"):
+        self._watch_zoom()
         self.plotter.show(title=title)
 
     def save(self, path: str):
@@ -576,6 +613,7 @@ class GlobeView:
                 self.plotter.render()
 
         self.plotter.add_timer_event(max_steps=10**9, duration=int(1000 / fps), callback=tick)
+        self._watch_zoom()
         print("  space play/pause   left/right step   [ ] speed   r restart   q quit")
         self.plotter.show(title=title)
 

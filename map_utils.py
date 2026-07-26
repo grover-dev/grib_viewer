@@ -125,6 +125,7 @@ class NavMap:
     res_base: int
     levels: dict[int, dict[int, tuple[float, float, float]]]
     bbox: tuple[float, float, float, float] | None = None
+    floor_res: int = 0  # levels below this are stored for every cell, decided or not
 
     @property
     def n_entries(self) -> int:
@@ -230,6 +231,7 @@ class NavMap:
             "W": self.W,
             "res_min": self.res_min,
             "res_base": self.res_base,
+            "floor_res": self.floor_res,
             "bbox": np.array(self.bbox if self.bbox else GLOBAL_BBOX),
         }
         for r, lvl in self.levels.items():
@@ -254,17 +256,27 @@ class NavMap:
             res_base=res_base,
             levels=levels,
             bbox=tuple(z["bbox"]) if "bbox" in z else None,
+            floor_res=int(z["floor_res"]) if "floor_res" in z else 0,
         )
 
     def leaves(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """(legal ids, their margin, their travel budget, illegal ids).
 
-        A cell is a leaf when it decided. Undecided cells have children stored
-        beneath them, so drawing only the leaves tiles the area once. H3 does not
-        nest exactly, so the tiling has hairline seams and slivers of overlap.
+        A cell is a leaf when it decided AND nothing finer covers the same water.
+        Both halves matter. Below `floor_res` every cell is stored whether or not
+        it decided, so a decided res-2 cell still has res-3, -4 and -5 cells over
+        the same ocean; emitting it too would draw that water four times over,
+        with the coarse hexes ghosting across the fine ones. Levels above the
+        floor are therefore skipped entirely for rendering, though `decide` still
+        uses them, and still answers most queries from res 2.
+
+        H3 does not nest exactly, so even the surviving tiling has hairline seams
+        and slivers of overlap.
         """
         legal, margin, budget, illegal = [], [], [], []
-        for _r, lvl in sorted(self.levels.items()):
+        for r, lvl in sorted(self.levels.items()):
+            if r < self.floor_res:
+                continue
             ids = np.fromiter(lvl.keys(), dtype=np.uint64, count=len(lvl))
             mm = np.array(list(lvl.values()), dtype=np.float32)
             if not len(ids):
