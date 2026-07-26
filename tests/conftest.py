@@ -16,7 +16,7 @@ import eccodes as ec
 import numpy as np
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 
 def _write(fh, *, paramid, values, lat0, lat1, lon0, lon1, date, hour, step=0):

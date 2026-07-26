@@ -57,6 +57,7 @@ Drag to rotate, scroll to zoom, `q` to quit.
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 
 import numpy as np
@@ -286,20 +287,26 @@ class ClockLayer(TimeLayer):
 
     name = "clock"
 
+    # index of the lower-left corner in vtkCornerAnnotation
+    _LOWER_LEFT = 0
+
     def __init__(self, plotter, fmt=None, span=(0.0, 1.0)):
         self.plotter = plotter
         self.fmt = fmt or (lambda t: f"t = {t:.1f}")
         self._span = span
-        self.update(span[0])
+        # Built once and then written in place. Calling add_text per frame would
+        # tear down and re-add an actor 30 times a second, and that churn is not
+        # free -- it dirties the renderer's actor list on every tick, which is
+        # exactly when the interactor is also trying to redraw.
+        self.actor = plotter.add_text(
+            self.fmt(span[0]), position="lower_left", font_size=11, color=INK, name="clock"
+        )
 
     def span(self) -> tuple[float, float]:
         return self._span
 
     def update(self, t: float) -> None:
-        # name= replaces the existing actor rather than stacking a new one
-        self.plotter.add_text(
-            self.fmt(t), position="lower_left", font_size=11, color=INK, name="clock"
-        )
+        self.actor.SetText(self._LOWER_LEFT, self.fmt(t))
 
 
 # --------------------------------------------------------------------------
@@ -527,11 +534,13 @@ class GlobeView:
             iren = self.plotter.iren
         except AttributeError:
             return
+        # Deliberately not InteractionEvent: that fires on every mouse motion
+        # during a drag, and doing work there competes with the redraw it is
+        # trying to service. The end of an interaction is soon enough.
         for event in (
             "MouseWheelForwardEvent",
             "MouseWheelBackwardEvent",
             "EndInteractionEvent",
-            "InteractionEvent",
         ):
             try:
                 iren.add_observer(event, self._scale_rotation)
@@ -580,6 +589,20 @@ class GlobeView:
             if self._slider is not None:
                 self._slider.GetRepresentation().SetValue(tl.t)
 
+        # While the mouse is driving the camera, the interactor is already
+        # redrawing as fast as it can. Forcing another full render from the
+        # animation timer on top of that queues work faster than it completes,
+        # and the view visibly falls behind the cursor -- which is why pausing
+        # made zooming feel fine. The clock keeps advancing; only our own extra
+        # render is dropped, and the interactor's redraw shows the new frame
+        # anyway.
+        self._interacting = False
+
+        def interaction(flag):
+            def go(*_a):
+                self._interacting = flag
+            return go
+
         def toggle():
             tl.playing = not tl.playing
 
@@ -606,13 +629,36 @@ class GlobeView:
         self.plotter.add_key_event("bracketleft", rate(0.5))
         self.plotter.add_key_event("bracketright", rate(2.0))
 
+        # Adaptive throttle. A timer at `fps` will happily ask for another render
+        # before the last one finished, and the queue only grows -- the view then
+        # trails the mouse by seconds and never catches up. Measuring how long a
+        # render actually takes and refusing to start one more often than that
+        # keeps the loop honest: the animation drops frames instead of falling
+        # behind, and zooming stays responsive because the interactor gets a share.
+        self._render_s = 1.0 / fps
+        self._last_render = 0.0
+
         def tick(_step):
-            if tl.playing:
-                tl.advance(step, loop=loop)
-                sync_slider()
-                self.plotter.render()
+            if not tl.playing:
+                return
+            tl.advance(step, loop=loop)
+            if self._interacting:
+                return  # the interactor's own redraw will pick this up
+            now = time.perf_counter()
+            if now - self._last_render < max(step, self._render_s):
+                return
+            sync_slider()
+            self._last_render = now
+            self.plotter.render()
+            self._render_s = 0.8 * self._render_s + 0.2 * (time.perf_counter() - now)
 
         self.plotter.add_timer_event(max_steps=10**9, duration=int(1000 / fps), callback=tick)
+        try:
+            iren = self.plotter.iren
+            iren.add_observer("StartInteractionEvent", interaction(True))
+            iren.add_observer("EndInteractionEvent", interaction(False))
+        except (AttributeError, RuntimeError):
+            pass
         self._watch_zoom()
         print("  space play/pause   left/right step   [ ] speed   r restart   q quit")
         self.plotter.show(title=title)
