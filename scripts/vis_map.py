@@ -234,6 +234,12 @@ class TrackLayer(TimeLayer):
         self.times = np.asarray(times, dtype=float)
         self.pts = lonlat_to_xyz(lat, lng, radius or RADII["track"])
         self.mesh = pv.PolyData(self.pts)
+        # Drop the vertex cells PolyData creates for a bare point cloud. Left in,
+        # they draw every point of the course from the first frame onward, so the
+        # whole route appears sailed no matter where the boat is -- and the
+        # polyline underneath truncates correctly, which makes it look like the
+        # reveal is broken when it is not.
+        self.mesh.verts = np.empty(0, dtype=np.int64)
         self.mesh.lines = np.empty(0, dtype=np.int64)
         kw = dict(line_width=width, lighting=False, show_scalar_bar=False)
         if values is not None:
