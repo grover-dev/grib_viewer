@@ -1,53 +1,48 @@
 #include <cstddef>
 #include <exception>
 #include <print>
-#include <span>
 #include <string>
-#include <string_view>
-#include <vector>
 
-#include <cnpy.h>
-
+#include <boatforge/npz.hpp>
 #include <boatforge/version.hpp>
 
 namespace {
 
 constexpr std::size_t kPreviewCount = 6;
 
-std::string format_shape(const std::vector<std::size_t>& shape) {
-    if (shape.empty()) {
-        return "()";  // 0-d array (numpy scalar)
-    }
-    std::string out = "(";
-    for (std::size_t i = 0; i < shape.size(); ++i) {
-        if (i > 0) {
-            out += ", ";
-        }
-        out += std::to_string(shape[i]);
-    }
-    out += ")";
-    return out;
-}
-
-void print_preview(const cnpy::NpyArray& array) {
-    // cnpy discards the numpy type char when parsing the header, so word size
-    // is all we have to go on. Everything in track.npz is float64.
-    if (array.word_size != sizeof(double)) {
-        std::println("    <{}-byte elements, not previewed>", array.word_size);
-        return;
-    }
-
-    const std::span values{array.data<double>(), array.num_vals};
+template <typename T>
+void print_values(const boatforge::NpyArray& array) {
+    const auto values = array.as<T>();
     const std::size_t shown = std::min(values.size(), kPreviewCount);
 
     std::print("    [");
     for (std::size_t i = 0; i < shown; ++i) {
-        std::print("{}{:.4f}", i > 0 ? ", " : "", values[i]);
+        std::print("{}{}", i > 0 ? ", " : "", values[i]);
     }
     if (shown < values.size()) {
-        std::print(", ... ({} more)", values.size() - shown);
+        std::print(", ... {} more", values.size() - shown);
     }
     std::println("]");
+}
+
+void print_preview(const boatforge::NpyArray& array) {
+    using boatforge::DType;
+    switch (array.dtype()) {
+        case DType::Bool: print_values<bool>(array); break;
+        case DType::Int8: print_values<std::int8_t>(array); break;
+        case DType::Int16: print_values<std::int16_t>(array); break;
+        case DType::Int32: print_values<std::int32_t>(array); break;
+        case DType::Int64: print_values<std::int64_t>(array); break;
+        case DType::UInt8: print_values<std::uint8_t>(array); break;
+        case DType::UInt16: print_values<std::uint16_t>(array); break;
+        case DType::UInt32: print_values<std::uint32_t>(array); break;
+        case DType::UInt64: print_values<std::uint64_t>(array); break;
+        case DType::Float32: print_values<float>(array); break;
+        case DType::Float64: print_values<double>(array); break;
+        case DType::Float16:
+            std::println("    <float16 not previewed>");
+            break;
+    }
 }
 
 }  // namespace
@@ -58,13 +53,14 @@ int main(int argc, char** argv) {
     std::println("boatforge {} — reading {}", boatforge::kVersion, path);
 
     try {
-        const cnpy::npz_t npz = cnpy::npz_load(path);
+        const boatforge::NpzArchive npz = boatforge::load_npz(path);
 
         std::println("{} array(s):", npz.size());
         for (const auto& [name, array] : npz) {
-            std::println("  {:<12} shape={:<10} word_size={} fortran_order={}",
-                         name, format_shape(array.shape), array.word_size,
-                         array.fortran_order);
+            std::println("  {:<12} {:<8} shape={:<10} order={}", name,
+                         boatforge::to_string(array.dtype()),
+                         array.shape_string(),
+                         array.fortran_order() ? 'F' : 'C');
             print_preview(array);
         }
     } catch (const std::exception& e) {

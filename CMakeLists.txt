@@ -31,17 +31,15 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
     message(FATAL_ERROR "In-source builds are not allowed; use `cmake --preset release`.")
 endif()
 
-include(cmake/cnpy.cmake)
+find_package(libzip REQUIRED)
 
-add_executable(boatforge
-    src/main.cpp
-)
-
-target_include_directories(boatforge PRIVATE include)
-
-target_compile_options(boatforge PRIVATE
+# Project-wide compile settings, linked privately by every target we own.
+add_library(boatforge_options INTERFACE)
+add_library(boatforge::options ALIAS boatforge_options)
+target_compile_options(boatforge_options INTERFACE
     -march=x86-64-v2
     -Wall -Wextra -Wpedantic
 )
 
-target_link_libraries(boatforge PRIVATE cnpy::cnpy)
+add_subdirectory(include)
+add_subdirectory(src)

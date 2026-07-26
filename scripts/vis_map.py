@@ -51,7 +51,19 @@ Options:
     --save PNG        render off-screen to a file instead of opening a window
     --size W H        window size in pixels (default 1400 1000)
 
-Drag to rotate, scroll to zoom, `q` to quit.
+Controls
+--------
+
+    drag            rotate; the speed scales with how close you are, so zooming
+                    in does not send the view skidding
+    scroll          zoom, bounded so you can neither enter the planet nor lose it
+    n               put north back at the top without moving the camera
+    b               follow the boat -- toggles, so it keeps up during playback
+    space           play / pause
+    left / right    step back / forward
+    [ ]             slower / faster
+    r               back to the start
+    q               quit
 """
 
 from __future__ import annotations
@@ -65,7 +77,7 @@ import pyvista as pv
 from h3.api import basic_int as h3
 from matplotlib.colors import LinearSegmentedColormap
 
-from map_utils import NavMap, lonlat_to_xyz
+from map_utils import NavMap, lonlat_to_xyz, xyz_to_lonlat
 
 # Palette: one sequential blue hue for magnitude, neutrals for everything that is
 # not data. Checked pairwise in OKLab under normal vision and simulated
@@ -99,6 +111,11 @@ BATTERY_CMAP = LinearSegmentedColormap.from_list(
 #
 # Packing them this tightly is only safe because cells_to_mesh lifts each cell to
 # compensate for its own sagitta -- see there.
+# How near and far the camera may get, in earth radii from the centre. The near
+# limit sits just off the surface; the far one keeps the globe filling enough of
+# the frame to still be a map.
+ZOOM_LIMITS = (1.03, 12.0)
+
 RADII = {
     "planet": 0.9994,
     "cells": 1.0,
@@ -351,6 +368,8 @@ class GlobeView:
         self.actors: dict[str, object] = {}
         self.timeline = Timeline()
         self._slider = None
+        self.following = False
+        self._interacting = False
 
     # -- base layers -------------------------------------------------------
 
@@ -506,9 +525,74 @@ class GlobeView:
             )
 
     def look_at(self, lat: float, lng: float, distance: float = 3.0):
-        eye = lonlat_to_xyz([lat], [lng], distance)[0]
+        eye = lonlat_to_xyz([lat], [lng], np.clip(distance, *ZOOM_LIMITS))[0]
         self.plotter.camera_position = [tuple(eye), (0, 0, 0), (0, 0, 1)]
+        self.align_north()
         self._scale_rotation()
+
+    def align_north(self, *_args) -> None:
+        """Put north back at the top of the screen without moving the camera.
+
+        Only the roll changes: the up vector becomes whatever is left of the pole
+        axis once the component along the view direction is removed. Looking
+        straight down a pole there is nothing left, and any roll is as good as
+        another, so it is left alone rather than snapped to an arbitrary choice.
+        """
+        cam = self.plotter.camera
+        pos = np.asarray(cam.position, dtype=float)
+        forward = np.asarray(cam.focal_point, dtype=float) - pos
+        n = np.linalg.norm(forward)
+        if n < 1e-12:
+            return
+        forward /= n
+        up = np.array([0.0, 0.0, 1.0]) - forward * np.dot([0.0, 0.0, 1.0], forward)
+        if np.linalg.norm(up) < 1e-6:
+            return  # camera is over a pole; roll is undefined
+        cam.up = tuple(up / np.linalg.norm(up))
+        self.plotter.render()
+
+    def centre_on(self, lat: float, lng: float) -> None:
+        """Swing to a lat/lon, keeping the current zoom and putting north up."""
+        distance = float(np.linalg.norm(self.plotter.camera.position))
+        self.look_at(lat, lng, distance)
+
+    def boat_position(self) -> tuple[float, float] | None:
+        """Where the boat is right now, or None if no track is loaded."""
+        for layer in self.timeline.layers:
+            if isinstance(layer, TrackLayer):
+                return xyz_to_lonlat(np.asarray(layer.boat.points[0], dtype=float))
+        return None
+
+    def centre_on_boat(self, *_args) -> None:
+        where = self.boat_position()
+        if where is None:
+            print("  no track loaded -- nothing to centre on")
+            return
+        self.centre_on(*where)
+
+    def toggle_follow(self, *_args) -> None:
+        """Keep the camera on the boat as it moves, rather than once."""
+        if self.boat_position() is None:
+            print("  no track loaded -- nothing to follow")
+            return
+        self.following = not self.following
+        print(f"  follow boat: {'on' if self.following else 'off'}")
+        if self.following:
+            self.centre_on_boat()
+
+    def _clamp_zoom(self, *_args) -> None:
+        """Keep the camera between skimming the surface and losing the globe.
+
+        VTK's dolly is unbounded, so a couple of extra scroll clicks either put
+        the camera inside the planet or leave it so far out the map is a speck,
+        and getting back is fiddly.
+        """
+        cam = self.plotter.camera
+        pos = np.asarray(cam.position, dtype=float)
+        r = float(np.linalg.norm(pos))
+        clamped = float(np.clip(r, *ZOOM_LIMITS))
+        if r > 1e-12 and clamped != r:
+            cam.position = tuple(pos / r * clamped)
 
     def _scale_rotation(self, *_args) -> None:
         """Slow the drag-to-rotate as the camera closes on the surface.
@@ -543,12 +627,23 @@ class GlobeView:
             "EndInteractionEvent",
         ):
             try:
-                iren.add_observer(event, self._scale_rotation)
+                iren.add_observer(event, self._on_camera_change)
             except Exception:  # noqa: BLE001 - observer set is best-effort
                 pass
 
+    def _on_camera_change(self, *_args) -> None:
+        self._clamp_zoom()
+        self._scale_rotation()
+
+    def bind_keys(self) -> None:
+        """Camera keys, available whether or not anything is animating."""
+        self.plotter.add_key_event("n", self.align_north)
+        self.plotter.add_key_event("b", self.toggle_follow)
+
     def show(self, title: str = "boatforge - ocean map"):
         self._watch_zoom()
+        self.bind_keys()
+        print("  n north-up   b follow boat   q quit")
         self.plotter.show(title=title)
 
     def save(self, path: str):
@@ -622,6 +717,7 @@ class GlobeView:
                 tl.speed = float(np.clip(tl.speed * factor, 0.05, 200.0))
             return go
 
+        self.bind_keys()
         self.plotter.add_key_event("space", toggle)
         self.plotter.add_key_event("r", restart)
         self.plotter.add_key_event("Left", nudge(-1))
@@ -648,6 +744,10 @@ class GlobeView:
             if now - self._last_render < max(step, self._render_s):
                 return
             sync_slider()
+            if self.following:
+                where = self.boat_position()
+                if where is not None:
+                    self.centre_on(*where)
             self._last_render = now
             self.plotter.render()
             self._render_s = 0.8 * self._render_s + 0.2 * (time.perf_counter() - now)
@@ -660,7 +760,10 @@ class GlobeView:
         except (AttributeError, RuntimeError):
             pass
         self._watch_zoom()
-        print("  space play/pause   left/right step   [ ] speed   r restart   q quit")
+        print(
+            "  space play/pause   left/right step   [ ] speed   r restart\n"
+            "  n north-up        b follow boat                     q quit"
+        )
         self.plotter.show(title=title)
 
     def record(self, path: str, n_frames: int = 240, fps: int = 30):
@@ -674,6 +777,11 @@ class GlobeView:
         self.plotter.show(auto_close=False)
         for i, t in enumerate(np.linspace(t0, t1, n_frames)):
             self.timeline.seek(t)
+            # Force the frame before grabbing it. Changing a mesh's topology
+            # happens to trigger a redraw on its own, but moving a point or
+            # rewriting a text actor does not, so without this the capture shows
+            # the previous frame's boat and clock against the current track.
+            self.plotter.render()
             if movie:
                 self.plotter.write_frame()
             else:

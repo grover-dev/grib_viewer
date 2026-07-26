@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def run(*args) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [sys.executable, str(ROOT / "slice_grib.py"), *map(str, args)],
+        [sys.executable, str(ROOT / "scripts" / "slice_grib.py"), *map(str, args)],
         capture_output=True, text=True, cwd=ROOT,
     )
 
