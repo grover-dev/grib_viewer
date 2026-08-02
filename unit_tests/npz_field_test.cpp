@@ -480,8 +480,9 @@ TEST(SolarPhysics, NightIsDarkAndDayIsNot) {
             const double local =
                 std::fmod(static_cast<double>(ref.t0 + i * ref.dt) / 3600.0 + lon / 15.0,
                           24.0);
-            double gap = std::abs(std::fmod(local - target + 36.0, 24.0) - 12.0);
-            gap = 12.0 - gap;  // circular distance, 0..12 h
+            // Circular distance in hours, 0..12: folding about 12 makes an
+            // exact match land on 0 and the antipodal hour on 12.
+            const double gap = std::abs(std::fmod(local - target + 36.0, 24.0) - 12.0);
             if (gap < best_gap) {
                 best_gap = gap;
                 best = i;
