@@ -2,7 +2,7 @@
 add_library(boatforge_core
     npy.cpp
     npz.cpp
-    solar.cpp
+    npz_field.cpp
 )
 add_library(boatforge::core ALIAS boatforge_core)
 

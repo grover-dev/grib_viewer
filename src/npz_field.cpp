@@ -1,4 +1,4 @@
-#include <boatforge/solar.h>
+#include <boatforge/npz_field.h>
 
 #include <cmath>
 #include <format>
@@ -17,7 +17,7 @@ constexpr float not_a_number = std::numeric_limits<float>::quiet_NaN();
 const NpyArray& member(const NpzArchive& npz, std::string_view name) {
     const auto it = npz.find(name);
     if (it == npz.end()) {
-        throw NpyError{std::format("not a solar npz: no '{}' array", name)};
+        throw NpyError{std::format("not a gridded field npz: no '{}' array", name)};
     }
     return it->second;
 }
@@ -51,18 +51,18 @@ std::size_t extent(const NpzArchive& npz, std::string_view name) {
 
 }  // namespace
 
-SolarField SolarField::load(const std::filesystem::path& path) {
+NpzField NpzField::load(const std::filesystem::path& path) {
     NpzArchive npz = load_npz(path);
 
     const int32_t version = scalar<int32_t>(npz, "version");
     if (version != supported_version) {
         throw NpyError{std::format(
-            "solar npz is version {}, this build reads version {}; regenerate it "
+            "field npz is version {}, this build reads version {}; regenerate it "
             "with scripts/solar_npz.py",
             version, supported_version)};
     }
 
-    SolarField field;
+    NpzField field;
     field.t0_ = std::chrono::seconds{scalar<int64_t>(npz, "t0")};
     field.step_ = std::chrono::seconds{scalar<int64_t>(npz, "dt")};
     field.nt_ = extent(npz, "nt");
@@ -88,7 +88,7 @@ SolarField SolarField::load(const std::filesystem::path& path) {
     // after this point anyway.
     const auto data_it = npz.find("data");
     if (data_it == npz.end()) {
-        throw NpyError{"not a solar npz: no 'data' array"};
+        throw NpyError{"not a gridded field npz: no 'data' array"};
     }
     field.data_ = std::move(data_it->second);
 
@@ -124,7 +124,7 @@ SolarField SolarField::load(const std::filesystem::path& path) {
     return field;
 }
 
-float SolarField::at(std::size_t i, std::size_t j, std::size_t k) const {
+float NpzField::at(std::size_t i, std::size_t j, std::size_t k) const {
     const std::size_t index = (i * nlat_ + j) * nlon_ + k;
     if (!quantised_) {
         return data_.as<float>()[index];
@@ -136,7 +136,7 @@ float SolarField::at(std::size_t i, std::size_t j, std::size_t k) const {
     return static_cast<float>(static_cast<double>(raw) * scale_ + offset_);
 }
 
-float SolarField::sample(std::chrono::seconds when, double lat, double lon) const {
+float NpzField::sample(std::chrono::seconds when, double lat, double lon) const {
     if (nt_ == 0) {
         return not_a_number;
     }

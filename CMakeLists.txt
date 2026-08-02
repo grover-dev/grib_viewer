@@ -43,3 +43,11 @@ target_compile_options(boatforge_options INTERFACE
 
 add_subdirectory(include)
 add_subdirectory(src)
+
+# Tests are opt-out so a consumer adding this by add_subdirectory doesn't pay
+# for GoogleTest, but a developer building the repo directly always gets them.
+option(BOATFORGE_BUILD_TESTS "Build the C++ unit tests" ${PROJECT_IS_TOP_LEVEL})
+if(BOATFORGE_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(unit_tests)
+endif()

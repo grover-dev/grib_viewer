@@ -10,6 +10,6 @@ target_sources(boatforge_headers INTERFACE
     FILES
         boatforge/npy.h
         boatforge/npz.h
-        boatforge/solar.h
+        boatforge/npz_field.h
         boatforge/version.h
 )

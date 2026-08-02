@@ -9,22 +9,24 @@
 
 namespace boatforge {
 
-// Solar irradiance over a regular lat/lon grid on a uniform time axis, as
-// written by scripts/solar_npz.py.
+// An environment field on a regular lat/lon grid and a uniform time axis, in
+// the npz layout scripts/solar_npz.py writes. Nothing below is specific to
+// radiation -- any field cut to that layout loads and samples identically.
 //
 // Sampling costs no search. The grid is regular and the time axis uniform, so
 // a (t, lat, lon) query resolves to an index by arithmetic -- three divides,
 // then eight strided loads for the trilinear blend. There is no tree to walk
 // and no axis to binary-search, which is the whole reason the npz stores the
 // axis constants alongside the cube.
-class SolarField {
+class NpzField {
 public:
     // Throws NpyError if the archive is missing members, has the wrong dtypes,
     // or was written by a newer format version.
-    static SolarField load(const std::filesystem::path& path);
+    static NpzField load(const std::filesystem::path& path);
 
-    // Mean downward short-wave irradiance in W/m^2, trilinear in
-    // (time, latitude, longitude). Already converted from the J/m^2
+    // The field's value at a point, trilinear in (time, latitude, longitude),
+    // in whatever unit the writer settled on. For the solar npz that is mean
+    // downward short-wave irradiance in W/m^2, already converted from the J/m^2
     // accumulations ERA5 ships, so a panel model can use it directly.
     //
     // `when` is time since the Unix epoch, UTC -- which is what the npz time
