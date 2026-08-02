@@ -18,9 +18,9 @@ int main(int argc, char** argv) {
      */
     const std::string path = argc > 1 ? argv[1] : "track.npz";
 
-    std::println("boatforge {} — reading {}", boatforge::kVersion, path);
+    std::println("boatforge — reading {}", path);
 
-    Sim simulator(std::filesystem::path(path));
+    Sim simulator(path);
 
     while(simulator.step()){}
 
