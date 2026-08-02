@@ -95,6 +95,7 @@ struct blackboard
     float applied_motor_power_out_w;
     float avionics_power_out_w; // <- estimation based on state, this will be used with load shed algorithms, tbd
     // FIXME: power out?
+    uint32_t steps;
 };
 
 /**
@@ -140,7 +141,8 @@ class Solver
              * bearing changes as we move, so a heading fixed at t0 would sail a
              * rhumb line instead. */
             bb_.powered_heading = initial_bearing_deg(bb_.current_lat, bb_.current_lon,
-                                                      bb_.end_lat,     bb_.end_lon);
+                                                      bb_.end_lat,     bb_.end_lon);\
+            bb_.powered_velocity= 2.0; // FIXME: Make this real F(power), 2ms ~4 knots
             bb_.distance_to_end = great_circle_distance_m(bb_.current_lat, bb_.current_lon,
                                                           bb_.end_lat,     bb_.end_lon);
 
@@ -220,12 +222,12 @@ class Info
         {
             /* One line per step, the sim's running commentary: where we are, when
              * we are, how far we have come and how far is left. */
-            std::println("[{:%F %T}] lat {:9.4f}  lon {:9.4f}  travelled {:10.1f} km  remaining {:10.1f} km",
-                         std::chrono::sys_seconds{bb_.time},
+            std::println("[{:%F %T}] lat {:9.4f}  lon {:9.4f}  travelled {:10.1f} km  remaining {:10.1f} km, step = {}",
+                         std::chrono::sys_seconds{bb_.time}, // TBD what to do with time...
                          bb_.current_lat,
                          bb_.current_lon,
                          bb_.total_traversed_distance / 1000.0,
-                         bb_.distance_to_end / 1000.0);
+                         bb_.distance_to_end / 1000.0, bb_.steps);
         }
     private:
         /* A reference, not a copy: a copy would freeze the values taken at
