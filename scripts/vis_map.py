@@ -643,8 +643,11 @@ class GlobeView:
 
     def bind_keys(self) -> None:
         """Camera keys, available whether or not anything is animating."""
-        self.plotter.add_key_event("n", self.align_north)
-        self.plotter.add_key_event("b", self.toggle_follow)
+        # Wrapped in no-arg lambdas: add_key_event rejects any parameter without
+        # a default, and *args counts as one, so binding these methods directly
+        # raises even though they take nothing required.
+        self.plotter.add_key_event("n", lambda: self.align_north())
+        self.plotter.add_key_event("b", lambda: self.toggle_follow())
 
     def show(self, title: str = "boatforge - ocean map"):
         self._watch_zoom()
