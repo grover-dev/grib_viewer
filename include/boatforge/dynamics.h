@@ -1,8 +1,52 @@
 #pragma once
-#include "solar.h"
 #include <chrono>
+#include <cmath>
 
 #include <boatforge/npz_field.h>
+
+namespace
+{
+/* Mean earth radius (IUGG), the sphere the great-circle propogation assumes */
+constexpr double earth_radius_m = 6371008.8;
+constexpr double pi = 3.14159265358979323846;
+
+constexpr double deg_to_rad(double deg) { return deg * pi / 180.0; }
+constexpr double rad_to_deg(double rad) { return rad * 180.0 / pi; }
+
+/* Initial great-circle bearing from (lat1, lon1) to (lat2, lon2), degrees
+ * clockwise from true north in [0, 360). Note this is the bearing at the start
+ * of the leg only -- it changes continuously along a great circle. */
+inline double initial_bearing_deg(double lat1, double lon1, double lat2, double lon2)
+{
+    const double phi1 = deg_to_rad(lat1);
+    const double phi2 = deg_to_rad(lat2);
+    /* No need to wrap the delta, sin and cos handle an antimeridian crossing */
+    const double delta_lambda = deg_to_rad(lon2 - lon1);
+
+    const double y = std::sin(delta_lambda) * std::cos(phi2);
+    const double x = std::cos(phi1) * std::sin(phi2)
+                   - std::sin(phi1) * std::cos(phi2) * std::cos(delta_lambda);
+
+    return std::fmod(rad_to_deg(std::atan2(y, x)) + 360.0, 360.0);
+}
+
+/* Great-circle distance in meters, haversine on the same sphere the propogation
+ * steps along. The atan2 form holds precision for near-antipodal pairs where
+ * the asin form does not. */
+inline double great_circle_distance_m(double lat1, double lon1, double lat2, double lon2)
+{
+    const double phi1 = deg_to_rad(lat1);
+    const double phi2 = deg_to_rad(lat2);
+    const double half_delta_phi = deg_to_rad(lat2 - lat1) / 2.0;
+    const double half_delta_lambda = deg_to_rad(lon2 - lon1) / 2.0;
+
+    const double a = std::sin(half_delta_phi) * std::sin(half_delta_phi)
+                   + std::cos(phi1) * std::cos(phi2)
+                       * std::sin(half_delta_lambda) * std::sin(half_delta_lambda);
+
+    return 2.0 * earth_radius_m * std::atan2(std::sqrt(a), std::sqrt(1.0 - a));
+}
+}
 
 
 // FIXME: Start with a cost calculator with a point-to-point router based on great circle route
@@ -17,11 +61,18 @@ struct blackboard
     std::chrono::seconds time;
     const std::chrono::seconds time_step = std::chrono::hours(1);
 
-    double lat;
-    double long;
+    /* Solver may eventually run way points, for now this will be hard coded at init time */
+    double end_lat;
+    double end_lon;
+    /* Meters, great-circle, refreshed each Solver::step() */
+    double distance_to_end;
+
+    /* Degrees, WGS84. current_lon is normalized to [-180, 180) after every step */
+    double current_lat;
+    double current_lon;
     double total_traversed_distance = 0.0;
 
-    /* Boat outputs */
+    /* Boat outputs, headings in degrees clockwise from true north, velocity in m/s */
     double powered_heading;
     double powered_velocity;
 
@@ -52,6 +103,14 @@ class Solver
 
         void step()
         {
+            /* Re-aim at the destination every step: on a sphere the great-circle
+             * bearing changes as we move, so a heading fixed at t0 would sail a
+             * rhumb line instead. */
+            bb_.powered_heading = initial_bearing_deg(bb_.current_lat, bb_.current_lon,
+                                                      bb_.end_lat,     bb_.end_lon);
+            bb_.distance_to_end = great_circle_distance_m(bb_.current_lat, bb_.current_lon,
+                                                          bb_.end_lat,     bb_.end_lon);
+
             // FIXME: Eventually make this real
             bb_.applied_motor_power_out_w = 500.0;
             bb_.avionics_power_out_w = 100.0;
@@ -95,9 +154,24 @@ class WorldPropogation
             double step = bb_.combined_velocity * static_cast<double>(bb_.time_step.count());
             bb_.total_traversed_distance += step;
 
-            // FIXME: Combine heading and velocity -> update lat and long
-            // bb_.lat = bb_.combined_heading
-            // bb_.long = bb_.combined_heading
+            /* Great-circle destination point: walk `step` meters from the current
+             * position along the combined heading, held constant over the step. */
+            const double angular_step = step / earth_radius_m;
+            const double lat_rad = deg_to_rad(bb_.current_lat);
+            const double lon_rad = deg_to_rad(bb_.current_lon);
+            const double bearing_rad = deg_to_rad(bb_.combined_heading);
+
+            const double sin_lat_next = std::sin(lat_rad) * std::cos(angular_step)
+                                      + std::cos(lat_rad) * std::sin(angular_step) * std::cos(bearing_rad);
+            const double lat_next = std::asin(sin_lat_next);
+            const double lon_next = lon_rad
+                                  + std::atan2(std::sin(bearing_rad) * std::sin(angular_step) * std::cos(lat_rad),
+                                               std::cos(angular_step) - std::sin(lat_rad) * sin_lat_next);
+
+            bb_.current_lat = rad_to_deg(lat_next);
+            /* remainder wraps into [-180, 180], keeping the field lookups in range
+             * when a track crosses the antimeridian */
+            bb_.current_lon = std::remainder(rad_to_deg(lon_next), 360.0);
         }
 
     private:
@@ -118,11 +192,11 @@ class SolarIsolationField // TODO: Generalize to environment models
 {
 public:
     // FIXME: This will need to load and sample data...
-    SolarIsolationField(blackboard & bb, const std::filesystem::path& path) : bb_(bb), field_(boatforge::NpzField(path)){}
+    SolarIsolationField(blackboard & bb, const std::filesystem::path& path) : bb_(bb), field_(boatforge::NpzField::load(path)){}
 
     void sample(){
         // FIXME: Add future optimization to cache data for parallel runs
-        bb.solar_power_in_w= field_.sample(bb.time, bb.lat, bb.long);
+        bb_.solar_power_in_w = field_.sample(bb_.time, bb_.current_lat, bb_.current_lon);
     }
 private:
     blackboard & bb_;
@@ -137,4 +211,4 @@ class EnvironmentField
         void sample();// FIXME: Make this virtual or something...
     private:
         blackboard & bb_;
-}
+};

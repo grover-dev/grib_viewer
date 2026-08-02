@@ -133,7 +133,7 @@ float NpzField::at(std::size_t i, std::size_t j, std::size_t k) const {
     if (raw == fill_) {
         return not_a_number;
     }
-    return static_cast<float>(static_cast<double>(raw) * scale_);
+    return static_cast<float>(static_cast<double>(raw) * scale_ + offset_);
 }
 
 float NpzField::sample(std::chrono::seconds when, double lat, double lon) const {

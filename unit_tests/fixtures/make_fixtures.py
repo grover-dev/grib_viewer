@@ -32,6 +32,9 @@ DEFAULT_GRIB = REPO / "data" / "18fdfe51416fefbcd1cd10d5e52abfe5" / "data.grib"
 # and daylight and the time interpolation has something to interpolate.
 REGION = ["--frames", "6:12", "--bbox", "-30", "-10", "30", "50"]
 
+# Same idea, smaller, and pulling a field that takes both signs.
+SIGNED = ["--var", "u10", "--frames", "6:10", "--bbox", "-25", "-15", "35", "45"]
+
 FIXTURES = [
     # Regional and quantised. Non-wrapping, so it exercises out-of-range
     # rejection at all four edges.
@@ -46,6 +49,13 @@ FIXTURES = [
     # complete in time, so a test can find where daylight peaks and check it
     # against local noon -- which is what proves the half-step centring.
     ("diurnal_u16.npz", ["--frames", "0:24", "--bbox", "-21", "-19", "39", "41"]),
+    # Not solar at all: the 10 m wind U component, which goes negative. Every
+    # radiation fixture quantises with offset == 0 because irradiance is floored
+    # at zero, so without a signed field the dequantiser's offset term is never
+    # actually exercised. This also covers a field that is not an accumulation,
+    # and so gets neither the J/m^2 conversion nor the half-step shift.
+    ("signed_u16.npz", SIGNED),
+    ("signed_f32.npz", SIGNED + ["--dtype", "f32"]),
 ]
 
 
