@@ -4,7 +4,7 @@
 #include <map>
 #include <string>
 
-#include <boatforge/npy.hpp>
+#include <boatforge/npy.h>
 
 namespace boatforge {
 

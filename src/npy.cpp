@@ -1,4 +1,4 @@
-#include <boatforge/npy.hpp>
+#include <boatforge/npy.h>
 
 #include <algorithm>
 #include <array>

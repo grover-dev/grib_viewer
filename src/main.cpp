@@ -3,8 +3,8 @@
 #include <print>
 #include <string>
 
-#include <boatforge/npz.hpp>
-#include <boatforge/version.hpp>
+#include <boatforge/npz.h>
+#include <boatforge/version.h>
 
 namespace {
 
@@ -47,7 +47,19 @@ void print_preview(const boatforge::NpyArray& array) {
 
 }  // namespace
 
+
+
 int main(int argc, char** argv) {
+    /**
+     * How to start?
+     * - Map has been created, lets architect the iteration loop
+     *   - Will probably need to optimize, problem for later
+     *
+     *
+     *
+     */
+
+
     const std::string path = argc > 1 ? argv[1] : "track.npz";
 
     std::println("boatforge {} — reading {}", boatforge::kVersion, path);

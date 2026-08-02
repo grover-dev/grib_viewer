@@ -1,4 +1,4 @@
-#include <boatforge/npz.hpp>
+#include <boatforge/npz.h>
 
 #include <format>
 #include <memory>

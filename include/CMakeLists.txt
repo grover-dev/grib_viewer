@@ -8,7 +8,8 @@ target_sources(boatforge_headers INTERFACE
     FILE_SET HEADERS
     BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}
     FILES
-        boatforge/npy.hpp
-        boatforge/npz.hpp
-        boatforge/version.hpp
+        boatforge/npy.h
+        boatforge/npz.h
+        boatforge/solar.h
+        boatforge/version.h
 )
