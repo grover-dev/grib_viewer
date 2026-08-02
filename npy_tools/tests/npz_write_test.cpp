@@ -381,7 +381,8 @@ TEST(Recorder, DurationsAreRecordedAsWholeSeconds) {
     log.record("t", std::chrono::milliseconds{1500});  // truncates, as documented
     log.save(out.path());
 
-    const auto values = load_npz(out.path()).at("t").as<std::int64_t>();
+    const NpzArchive npz = load_npz(out.path());
+    const auto values = npz.at("t").as<std::int64_t>();
     EXPECT_EQ(values[0], 7200);
     EXPECT_EQ(values[1], 5400);
     EXPECT_EQ(values[2], 1);

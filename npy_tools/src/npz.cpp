@@ -1,6 +1,7 @@
 #include <npy_tools/npz.h>
 
 #include <format>
+#include <fstream>
 #include <memory>
 #include <string_view>
 #include <utility>
@@ -122,6 +123,23 @@ using Member = std::pair<std::string, std::vector<std::byte>>;
 
 void write_archive(const std::filesystem::path& path,
                    const std::vector<Member>& members, Compression compression) {
+    // libzip deletes an archive that ends up with no entries rather than
+    // writing an empty one, which would turn "the run recorded nothing" into
+    // "the output is missing". numpy.savez() with no arrays produces a bare
+    // end-of-central-directory record, so write that instead.
+    if (members.empty()) {
+        static constexpr char kEmptyZip[]{'P',  'K',  '\x05', '\x06', 0, 0, 0, 0,
+                                          0,    0,    0,      0,      0, 0, 0, 0,
+                                          0,    0,    0,      0,      0, 0};
+        std::ofstream out{path, std::ios::binary | std::ios::trunc};
+        out.write(kEmptyZip, sizeof(kEmptyZip));
+        if (!out) {
+            throw NpyError{
+                std::format("cannot write {}: empty archive", path.string())};
+        }
+        return;
+    }
+
     int code = 0;
     ZipWriteHandle archive{zip_open(path.c_str(), ZIP_CREATE | ZIP_TRUNCATE, &code)};
     if (!archive) {

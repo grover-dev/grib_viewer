@@ -16,7 +16,7 @@ int main(int argc, char** argv)
      *
      *
      */
-    const std::string path = argc > 1 ? argv[1] : "track.npz";
+    const std::string path = argc > 1 ? argv[1] : "input.npz";
 
     std::println("boatforge — reading {}", path);
 
@@ -30,11 +30,13 @@ int main(int argc, char** argv)
     end.lat = 36.0;
     end.lon = 22.0;
 
-    Sim simulator(std::chrono::seconds(1735776000), start, end, path);
+    const std::string out_path = argc > 2 ? argv[2] : "track.npz";
+    Sim simulator(std::chrono::seconds(1735776000), start, end, path, out_path);
 
     while (simulator.step())
     {
     }
 
+    simulator.end();
     return 0;
 }
