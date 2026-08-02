@@ -33,6 +33,7 @@ class Sim
 
             blackboard_.steps++;
             blackboard_.time+=blackboard_.time_step;
+            blackboard_.total_time+=blackboard_.time_step;
             // FIXME: save output here -> to RAM, later to disk...
             count_--;
             return count_ > 0; // FIXME: For now only do a fixed number of steps

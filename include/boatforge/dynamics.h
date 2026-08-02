@@ -96,6 +96,7 @@ struct blackboard
     float avionics_power_out_w; // <- estimation based on state, this will be used with load shed algorithms, tbd
     // FIXME: power out?
     uint32_t steps;
+    std::chrono::seconds total_time;
 };
 
 /**
@@ -222,12 +223,12 @@ class Info
         {
             /* One line per step, the sim's running commentary: where we are, when
              * we are, how far we have come and how far is left. */
-            std::println("[{:%F %T}] lat {:9.4f}  lon {:9.4f}  travelled {:10.1f} km  remaining {:10.1f} km, step = {}",
+            std::println("[{:%F %T}] lat {:9.4f}  lon {:9.4f}  travelled {:10.1f} km  remaining {:10.1f} km, step = {}, total hours {}, total charge {5.5f}",
                          std::chrono::sys_seconds{bb_.time}, // TBD what to do with time...
                          bb_.current_lat,
                          bb_.current_lon,
                          bb_.total_traversed_distance / 1000.0,
-                         bb_.distance_to_end / 1000.0, bb_.steps);
+                         bb_.distance_to_end / 1000.0, bb_.steps, std::chrono::duration_cast<std::chrono::hours>(bb_.total_time).count(), bb_.power_stored_wh);
         }
     private:
         /* A reference, not a copy: a copy would freeze the values taken at

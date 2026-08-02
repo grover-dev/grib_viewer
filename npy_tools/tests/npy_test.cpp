@@ -314,7 +314,7 @@ TEST(ParseNpy, RejectsStructuredDtypes) {
 
 TEST(ParseNpy, RejectsDtypesWithNoCppEquivalent) {
     const auto payload = raw<std::uint8_t>({0, 0, 0, 0, 0, 0, 0, 0});
-    for (const std::string_view descr : {"'<i3'", "'<c16'", "'|S5'", "'<f8x'"}) {
+    for (const std::string_view descr : {"'<i3'", "'<c16'", "'|S5'", "'<m8'"}) {
         const auto dict = header_dict(descr, "(1,)", false);
         EXPECT_THROW(parse_npy(npy_image(dict, payload)), NpyError) << descr;
     }
