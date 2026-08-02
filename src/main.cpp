@@ -23,12 +23,12 @@ int main(int argc, char** argv)
     Sim::lat_lon start;
     // roughly off the coast of spain
     start.lat = 40.0;
-    start.lon = 13.0;
+    start.lon = -13.0;
 
     // further off the coast of spaiun
     Sim::lat_lon end;
     end.lat = 36.0;
-    end.lon = 22.0;
+    end.lon = -22.0;
 
     const std::string out_path = argc > 2 ? argv[2] : "track.npz";
     Sim simulator(std::chrono::seconds(1735776000), start, end, path, out_path);

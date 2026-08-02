@@ -45,6 +45,10 @@ Options:
 
     --show-excluded   draw water the (K, W) rules rejected, in neutral grey
     --demo-track      a great-circle course through the strait, to show the hook
+    --track NPZ       a track to animate; needs lat, lng and time (hours)
+    --track-scalar K  which channel of the track to shade the course by
+    --track-scale {unit,normalized}   shade over 0..1, or over the channel's
+                      own range -- raw channels need the latter or they clamp
     --coastlines {10m,50m,110m,none}   coastline detail (default 50m)
     --graticule DEG   meridian/parallel spacing, 0 to disable (default 15)
     --view LAT LON    camera target (default: centre of the map's bbox)
@@ -229,7 +233,7 @@ class TrackLayer(TimeLayer):
     name = "track"
 
     def __init__(self, plotter, lat, lng, times, values=None, cmap=None,
-                 color=TRACK, width=5.0, boat_size=13.0, radius=None):
+                 color=TRACK, width=5.0, boat_size=13.0, radius=None, clim=None):
         self.plotter = plotter
         self.times = np.asarray(times, dtype=float)
         self.pts = lonlat_to_xyz(lat, lng, radius or RADII["track"])
@@ -244,7 +248,11 @@ class TrackLayer(TimeLayer):
         kw = dict(line_width=width, lighting=False, show_scalar_bar=False)
         if values is not None:
             self.mesh.point_data["value"] = np.asarray(values, dtype=float)
-            kw.update(scalars="value", cmap=cmap or BATTERY_CMAP, clim=(0.0, 1.0))
+            # Default 0..1: the channel this was built for is a battery
+            # fraction. A raw channel (W, km) needs its own range passed in or
+            # it clamps to a single colour -- see --track-scale.
+            kw.update(scalars="value", cmap=cmap or BATTERY_CMAP,
+                      clim=clim or (0.0, 1.0))
         else:
             kw["color"] = color
         self.actor = plotter.add_mesh(self.mesh, **kw)
@@ -470,17 +478,19 @@ class GlobeView:
         color: str = TRACK,
         width: float = 4.0,
         cmap=None,
+        clim=None,
     ):
         """A course over the globe.
 
-        `values` colours it by any per-point scalar. Passing `times` makes it a
-        time layer instead of a static line: the course is then drawn as it is
-        sailed, with the boat at the head, and it registers with the timeline.
+        `values` colours it by any per-point scalar, over `clim` if given and
+        0..1 otherwise. Passing `times` makes it a time layer instead of a
+        static line: the course is then drawn as it is sailed, with the boat at
+        the head, and it registers with the timeline.
         """
         if times is not None:
             layer = TrackLayer(
                 self.plotter, lat, lng, times, values=values, cmap=cmap,
-                color=color, width=width,
+                color=color, width=width, clim=clim,
             )
             self.timeline.add(layer)
             self.actors[name] = layer.actor
@@ -490,7 +500,7 @@ class GlobeView:
         kw = dict(line_width=width, lighting=False, show_scalar_bar=False)
         if values is not None:
             line.point_data["value"] = np.asarray(values, float)
-            kw.update(scalars="value", cmap=cmap or MARGIN_CMAP)
+            kw.update(scalars="value", cmap=cmap or MARGIN_CMAP, clim=clim)
         else:
             kw["color"] = color
         a = self.plotter.add_mesh(line, **kw)
@@ -822,6 +832,14 @@ def main() -> None:
         default="battery",
         help="which channel of the track to shade it by (default battery)",
     )
+    p.add_argument(
+        "--track-scale",
+        choices=("unit", "normalized"),
+        default="unit",
+        help="unit: shade over 0..1, for fractions like battery -- anything "
+        "outside that range clamps to one colour. normalized: shade over the "
+        "channel's own min..max, for raw channels like W or km.",
+    )
     p.add_argument("--coastlines", default="50m", choices=("10m", "50m", "110m", "none"))
     p.add_argument("--graticule", type=int, default=15, metavar="DEG", help="0 to disable")
     p.add_argument("--view", type=float, nargs=2, metavar=("LAT", "LON"))
@@ -871,13 +889,36 @@ def main() -> None:
         # Centre on the course, not the bbox: the bbox centre is often over water
         # the (K, W) rules excluded, which points the camera at nothing.
         target = (float(np.mean(lat)), float(np.mean(lng)))
+        channels = [k for k, v in tr.items() if getattr(v, "shape", None) == lat.shape]
         scalar = tr.get(args.track_scalar)
         if scalar is not None and scalar.shape != lat.shape:
             scalar = None  # e.g. speed_kmh, a header value rather than a channel
-        view.add_track(lat, lng, values=scalar, times=hours, width=5)
+
+        # Say so rather than falling back to a flat orange line, which reads as
+        # "the shading is broken" instead of "that channel is not in the file".
+        clim = None
+        if scalar is None:
+            print(
+                f"  no channel {args.track_scalar!r} to shade by; "
+                f"drawing the course unshaded. available: {channels}"
+            )
+        else:
+            lo, hi = float(np.min(scalar)), float(np.max(scalar))
+            if args.track_scale == "normalized":
+                # A flat channel has no range to spread a colour map over.
+                clim = (lo, hi) if hi > lo else None
+            elif lo < 0.0 or hi > 1.0:
+                print(
+                    f"  {args.track_scalar} spans {lo:.4g}..{hi:.4g}, outside the "
+                    "0..1 unit scale; pass --track-scale normalized to spread the "
+                    "colour map over it"
+                )
+            print(f"  shading by {args.track_scalar} ({lo:.4g}..{hi:.4g}), "
+                  f"scale {args.track_scale}")
+
+        view.add_track(lat, lng, values=scalar, times=hours, width=5, clim=clim)
         view.add_markers([lat[0], lat[-1]], [lng[0], lng[-1]], labels=["start", "goal"])
         view.add_clock(lambda t: f"T+{t:5.1f} h   day {int(t // 24) + 1}")
-        channels = [k for k, v in tr.items() if getattr(v, "shape", None) == lat.shape]
         print(f"track: {len(lat)} points over {hours[-1]:.1f} h, channels {channels}")
 
     view.add_title(
