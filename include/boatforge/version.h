@@ -2,7 +2,8 @@
 
 #include <string_view>
 
-namespace boatforge {
+namespace boatforge
+{
 
 inline constexpr std::string_view kVersion = "0.1.0";
 

@@ -2,7 +2,6 @@
 
 class BoatModel
 {
-
     // field.sample(t, lat, lon)            — environment (radiation, later currents/wind)
     // solve(state, env, value_fn)          — the decision
     // - this is the control algorithm

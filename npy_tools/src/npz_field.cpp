@@ -8,15 +8,19 @@
 
 #include <npy_tools/npz.h>
 
-namespace boatforge {
-namespace {
+namespace boatforge
+{
+namespace
+{
 
 constexpr int32_t supported_version = 1;
 constexpr float not_a_number = std::numeric_limits<float>::quiet_NaN();
 
-const NpyArray& member(const NpzArchive& npz, std::string_view name) {
+const NpyArray& member(const NpzArchive& npz, std::string_view name)
+{
     const auto it = npz.find(name);
-    if (it == npz.end()) {
+    if (it == npz.end())
+    {
         throw NpyError{std::format("not a gridded field npz: no '{}' array", name)};
     }
     return it->second;
@@ -25,41 +29,47 @@ const NpyArray& member(const NpzArchive& npz, std::string_view name) {
 // A 0-d member, read as a scalar. The writer emits these with fixed dtypes, so
 // a mismatch means the file is not what it claims and is worth failing on.
 template <typename T>
-T scalar(const NpzArchive& npz, std::string_view name) {
+T scalar(const NpzArchive& npz, std::string_view name)
+{
     const NpyArray& array = member(npz, name);
-    if (array.size() != 1) {
-        throw NpyError{std::format("'{}' should be a scalar, has shape {}", name,
-                                   array.shape_string())};
+    if (array.size() != 1)
+    {
+        throw NpyError{std::format("'{}' should be a scalar, has shape {}", name, array.shape_string())};
     }
-    try {
+    try
+    {
         return array.as<T>()[0];
-    } catch (const NpyError& e) {
+    }
+    catch (const NpyError& e)
+    {
         throw NpyError{std::format("'{}': {}", name, e.what())};
     }
 }
 
 // Positive count, narrowed once so the sampler can index without casting.
-std::size_t extent(const NpzArchive& npz, std::string_view name) {
+std::size_t extent(const NpzArchive& npz, std::string_view name)
+{
     const int64_t n = scalar<int64_t>(npz, name);
-    if (n < 2) {
-        throw NpyError{std::format(
-            "'{}' is {}; the grid needs at least 2 points per axis to interpolate",
-            name, n)};
+    if (n < 2)
+    {
+        throw NpyError{std::format("'{}' is {}; the grid needs at least 2 points per axis to interpolate", name, n)};
     }
     return static_cast<std::size_t>(n);
 }
 
 }  // namespace
 
-NpzField NpzField::load(const std::filesystem::path& path) {
+NpzField NpzField::load(const std::filesystem::path& path)
+{
     NpzArchive npz = load_npz(path);
 
     const int32_t version = scalar<int32_t>(npz, "version");
-    if (version != supported_version) {
-        throw NpyError{std::format(
-            "field npz is version {}, this build reads version {}; regenerate it "
-            "with scripts/solar_npz.py",
-            version, supported_version)};
+    if (version != supported_version)
+    {
+        throw NpyError{
+            std::format("field npz is version {}, this build reads version {}; regenerate it "
+                        "with scripts/solar_npz.py",
+                        version, supported_version)};
     }
 
     NpzField field;
@@ -74,38 +84,40 @@ NpzField NpzField::load(const std::filesystem::path& path) {
     field.nlon_ = extent(npz, "nlon");
     field.wrap_ = scalar<int32_t>(npz, "lon_wrap") != 0;
 
-    if (field.step_ <= std::chrono::seconds{0}) {
-        throw NpyError{std::format("time step is {} s; must be positive",
-                                   field.step_.count())};
+    if (field.step_ <= std::chrono::seconds{0})
+    {
+        throw NpyError{std::format("time step is {} s; must be positive", field.step_.count())};
     }
-    if (!(field.dlat_ > 0.0) || !(field.dlon_ > 0.0)) {
-        throw NpyError{std::format(
-            "grid steps must be positive and ascending, got dlat={} dlon={}",
-            field.dlat_, field.dlon_)};
+    if (!(field.dlat_ > 0.0) || !(field.dlon_ > 0.0))
+    {
+        throw NpyError{
+            std::format("grid steps must be positive and ascending, got dlat={} dlon={}", field.dlat_, field.dlon_)};
     }
 
     // Moved, not copied: a global month is gigabytes and the archive is dead
     // after this point anyway.
     const auto data_it = npz.find("data");
-    if (data_it == npz.end()) {
+    if (data_it == npz.end())
+    {
         throw NpyError{"not a gridded field npz: no 'data' array"};
     }
     field.data_ = std::move(data_it->second);
 
     const std::vector<std::size_t>& shape = field.data_.shape();
-    if (shape.size() != 3 || shape[0] != field.nt_ || shape[1] != field.nlat_ ||
-        shape[2] != field.nlon_) {
-        throw NpyError{std::format(
-            "'data' has shape {}, but the axes say ({}, {}, {})",
-            field.data_.shape_string(), field.nt_, field.nlat_, field.nlon_)};
+    if (shape.size() != 3 || shape[0] != field.nt_ || shape[1] != field.nlat_ || shape[2] != field.nlon_)
+    {
+        throw NpyError{std::format("'data' has shape {}, but the axes say ({}, {}, {})", field.data_.shape_string(),
+                                   field.nt_, field.nlat_, field.nlon_)};
     }
-    if (field.data_.fortran_order()) {
+    if (field.data_.fortran_order())
+    {
         throw NpyError{"'data' is Fortran-ordered; the sampler indexes it C-order"};
     }
 
     // The dtype the writer chose is what says whether values are quantised;
     // scale/offset/fill are only meaningful for the integer payload.
-    switch (field.data_.dtype()) {
+    switch (field.data_.dtype())
+    {
         case DType::UInt16:
             field.quantised_ = true;
             field.scale_ = scalar<double>(npz, "scale");
@@ -116,40 +128,45 @@ NpzField NpzField::load(const std::filesystem::path& path) {
             field.quantised_ = false;
             break;
         default:
-            throw NpyError{std::format(
-                "'data' is {}; expected uint16 (quantised) or float32",
-                to_string(field.data_.dtype()))};
+            throw NpyError{
+                std::format("'data' is {}; expected uint16 (quantised) or float32", to_string(field.data_.dtype()))};
     }
 
     return field;
 }
 
-float NpzField::at(std::size_t i, std::size_t j, std::size_t k) const {
+float NpzField::at(std::size_t i, std::size_t j, std::size_t k) const
+{
     const std::size_t index = (i * nlat_ + j) * nlon_ + k;
-    if (!quantised_) {
+    if (!quantised_)
+    {
         return data_.as<float>()[index];
     }
     const uint16_t raw = data_.as<uint16_t>()[index];
-    if (raw == fill_) {
+    if (raw == fill_)
+    {
         return not_a_number;
     }
     return static_cast<float>(static_cast<double>(raw) * scale_ + offset_);
 }
 
-float NpzField::sample(std::chrono::seconds when, double lat, double lon) const {
-    if (nt_ == 0) {
+float NpzField::sample(std::chrono::seconds when, double lat, double lon) const
+{
+    if (nt_ == 0)
+    {
         return not_a_number;
     }
 
     // --- fractional indices, by arithmetic ---------------------------------
-    const double ti = static_cast<double>((when - t0_).count()) /
-                      static_cast<double>(step_.count());
-    if (!(ti >= 0.0) || ti > static_cast<double>(nt_ - 1)) {
+    const double ti = static_cast<double>((when - t0_).count()) / static_cast<double>(step_.count());
+    if (!(ti >= 0.0) || ti > static_cast<double>(nt_ - 1))
+    {
         return not_a_number;  // also rejects NaN input, via the negated comparison
     }
 
     const double yi = (lat - lat0_) / dlat_;
-    if (!(yi >= 0.0) || yi > static_cast<double>(nlat_ - 1)) {
+    if (!(yi >= 0.0) || yi > static_cast<double>(nlat_ - 1))
+    {
         return not_a_number;
     }
 
@@ -159,11 +176,13 @@ float NpzField::sample(std::chrono::seconds when, double lat, double lon) const 
     // edge, where the bounds check below correctly rejects it on a regional
     // grid. It is the same trick grib_utils.crop_message uses to pick columns.
     double east = std::fmod(lon - lon0_, 360.0);
-    if (east < 0.0) {
+    if (east < 0.0)
+    {
         east += 360.0;
     }
     const double xi = east / dlon_;
-    if (!(xi >= 0.0) || (!wrap_ && xi > static_cast<double>(nlon_ - 1))) {
+    if (!(xi >= 0.0) || (!wrap_ && xi > static_cast<double>(nlon_ - 1)))
+    {
         return not_a_number;
     }
 
