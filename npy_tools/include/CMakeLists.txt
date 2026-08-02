@@ -11,4 +11,5 @@ target_sources(npy_tools_headers INTERFACE
         npy_tools/npy.h
         npy_tools/npz.h
         npy_tools/npz_field.h
+        npy_tools/npz_recorder.h
 )

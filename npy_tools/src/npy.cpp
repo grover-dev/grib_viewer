@@ -6,6 +6,7 @@
 #include <charconv>
 #include <cstring>
 #include <format>
+#include <limits>
 
 namespace boatforge {
 namespace {
@@ -168,6 +169,42 @@ std::vector<std::size_t> parse_shape(std::string_view value) {
     return shape;
 }
 
+// numpy's rendering of a shape tuple: "()" for 0-d, a trailing comma at rank 1
+// so it stays a tuple, plain otherwise. The header parser above accepts more
+// than this, but what we *write* should be what numpy writes.
+std::string format_shape(std::span<const std::size_t> shape) {
+    if (shape.empty()) {
+        return "()";
+    }
+    std::string out = "(";
+    for (std::size_t i = 0; i < shape.size(); ++i) {
+        out += std::format("{}{}", i > 0 ? ", " : "", shape[i]);
+    }
+    out += shape.size() == 1 ? ",)" : ")";
+    return out;
+}
+
+// The descr string for a dtype. Single-byte types take '|' (byte order is
+// meaningless at width 1), everything else '<' -- see the endianness check in
+// write_npy, which is what makes that true.
+std::string_view descr_of(DType dtype) {
+    switch (dtype) {
+        case DType::Bool: return "|b1";
+        case DType::Int8: return "|i1";
+        case DType::UInt8: return "|u1";
+        case DType::Int16: return "<i2";
+        case DType::Int32: return "<i4";
+        case DType::Int64: return "<i8";
+        case DType::UInt16: return "<u2";
+        case DType::UInt32: return "<u4";
+        case DType::UInt64: return "<u8";
+        case DType::Float16: return "<f2";
+        case DType::Float32: return "<f4";
+        case DType::Float64: return "<f8";
+    }
+    throw NpyError{"cannot write an array of unknown dtype"};
+}
+
 bool parse_bool(std::string_view value) {
     value = trim(value);
     if (value == "True") return true;
@@ -226,16 +263,7 @@ NpyArray::NpyArray(std::vector<std::size_t> shape, DType dtype,
 }
 
 std::string NpyArray::shape_string() const {
-    if (shape_.empty()) {
-        return "()";  // 0-d array (numpy scalar)
-    }
-    std::string out = "(";
-    for (std::size_t i = 0; i < shape_.size(); ++i) {
-        out += std::format("{}{}", i > 0 ? ", " : "", shape_[i]);
-    }
-    // numpy renders a 1-d shape with a trailing comma.
-    out += shape_.size() == 1 ? ",)" : ")";
-    return out;
+    return format_shape(shape_);
 }
 
 NpyArray parse_npy(std::span<const std::byte> image) {
@@ -286,6 +314,80 @@ NpyArray parse_npy(std::span<const std::byte> image) {
 
     std::vector<std::byte> data(payload.begin(), payload.begin() + payload_bytes);
     return NpyArray{std::move(shape), dtype, fortran_order, std::move(data)};
+}
+
+std::vector<std::byte> write_npy(std::span<const std::byte> data, DType dtype,
+                                 const std::vector<std::size_t>& shape,
+                                 bool fortran_order) {
+    if (std::endian::native != std::endian::little) {
+        throw NpyError{"boatforge requires a little-endian host"};
+    }
+
+    std::size_t count = 1;
+    for (const std::size_t dim : shape) {
+        if (dim != 0 && count > std::numeric_limits<std::size_t>::max() / dim) {
+            throw NpyError{std::format("npy shape {} overflows", format_shape(shape))};
+        }
+        count *= dim;
+    }
+    const std::size_t expected = count * word_size(dtype);
+    if (data.size() != expected) {
+        throw NpyError{std::format(
+            "npy payload is {} bytes, but shape {} of {} needs {}", data.size(),
+            format_shape(shape), to_string(dtype), expected)};
+    }
+
+    const std::string dict = std::format(
+        "{{'descr': '{}', 'fortran_order': {}, 'shape': {}, }}",
+        descr_of(dtype), fortran_order ? "True" : "False", format_shape(shape));
+
+    // Pad with spaces and terminate with a newline so the payload starts on a
+    // 64-byte boundary, as the format asks. Version 1.0 holds the header length
+    // in 16 bits; a header that will not fit moves to 2.0's 32-bit field, which
+    // takes two more prefix bytes and so shifts the padding.
+    const auto pad = [&dict](std::size_t prefix) {
+        std::string header = dict;
+        while ((prefix + header.size() + 1) % 64 != 0) {
+            header.push_back(' ');
+        }
+        header.push_back('\n');
+        return header;
+    };
+
+    unsigned major = 1;
+    std::string header = pad(10);
+    if (header.size() > 0xffff) {
+        major = 2;
+        header = pad(12);
+        if (header.size() > 0xffffffffULL) {
+            throw NpyError{"npy header is too large to write"};
+        }
+    }
+
+    std::vector<std::byte> image;
+    image.reserve((major == 1 ? 10 : 12) + header.size() + data.size());
+    for (const char c : kMagic) {
+        image.push_back(static_cast<std::byte>(c));
+    }
+    image.push_back(static_cast<std::byte>(major));
+    image.push_back(std::byte{0});  // minor
+
+    const auto len = static_cast<std::uint32_t>(header.size());
+    const int len_bytes = major == 1 ? 2 : 4;
+    for (int i = 0; i < len_bytes; ++i) {
+        image.push_back(static_cast<std::byte>((len >> (8 * i)) & 0xff));
+    }
+
+    for (const char c : header) {
+        image.push_back(static_cast<std::byte>(c));
+    }
+    image.insert(image.end(), data.begin(), data.end());
+    return image;
+}
+
+std::vector<std::byte> write_npy(const NpyArray& array) {
+    return write_npy(array.bytes(), array.dtype(), array.shape(),
+                     array.fortran_order());
 }
 
 }  // namespace boatforge

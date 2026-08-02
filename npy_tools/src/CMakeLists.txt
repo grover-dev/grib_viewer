@@ -2,6 +2,7 @@ add_library(npy_tools
     npy.cpp
     npz.cpp
     npz_field.cpp
+    npz_recorder.cpp
 )
 add_library(npy_tools::npy_tools ALIAS npy_tools)
 

@@ -24,6 +24,7 @@ set(NPY_TOOLS_FIXTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../unit_tests/fixtures
 add_executable(npy_tools_tests
     npy_test.cpp
     npz_test.cpp
+    npz_write_test.cpp
 )
 
 target_link_libraries(npy_tools_tests

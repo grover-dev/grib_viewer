@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -92,5 +93,46 @@ private:
 
 // Parse a complete .npy file image (header + payload).
 NpyArray parse_npy(std::span<const std::byte> image);
+
+// Serialize to a complete .npy file image, in the layout numpy.save writes:
+// version 1.0 where the header fits, the header padded so the payload starts on
+// a 64-byte boundary, and the payload in the host's (little-endian) order.
+//
+// `data` must hold exactly product(shape) * word_size(dtype) bytes; anything
+// else is a caller bug rather than something to pad or truncate, so it throws.
+std::vector<std::byte> write_npy(std::span<const std::byte> data, DType dtype,
+                                 const std::vector<std::size_t>& shape,
+                                 bool fortran_order = false);
+
+// Re-serialize a parsed array. write_npy(parse_npy(x)) is not byte-identical to
+// x -- header padding and format version are normalised -- but round-trips.
+std::vector<std::byte> write_npy(const NpyArray& array);
+
+// Serialize a contiguous range with an explicit shape. The element type picks
+// the dtype, so the array numpy reads back has the type it was written from.
+template <std::ranges::contiguous_range R>
+std::vector<std::byte> write_npy(const R& values,
+                                 const std::vector<std::size_t>& shape,
+                                 bool fortran_order = false) {
+    using T = std::ranges::range_value_t<R>;
+    const std::span<const T> flat{std::ranges::data(values),
+                                  std::ranges::size(values)};
+    return write_npy(std::as_bytes(flat), dtype_of<T>(), shape, fortran_order);
+}
+
+// Serialize a contiguous range as a 1-d array -- the common case, and what a
+// column of per-step samples wants to be.
+template <std::ranges::contiguous_range R>
+std::vector<std::byte> write_npy(const R& values) {
+    return write_npy(values, std::vector<std::size_t>{std::ranges::size(values)});
+}
+
+// Serialize a single value as a 0-d array (a numpy scalar), matching how the
+// gridded-field npz stores its axis constants.
+template <typename T>
+std::vector<std::byte> write_npy_scalar(const T& value) {
+    return write_npy(std::as_bytes(std::span<const T, 1>{&value, 1}),
+                     dtype_of<T>(), {});
+}
 
 }  // namespace boatforge
