@@ -7,7 +7,7 @@
 // wrapping, bounds, dequantisation), not the particular numbers ERA5 happened
 // to record over the Atlantic on 1 January 2025.
 
-#include <boatforge/npz_field.h>
+#include <npy_tools/npz_field.h>
 
 #include <algorithm>
 #include <chrono>
@@ -16,8 +16,8 @@
 #include <filesystem>
 #include <string>
 
-#include <boatforge/npy.h>
-#include <boatforge/npz.h>
+#include <npy_tools/npy.h>
+#include <npy_tools/npz.h>
 #include <gtest/gtest.h>
 
 namespace {

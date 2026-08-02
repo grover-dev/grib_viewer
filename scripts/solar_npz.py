@@ -326,8 +326,9 @@ def main() -> None:
     print(f"\nwrote {dst}: {disk / 1e6:.1f} MB on disk"
           f"  ({raw / 1e6:.1f} MB in memory as {payload.dtype})")
     if args.dtype == "u16":
+        unit = "W m**-2" if convert else (units or "?")
         print(f"  quantised: value = raw * {scale:.6g} + {offset:.6g}"
-              f"  (step {scale:.4g} W/m^2)")
+              f"  (step {scale:.4g} {unit})")
     print()
 
 

@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 
-#include <boatforge/npy.h>
+#include <npy_tools/npy.h>
 
 namespace boatforge {
 

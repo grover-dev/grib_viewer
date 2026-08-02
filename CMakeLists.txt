@@ -41,6 +41,7 @@ target_compile_options(boatforge_options INTERFACE
     -Wall -Wextra -Wpedantic
 )
 
+add_subdirectory(npy_tools)
 add_subdirectory(include)
 add_subdirectory(src)
 

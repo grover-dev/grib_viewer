@@ -1,4 +1,4 @@
-#include <boatforge/npz_field.h>
+#include <npy_tools/npz_field.h>
 
 #include <cmath>
 #include <format>
@@ -6,7 +6,7 @@
 #include <string_view>
 #include <utility>
 
-#include <boatforge/npz.h>
+#include <npy_tools/npz.h>
 
 namespace boatforge {
 namespace {

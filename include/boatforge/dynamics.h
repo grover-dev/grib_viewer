@@ -3,7 +3,7 @@
 #include <cmath>
 #include <print>
 
-#include <boatforge/npz_field.h>
+#include <npy_tools/npz_field.h>
 
 namespace
 {

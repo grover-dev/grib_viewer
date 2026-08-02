@@ -8,8 +8,9 @@ target_sources(boatforge_headers INTERFACE
     FILE_SET HEADERS
     BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}
     FILES
-        boatforge/npy.h
-        boatforge/npz.h
-        boatforge/npz_field.h
         boatforge/version.h
 )
+
+# npz-backed fields appear in boatforge's own headers, so the npy_tools include
+# path has to travel with them.
+target_link_libraries(boatforge_headers INTERFACE npy_tools::headers)

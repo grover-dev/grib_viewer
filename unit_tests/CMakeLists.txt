@@ -16,7 +16,7 @@ add_executable(boatforge_tests
 )
 
 target_link_libraries(boatforge_tests
-    PRIVATE boatforge::core boatforge::options GTest::gtest_main
+    PRIVATE npy_tools::npy_tools boatforge::options GTest::gtest_main
 )
 
 # The fixtures are read from the source tree rather than copied next to the

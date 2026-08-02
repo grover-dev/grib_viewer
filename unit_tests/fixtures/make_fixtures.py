@@ -56,6 +56,12 @@ FIXTURES = [
     # and so gets neither the J/m^2 conversion nor the half-step shift.
     ("signed_u16.npz", SIGNED),
     ("signed_f32.npz", SIGNED + ["--dtype", "f32"]),
+    # Significant wave height over the Bay of Biscay and western France, which
+    # is undefined on land. Radiation and wind are defined everywhere, so this
+    # is the only fixture carrying the no-data marker -- without it the
+    # dequantiser's fill check is dead code as far as the tests can tell.
+    ("holes_u16.npz",
+     ["--var", "swh", "--frames", "6:10", "--bbox", "-10", "5", "40", "50"]),
 ]
 
 
@@ -71,6 +77,13 @@ def expectations(name: str, npz) -> list[tuple[str, bool]]:
         ("field varies, so comparisons are not vacuous",
          float(npz["data"].max()) > float(npz["data"].min())),
     ]
+    if name.startswith("holes"):
+        holes = int((npz["data"] == 65535).sum())
+        total = int(npz["data"].size)
+        return common[:2] + [
+            (f"carries the no-data marker ({holes}/{total} cells)", holes > 0),
+            ("but is not entirely holes", holes < total),
+        ]
     if name.startswith("signed"):
         # The whole reason this fixture exists: a non-zero quantisation offset.
         return common + [
