@@ -82,7 +82,7 @@ TEST(LoadNpz, ZeroDimensionalScalarsCarryExactlyOneElement) {
     const NpzArchive npz = load_npz(fixture("region_u16.npz"));
 
     for (const std::string_view key : {"t0", "dt", "nt", "nlat", "nlon"}) {
-        const auto& array = npz.at(key);
+        const auto& array = member(npz, key);
         SCOPED_TRACE(key);
         EXPECT_TRUE(array.shape().empty());
         EXPECT_EQ(array.size(), 1u);

@@ -1,15 +1,18 @@
 # GoogleTest, fetched rather than found: the version is then a property of the
 # repo instead of the machine, and it lands under builds/ with everything else.
-include(FetchContent)
+# Skipped when npy_tools/tests has already fetched it.
+if(NOT TARGET GTest::gtest_main)
+    include(FetchContent)
 
-FetchContent_Declare(googletest
-    URL https://github.com/google/googletest/archive/refs/tags/v1.17.0.tar.gz
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-)
-# GoogleTest is not ours, so it does not get boatforge::options' -Wall -Wpedantic.
-set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(googletest)
+    FetchContent_Declare(googletest
+        URL https://github.com/google/googletest/archive/refs/tags/v1.17.0.tar.gz
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    )
+    # GoogleTest is not ours, so it does not get boatforge::options' -Wall -Wpedantic.
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+endif()
 
 add_executable(boatforge_tests
     npz_field_test.cpp
