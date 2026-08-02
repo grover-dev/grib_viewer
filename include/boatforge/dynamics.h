@@ -1,6 +1,7 @@
 #pragma once
 #include <chrono>
 #include <cmath>
+#include <print>
 
 #include <boatforge/npz_field.h>
 
@@ -96,6 +97,38 @@ struct blackboard
     // FIXME: power out?
 };
 
+/**
+ * Different environment models have different effects
+ * - ex: wind + currnet -> propulsion
+ *       wave height + period -> risk
+ *       sun -> power
+ * -
+ */
+class SolarIsolationField // TODO: Generalize to environment models
+{
+public:
+    // FIXME: This will need to load and sample data...
+    SolarIsolationField(blackboard & bb, const std::filesystem::path& path) : bb_(bb), field_(boatforge::NpzField::load(path)){}
+
+    void sample(){
+        // FIXME: Add future optimization to cache data for parallel runs
+        bb_.solar_power_in_w = field_.sample(bb_.time, bb_.current_lat, bb_.current_lon);
+    }
+private:
+    blackboard & bb_;
+    boatforge::NpzField field_;
+};
+
+class EnvironmentField
+{
+    public:
+        EnvironmentField(blackboard & bb) : bb_(bb){}
+
+        void sample();// FIXME: Make this virtual or something...
+    private:
+        blackboard & bb_;
+};
+
 class Solver
 {
     public:
@@ -176,39 +209,26 @@ class WorldPropogation
 
     private:
         blackboard & bb_;
-
 };
 
-
-
-/**
- * Different environment models have different effects
- * - ex: wind + currnet -> propulsion
- *       wave height + period -> risk
- *       sun -> power
- * -
- */
-class SolarIsolationField // TODO: Generalize to environment models
-{
-public:
-    // FIXME: This will need to load and sample data...
-    SolarIsolationField(blackboard & bb, const std::filesystem::path& path) : bb_(bb), field_(boatforge::NpzField::load(path)){}
-
-    void sample(){
-        // FIXME: Add future optimization to cache data for parallel runs
-        bb_.solar_power_in_w = field_.sample(bb_.time, bb_.current_lat, bb_.current_lon);
-    }
-private:
-    blackboard & bb_;
-    boatforge::NpzField field_;
-};
-
-class EnvironmentField
+class Info
 {
     public:
-        EnvironmentField(blackboard & bb) : bb_(bb){}
+        Info(blackboard & bb) : bb_(bb){}
 
-        void sample();// FIXME: Make this virtual or something...
+        void step()
+        {
+            /* One line per step, the sim's running commentary: where we are, when
+             * we are, how far we have come and how far is left. */
+            std::println("[{:%F %T}] lat {:9.4f}  lon {:9.4f}  travelled {:10.1f} km  remaining {:10.1f} km",
+                         std::chrono::sys_seconds{bb_.time},
+                         bb_.current_lat,
+                         bb_.current_lon,
+                         bb_.total_traversed_distance / 1000.0,
+                         bb_.distance_to_end / 1000.0);
+        }
     private:
+        /* A reference, not a copy: a copy would freeze the values taken at
+         * construction and log the same line every step. */
         blackboard & bb_;
 };

@@ -378,6 +378,40 @@ TEST(NpzFieldDtype, QuantisedAgreesWithFloat32OverTheSameWindow) {
     EXPECT_LE(worst, quantised.scale) << "quantisation drifted beyond one step";
 }
 
+TEST(NpzFieldDtype, DequantisesFieldsThatTakeBothSigns) {
+    // Radiation is floored at zero, so every solar fixture quantises with
+    // offset == 0 and the offset term of the dequantiser goes untested. The
+    // signed fixture is 10 m wind U, which is negative over half the domain.
+    const Reference quantised{"signed_u16.npz"};
+    ASSERT_TRUE(quantised.quantised);
+    ASSERT_LT(quantised.offset, 0.0) << "fixture does not exercise the offset term";
+    const Reference exact{"signed_f32.npz"};
+    ASSERT_FALSE(exact.quantised);
+    ASSERT_EQ(quantised.nt, exact.nt);
+    ASSERT_EQ(quantised.nlat, exact.nlat);
+    ASSERT_EQ(quantised.nlon, exact.nlon);
+
+    const NpzField a = NpzField::load(fixture("signed_u16.npz"));
+    const NpzField b = NpzField::load(fixture("signed_f32.npz"));
+
+    double worst = 0.0, lowest = 0.0, highest = 0.0;
+    for (int64_t i = 0; i < exact.nt; ++i) {
+        for (int64_t j = 0; j < exact.nlat; j += 3) {
+            for (int64_t k = 0; k < exact.nlon; k += 3) {
+                const seconds t = exact.time_at(i);
+                const double lat = exact.lat_at(j), lon = exact.lon_at(k);
+                const double want = b.sample(t, lat, lon);
+                worst = std::max(worst, std::abs(a.sample(t, lat, lon) - want));
+                lowest = std::min(lowest, want);
+                highest = std::max(highest, want);
+            }
+        }
+    }
+    ASSERT_LT(lowest, 0.0) << "no negative values sampled; the offset is untested";
+    ASSERT_GT(highest, 0.0) << "no positive values sampled";
+    EXPECT_LE(worst, quantised.scale) << "quantisation drifted beyond one step";
+}
+
 TEST(NpzFieldDtype, Float32PathReturnsStoredValuesVerbatim) {
     const Reference ref{"region_f32.npz"};
     const NpzField field = NpzField::load(fixture("region_f32.npz"));

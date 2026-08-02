@@ -3,6 +3,7 @@
 #include <print>
 #include <string>
 
+#include <boatforge/main.h>
 #include <boatforge/npz.h>
 #include <boatforge/version.h>
 

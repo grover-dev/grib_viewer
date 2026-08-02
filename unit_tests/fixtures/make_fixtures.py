@@ -68,8 +68,16 @@ def expectations(name: str, npz) -> list[tuple[str, bool]]:
     common = [
         ("at least 3 frames, to interpolate in time", nt >= 3),
         ("at least 2 points per spatial axis", nlat >= 2 and nlon >= 2),
-        ("some daylight in the window", float(npz["data"].max()) > 0),
+        ("field varies, so comparisons are not vacuous",
+         float(npz["data"].max()) > float(npz["data"].min())),
     ]
+    if name.startswith("signed"):
+        # The whole reason this fixture exists: a non-zero quantisation offset.
+        return common + [
+            ("longitude does not wrap", not wraps),
+            ("quantised with a negative offset" if "u16" in name else "unquantised",
+             float(npz["offset"]) < 0 if "u16" in name else dtype == np.float32),
+        ]
     if name.startswith("diurnal"):
         return common + [
             ("a full day of frames", nt >= 24),
@@ -113,13 +121,14 @@ def main() -> None:
             print(f"    {'ok  ' if ok else 'FAIL'}  {what}")
             failed |= not ok
 
-    # The region pair must describe the same window, or the quantisation-error
-    # test is comparing two different things and would pass for the wrong reason.
-    with np.load(HERE / "region_u16.npz") as a, np.load(HERE / "region_f32.npz") as b:
-        for axis in ("time", "lat", "lon"):
-            same = np.array_equal(a[axis], b[axis])
-            print(f"    {'ok  ' if same else 'FAIL'}  region pair shares its {axis} axis")
-            failed |= not same
+    # Each u16/f32 pair must describe the same window, or the quantisation-error
+    # tests are comparing two different things and would pass for the wrong reason.
+    for stem in ("region", "signed"):
+        with np.load(HERE / f"{stem}_u16.npz") as a, np.load(HERE / f"{stem}_f32.npz") as b:
+            for axis in ("time", "lat", "lon"):
+                same = np.array_equal(a[axis], b[axis])
+                print(f"    {'ok  ' if same else 'FAIL'}  {stem} pair shares its {axis} axis")
+                failed |= not same
 
     if failed:
         raise SystemExit("\nfixtures do not satisfy what the tests assume")
