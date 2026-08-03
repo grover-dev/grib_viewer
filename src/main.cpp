@@ -1,46 +1,54 @@
-#include <cstddef>
+#include <chrono>
 #include <cstdio>
-#include <exception>
-#include <filesystem>
 #include <print>
 #include <string>
 
 #include <boatforge/dynamics.h>
 #include <boatforge/sim.h>
 
+namespace
+{
+/* Stand-in for the yaml loader: the same document, written by hand. Replace
+ * this with a parse of argv[1] and nothing else about main() has to change --
+ * the whole of a run's input is the config_t it returns. */
+Sim::config_t hard_coded_config(const std::filesystem::path& solar_field, const std::filesystem::path& out_directory)
+{
+    Sim::config_t config;
+    config.out_directory = out_directory;
+
+    Sim::run_t run;
+    run.name = "run";
+    run.start_time = std::chrono::seconds(1735776000) + std::chrono::hours(12);
+    /* roughly off the coast of spain */
+    run.start = {.lat = 40.0, .lon = -13.0};
+    /* further off the coast of spaiun */
+    run.end = {.lat = 36.0, .lon = -22.0};
+    run.solar_field = solar_field;
+    run.max_steps = 100;
+
+    config.runs.push_back(run);
+
+    return config;
+}
+}  // namespace
+
 int main(int argc, char** argv)
 {
     if (argc < 3)
     {
-        std::printf("Need at least 3 arguments");
+        std::printf("usage: boatforge <field.npz> <out-directory>\n");
         return 1;
     }
-    // FIXME: change this to take in larger blocks of data
-    const std::string path = argc > 1 ? argv[1] : "input.npz";
 
-    std::println("boatforge — reading {}", path);
+    // FIXME: replace both arguments with a single config.yaml
+    const std::filesystem::path path = argv[1];
+    const std::filesystem::path out_directory = argv[2];
 
-    Sim::lat_lon start;
-    // roughly off the coast of spain
-    start.lat = 40.0;
-    start.lon = -13.0;
+    std::println("boatforge — reading {}", path.string());
 
-    // further off the coast of spaiun
-    Sim::lat_lon end;
-    end.lat = 36.0;
-    end.lon = -22.0;
+    Sim simulator(hard_coded_config(path, out_directory));
 
-    auto solar_field = boatforge::NpzField::load(path);
-
-    const std::string out_directory = argv[2];
-
-    // FIXME: take in a list of start + end conditions
-    //
-    // FIXME: build an array of these runs
-
-    Sim simulator(std::chrono::seconds(1735776000) + std::chrono::hours(12), start, end, solar_field, out_directory);
-
-    while (simulator.step())
+    while (simulator.run())
     {
     }
 

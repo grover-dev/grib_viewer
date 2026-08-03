@@ -2,7 +2,13 @@
 #include <boatforge/dynamics.h>
 
 #include <npy_tools/npz_recorder.h>
+#include <chrono>
+#include <cstdint>
+#include <deque>
 #include <filesystem>
+#include <map>
+#include <string>
+#include <vector>
 
 #include <npy_tools/npz_field.h>
 class Sim
@@ -11,27 +17,65 @@ public:
     // FIXME: move this into the blackboard def eventuall,y no need for special structs
     struct lat_lon
     {
-        double lat;
-        double lon;
+        double lat = 0.0;
+        double lon = 0.0;
     };
 
+    /* One simulated voyage. Everything here is plain data with a default, so a
+     * yaml node maps onto it field by field and a key left out of the file just
+     * keeps the default rather than leaving a member uninitialised. */
     struct run_t
     {
-        const std::chrono::seconds start_time;
-        const lat_lon start;
-        const lat_lon end;
-        boatforge::NpzField& solar_field;
-        std::string output_name;
+        /* Names the output file, out_directory / name + ".npz", so it has to be
+         * unique across the runs of one config. */
+        std::string name = "run";
+
+        /* Departure, seconds since the Unix epoch UTC -- the frame the solar
+         * npz time axis uses. From yaml this is either an integer stamp or a
+         * date string the loader converts. */
+        std::chrono::seconds start_time{0};
+
+        /* Degrees, WGS84 */
+        lat_lon start{};
+        lat_lon end{};
+
+        /* npz written by scripts/grib_npz.py. Loaded by Sim, and shared between
+         * runs that name the same file, so a sweep of start days over one
+         * weather cube only pays for the load once. */
+        std::filesystem::path solar_field{};
+
+        /* Steps of blackboard::time_step to run before giving up on reaching
+         * the end point. 0 means "no cap" once the sim can terminate on
+         * arrival. */
+        // FIXME: For now this is the only termination condition
+        uint32_t max_steps = 100;
     };
 
-    Sim(std::span<run_t> runs)
+    /* The whole of an invocation: what to run and where to put it. This is the
+     * root of the yaml document. */
+    struct config_t
     {
-        for (auto& run : runs)
+        std::filesystem::path out_directory = ".";
+        std::vector<run_t> runs;
+    };
+
+    explicit Sim(config_t config) : config_(std::move(config))
+    {
+        for (auto& run : config_.runs)
         {
-            instances.push_back(sim_t{run});
+            /* Look up before loading so a repeated path loads once; map nodes
+             * are stable, so the reference handed to the sim survives later
+             * inserts. */
+            auto field = solar_fields_.find(run.solar_field);
+            if (field == solar_fields_.end())
+            {
+                field = solar_fields_.emplace(run.solar_field, boatforge::NpzField::load(run.solar_field)).first;
+            }
+
+            instances_.emplace_back(run, field->second, config_.out_directory);
         }
 
-        for (auto& instace : instances)
+        for (auto& instace : instances_)
         {
             instace.sample();
         }
@@ -42,16 +86,19 @@ public:
     // - stick to waypointed great circle distance for now, eentually move to something more intelligent
     //   - as a basic option can hand plot a few routes, then check their performance. avoid a lot of unnecessary search
 
+    /* True while any instance still has stepping left to do. Instances that
+     * have finished are stepped no further, so a short run does not hold back
+     * -- or get dragged along by -- a long one. */
     bool run()
     {
-        bool done = true;
+        bool running = false;
 
-        for (auto& instace : instances)
+        for (auto& instace : instances_)
         {
-            done &= instace.step();
+            running |= instace.step();
         }
 
-        return done;
+        return running;
     }
 
     // FIXME: move to destructor
@@ -59,7 +106,7 @@ public:
     {
         // FIXME: rework the recorder to take in a  data dict eventually
 
-        for (auto& instace : instances)
+        for (auto& instace : instances_)
         {
             instace.end();
         }
@@ -76,7 +123,10 @@ private:
 
     struct sim_t
     {
-        run_t& run_;
+        const run_t& run_;
+        /* By value, not by reference: the config member it is built from
+         * outlives us, but the joined path is a temporary. */
+        const std::filesystem::path output_path_;
         blackboard blackboard_;
         SolarIsolationField solar_field_;
         Solver solver_;
@@ -84,15 +134,17 @@ private:
         WorldPropogation world_;
         Info info_;
         boatforge::NpzRecorder recorder_;
-        uint16_t count_ = 100;
+        uint32_t steps_left_;
 
-        sim_t(run_t& run)
+        sim_t(const run_t& run, boatforge::NpzField& solar_field, const std::filesystem::path& out_directory)
             : run_(run),
-              solar_field_(blackboard_, run_.solar_field),
+              output_path_(out_directory / (run.name + ".npz")),
+              solar_field_(blackboard_, solar_field),
               solver_(blackboard_),
               boat_(blackboard_),
               world_(blackboard_),
-              info_(blackboard_)
+              info_(blackboard_),
+              steps_left_(run.max_steps)
         {
             blackboard_.time = run_.start_time;
             blackboard_.current_lat = run_.start.lat;
@@ -121,6 +173,11 @@ private:
 
         bool step()
         {
+            if (steps_left_ == 0)
+            {
+                return false;
+            }
+
             solar_field_.sample();
             solver_.step();
             boat_.step();
@@ -133,21 +190,25 @@ private:
             blackboard_.total_time += blackboard_.time_step;
 
             sample();
-            count_--;
-            return count_ > 0;  // FIXME: For now only do a fixed number of steps
+            steps_left_--;
+            return steps_left_ > 0;  // FIXME: For now only do a fixed number of steps
         }
 
         void end()
         {
-            // recorder_.save(output_path_);
+            std::filesystem::create_directories(output_path_.parent_path());
+            recorder_.save(output_path_);
         }
     };
 
-    std::vector<sim_t> instances;
+    config_t config_;
 
-    /* By value, not by reference: main.cpp passes a temporary path built from a
-     * std::string, so a reference member would dangle by the time end() runs. */
-    // const std::filesystem::path output_path_;
+    /* Keyed by path so runs sharing a field share one load. Node addresses are
+     * stable across inserts, which is what lets sim_t hold a reference. */
+    std::map<std::filesystem::path, boatforge::NpzField> solar_fields_;
 
-    //
+    /* deque, not vector: sim_t's members hold references to its own blackboard,
+     * so an instance that got relocated by a growing vector would leave every
+     * model pointing at the old one. */
+    std::deque<sim_t> instances_;
 };
