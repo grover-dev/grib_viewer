@@ -89,6 +89,12 @@ struct blackboard
     double combined_heading{};
     double combined_velocity{};
 
+    /* Cleared by any model that finds it has nothing to step on -- for now only
+     * a field sample off the end of its coverage. The sim ends that run where
+     * the flag drops, rather than carrying a NaN through the rest of the
+     * track. */
+    bool data_valid = true;
+
     // FIXME: This will eventually be fed by a configuration
     const float surface_area_m = 5.0f;
     float solar_power_in_w{};
@@ -121,7 +127,10 @@ public:
     void sample()
     {
         // FIXME: Add future optimization to cache data for parallel runs
-        bb_.solar_power_in_w = field_.sample(bb_.time, bb_.current_lat, bb_.current_lon);
+        /* On a miss solar_power_in_w keeps its last value, which nothing reads:
+         * the sim ends the run on the cleared flag before the step that would
+         * have used it. */
+        bb_.data_valid &= field_.sample(bb_.time, bb_.current_lat, bb_.current_lon, bb_.solar_power_in_w);
     }
 
 private:

@@ -7,6 +7,7 @@
 #include <deque>
 #include <filesystem>
 #include <map>
+#include <print>
 #include <string>
 #include <vector>
 
@@ -93,9 +94,12 @@ public:
     {
         bool running = false;
 
-        for (auto& instace : instances_)
+        for (auto& instance : instances_)
         {
-            running |= instace.step();
+            if (instance.blackboard_.data_valid)
+            {
+                running |= instance.step();
+            }
         }
 
         return running;
@@ -179,6 +183,18 @@ private:
             }
 
             solar_field_.sample();
+            /* Off the end of the field's coverage: everything downstream would
+             * be modelled on data that is not there, so the run ends here with
+             * the track it has rather than a tail of NaNs. */
+            if (!blackboard_.data_valid)
+            {
+                std::println("{}: no field data at step {}, ending run early", run_.name, blackboard_.steps);
+                /* Retire the instance, or the next call would step it again --
+                 * the sim as a whole runs until the longest run finishes. */
+                steps_left_ = 0;
+                return false;
+            }
+
             solver_.step();
             boat_.step();
             world_.step();

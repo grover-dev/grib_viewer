@@ -150,24 +150,24 @@ float NpzField::at(std::size_t i, std::size_t j, std::size_t k) const
     return static_cast<float>(static_cast<double>(raw) * scale_ + offset_);
 }
 
-float NpzField::sample(std::chrono::seconds when, double lat, double lon) const
+bool NpzField::sample(std::chrono::seconds when, double lat, double lon, float& value) const
 {
     if (nt_ == 0)
     {
-        return not_a_number;
+        return false;
     }
 
     // --- fractional indices, by arithmetic ---------------------------------
     const double ti = static_cast<double>((when - t0_).count()) / static_cast<double>(step_.count());
     if (!(ti >= 0.0) || ti > static_cast<double>(nt_ - 1))
     {
-        return not_a_number;  // also rejects NaN input, via the negated comparison
+        return false;  // also rejects NaN input, via the negated comparison
     }
 
     const double yi = (lat - lat0_) / dlat_;
     if (!(yi >= 0.0) || yi > static_cast<double>(nlat_ - 1))
     {
-        return not_a_number;
+        return false;
     }
 
     // Measuring longitude as an offset east of the grid origin, modulo 360,
@@ -183,7 +183,7 @@ float NpzField::sample(std::chrono::seconds when, double lat, double lon) const
     const double xi = east / dlon_;
     if (!(xi >= 0.0) || (!wrap_ && xi > static_cast<double>(nlon_ - 1)))
     {
-        return not_a_number;
+        return false;
     }
 
     // --- corners -----------------------------------------------------------
@@ -216,7 +216,16 @@ float NpzField::sample(std::chrono::seconds when, double lat, double lon) const
     const double c0 = c00 + (c01 - c00) * fy;
     const double c1 = c10 + (c11 - c10) * fy;
 
-    return static_cast<float>(c0 + (c1 - c0) * ft);
+    const float blended = static_cast<float>(c0 + (c1 - c0) * ft);
+    /* A hole anywhere in the cell reaches here as a NaN, and it is a miss for
+     * the same reason being off the grid is. */
+    if (std::isnan(blended))
+    {
+        return false;
+    }
+
+    value = blended;
+    return true;
 }
 
 }  // namespace boatforge

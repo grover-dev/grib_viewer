@@ -38,8 +38,12 @@ public:
     // a global grid that also makes the antimeridian interpolate correctly
     // rather than fall off the end.
     //
-    // Returns NaN outside coverage, or where the source had no data.
-    float sample(std::chrono::seconds when, double lat, double lon) const;
+    // False outside coverage, or where the source had no data; `value` is
+    // written only when it returns true. The miss is a return value rather than
+    // a NaN a caller has to remember to test for, so a sim that walks off the
+    // end of the field stops on the false instead of carrying a NaN through its
+    // state for the rest of the run.
+    bool sample(std::chrono::seconds when, double lat, double lon, float& value) const;
 
 private:
     // Dequantised value at a grid node. NaN where the source marked no data.

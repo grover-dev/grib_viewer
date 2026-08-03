@@ -105,6 +105,76 @@ def _spread(values, gap: float):
     return out
 
 
+def _place_end_labels(ax, entries) -> None:
+    """Lay the end labels out against the axis as it currently stands.
+
+    Their y positions are data coordinates, so they cannot be computed once and
+    left: hiding a run rescales the axis, and a label still sitting where a
+    range 28 orders of magnitude wider put it is both meaningless and, with
+    annotation_clip off, enough to overflow the text transform when drawn.
+    Re-placing on every rescale keeps them beside their lines.
+    """
+    visible = [e for e in entries if e[0].get_visible()]
+    if not visible:
+        return
+    lo, hi = ax.get_ylim()
+    x0, x1 = ax.get_xlim()
+    gap = (hi - lo) * 0.075
+    for (ann, x, y_true), y in zip(visible, _spread([e[2] for e in visible], gap)):
+        ann.xyann = (x + (x1 - x0) * 0.025, y)
+
+
+def _attach_toggles(fig, legend, runs: dict, end_labels=None) -> None:
+    """Click a legend entry, or a label at the end of a line, to hide that run.
+
+    `runs` maps a label to every artist belonging to it -- its line in each
+    panel, and the end labels with their leaders -- so one click takes the whole
+    run out of all panels at once and another brings it back.
+
+    The axes rescale to what is left visible, which is the point of hiding a
+    run: one series ranging orders of magnitude wider than the rest flattens
+    them all, and taking it out should let the others open up.
+
+    Only does anything in a window. Saved figures keep every run visible.
+    """
+    owner = {}  # artist -> run label
+    dimmable = {label: [] for label in runs}
+
+    for handle, text in zip(legend.legend_handles, legend.get_texts()):
+        label = text.get_text()
+        if label not in runs:
+            continue
+        handle.set_picker(8)  # a few pixels of slack around a thin line
+        text.set_picker(True)
+        owner[handle] = owner[text] = label
+        dimmable[label] += [handle, text]
+
+    for label, artists in runs.items():
+        for artist in artists:
+            if artist.get_gid() == "endlabel":
+                artist.set_picker(True)
+                owner[artist] = label
+
+    def on_pick(event):
+        label = owner.get(event.artist)
+        if label is None:
+            return
+        shown = not runs[label][0].get_visible()
+        for artist in runs[label]:
+            artist.set_visible(shown)
+        for artist in dimmable[label]:
+            artist.set_alpha(1.0 if shown else 0.25)
+        for ax in fig.axes:
+            ax.relim(visible_only=True)
+            ax.autoscale_view()
+            # After the rescale, not before: the labels are placed in data
+            # coordinates against the limits they end up with.
+            _place_end_labels(ax, (end_labels or {}).get(ax, ()))
+        fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect("pick_event", on_pick)
+
+
 def _style_axis(ax, title: str) -> None:
     ax.set_facecolor(SURFACE)
     ax.set_title(title, color=INK, fontsize=12, loc="left", pad=10)
@@ -155,6 +225,9 @@ def build_figure(plt, runs):
     )
 
     handles = []
+    # Every artist belonging to a run, so a click can take all of it out at once.
+    owned: dict[str, list] = {label: [] for label, _, _ in runs}
+    end_labels: dict = {}  # ax -> [(annotation, x, y_true)], re-placed on rescale
     for panel, (ax, name) in enumerate(zip(axes[:, 0], names)):
         _style_axis(ax, name)
         ends = []
@@ -167,6 +240,7 @@ def build_figure(plt, runs):
             color = SERIES[slot] if multi else TRACK
             line, = ax.plot(times, values, color=color, linewidth=2.0,
                             solid_capstyle="round", label=label)
+            owned[label].append(line)
             if panel == 0:
                 handles.append(line)
 
@@ -192,32 +266,37 @@ def build_figure(plt, runs):
         # a colour to a legend swatch. Only up to four -- past that the right
         # margin is a thicket and the legend has to carry it alone.
         if multi and len(runs) <= 4 and ends:
-            lo, hi = ax.get_ylim()
-            spread = _spread([y for _, y, _, _ in ends], (hi - lo) * 0.075)
-            x0, x1 = ax.get_xlim()
-            for (x, y_true, label, color), y in zip(ends, spread):
+            entries = []
+            for x, y_true, label, color in ends:
                 # Anchored to where the line actually ends, with a leader to
                 # wherever the label had to move: runs that finish together get
                 # fanned out, and without the leader the label would appear to
-                # claim a value its line never reached.
-                ax.annotate(
-                    label, xy=(x, y_true), xytext=(x + (x1 - x0) * 0.025, y),
+                # claim a value its line never reached. The text position is
+                # set by _place_end_labels, now and after every rescale.
+                end = ax.annotate(
+                    label, xy=(x, y_true), xytext=(x, y_true),
                     textcoords="data", ha="left", va="center",
                     color=color, fontsize=9, annotation_clip=False,
                     arrowprops=dict(arrowstyle="-", color=color, linewidth=0.8,
                                     shrinkA=0, shrinkB=2),
                 )
+                end.set_gid("endlabel")  # picked up by _attach_toggles
+                owned[label].append(end)
+                entries.append((end, x, y_true))
+            end_labels[ax] = entries
+            _place_end_labels(ax, entries)
 
     axes[-1, 0].set_xlabel("hours since departure", color=COAST, fontsize=10)
     fig.tight_layout()
     if multi:
         # A legend is present for every multi-run figure, direct labels or not.
-        fig.legend(
+        legend = fig.legend(
             handles=handles, loc="lower center", ncol=min(len(handles), 4),
             frameon=False, labelcolor=INK, fontsize=10,
         )
         # Room for the legend below and the end labels to the right.
         fig.subplots_adjust(bottom=0.06 + 0.30 / len(names), right=0.86)
+        _attach_toggles(fig, legend, owned, end_labels)
     return fig
 
 

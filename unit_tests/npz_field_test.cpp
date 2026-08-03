@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <string>
 
 #include <npy_tools/npy.h>
@@ -26,6 +27,15 @@ using namespace std::chrono_literals;
 using boatforge::NpyError;
 using boatforge::NpzField;
 using std::chrono::seconds;
+
+// NpzField::sample reports a miss through its return value and leaves the
+// output alone. Most of the suite is written against the value itself, so it
+// goes through this: a miss comes back as the NaN those tests test for.
+float sample(const NpzField& field, seconds when, double lat, double lon) {
+    constexpr float nan = std::numeric_limits<float>::quiet_NaN();
+    float value = nan;
+    return field.sample(when, lat, lon, value) ? value : nan;
+}
 
 std::filesystem::path fixture(const std::string& name) {
     return std::filesystem::path{BOATFORGE_FIXTURE_DIR} / name;
@@ -140,7 +150,7 @@ TEST(NpzFieldNodes, ExactAtEveryNodeOfTheRegionalGrid) {
         for (int64_t j = 0; j < ref.nlat; j += 7) {
             for (int64_t k = 0; k < ref.nlon; k += 7) {
                 const float got =
-                    field.sample(ref.time_at(i), ref.lat_at(j), ref.lon_at(k));
+                    sample(field, ref.time_at(i), ref.lat_at(j), ref.lon_at(k));
                 ASSERT_NEAR(got, ref.node(i, j, k), tol)
                     << "node (" << i << ", " << j << ", " << k << ")";
                 ++checked;
@@ -158,7 +168,7 @@ TEST(NpzFieldNodes, ExactAtTheCornersOfCoverage) {
     for (const int64_t i : {int64_t{0}, ref.nt - 1}) {
         for (const int64_t j : {int64_t{0}, ref.nlat - 1}) {
             for (const int64_t k : {int64_t{0}, ref.nlon - 1}) {
-                EXPECT_NEAR(field.sample(ref.time_at(i), ref.lat_at(j), ref.lon_at(k)),
+                EXPECT_NEAR(sample(field, ref.time_at(i), ref.lat_at(j), ref.lon_at(k)),
                             ref.node(i, j, k), tol)
                     << "corner (" << i << ", " << j << ", " << k << ")";
             }
@@ -177,7 +187,7 @@ TEST(NpzFieldInterpolation, MidpointInTimeIsTheMeanOfTheNeighbouringFrames) {
 
     for (int64_t i = 0; i + 1 < ref.nt; ++i) {
         const seconds half{ref.t0 + i * ref.dt + ref.dt / 2};
-        EXPECT_NEAR(field.sample(half, ref.lat_at(j), ref.lon_at(k)),
+        EXPECT_NEAR(sample(field, half, ref.lat_at(j), ref.lon_at(k)),
                     0.5 * (ref.node(i, j, k) + ref.node(i + 1, j, k)),
                     tolerance(ref))
             << "between frames " << i << " and " << i + 1;
@@ -194,7 +204,7 @@ TEST(NpzFieldInterpolation, MidpointInSpaceIsTheMeanOfTheFourSurroundingNodes) {
             const double expected =
                 0.25 * (ref.node(i, j, k) + ref.node(i, j, k + 1) +
                         ref.node(i, j + 1, k) + ref.node(i, j + 1, k + 1));
-            EXPECT_NEAR(field.sample(ref.time_at(i),
+            EXPECT_NEAR(sample(field, ref.time_at(i),
                                      ref.lat_at(j) + ref.dlat / 2,
                                      ref.lon_at(k) + ref.dlon / 2),
                         expected, tolerance(ref))
@@ -213,10 +223,10 @@ TEST(NpzFieldInterpolation, IsMonotoneBetweenTwoNodes) {
     const double lo = ref.node(i, j, k), hi = ref.node(i, j, k + 1);
     ASSERT_NE(lo, hi) << "picked a flat cell; the test would be vacuous";
 
-    float previous = field.sample(ref.time_at(i), ref.lat_at(j), ref.lon_at(k));
+    float previous = sample(field, ref.time_at(i), ref.lat_at(j), ref.lon_at(k));
     for (int step = 1; step <= 10; ++step) {
         const double f = step / 10.0;
-        const float got = field.sample(ref.time_at(i), ref.lat_at(j),
+        const float got = sample(field, ref.time_at(i), ref.lat_at(j),
                                        ref.lon_at(k) + f * ref.dlon);
         EXPECT_NEAR(got, lo + (hi - lo) * f, tolerance(ref)) << "at f=" << f;
         if (hi > lo) {
@@ -238,10 +248,25 @@ TEST(NpzFieldBounds, OutsideTheTimeAxisIsNaN) {
     const NpzField field = NpzField::load(fixture("region_u16.npz"));
     const seconds last{ref.t0 + (ref.nt - 1) * ref.dt};
 
-    EXPECT_TRUE(std::isnan(field.sample(seconds{ref.t0} - 1s, ref.mid_lat(), ref.mid_lon())));
-    EXPECT_TRUE(std::isnan(field.sample(last + 1s, ref.mid_lat(), ref.mid_lon())));
-    EXPECT_FALSE(std::isnan(field.sample(seconds{ref.t0}, ref.mid_lat(), ref.mid_lon())));
-    EXPECT_FALSE(std::isnan(field.sample(last, ref.mid_lat(), ref.mid_lon())));
+    EXPECT_TRUE(std::isnan(sample(field, seconds{ref.t0} - 1s, ref.mid_lat(), ref.mid_lon())));
+    EXPECT_TRUE(std::isnan(sample(field, last + 1s, ref.mid_lat(), ref.mid_lon())));
+    EXPECT_FALSE(std::isnan(sample(field, seconds{ref.t0}, ref.mid_lat(), ref.mid_lon())));
+    EXPECT_FALSE(std::isnan(sample(field, last, ref.mid_lat(), ref.mid_lon())));
+}
+
+// The rest of the bounds tests read the miss through the helper above; this one
+// pins the contract the sim relies on -- false, and `value` untouched, so a
+// caller that ignores the flag cannot pick up a stale sample and call it data.
+TEST(NpzFieldBounds, AMissReturnsFalseAndLeavesTheOutputAlone) {
+    const Reference ref{"region_u16.npz"};
+    const NpzField field = NpzField::load(fixture("region_u16.npz"));
+
+    float value = -1.0f;
+    EXPECT_FALSE(field.sample(seconds{ref.t0} - 1s, ref.mid_lat(), ref.mid_lon(), value));
+    EXPECT_FLOAT_EQ(value, -1.0f);
+
+    EXPECT_TRUE(field.sample(ref.mid_time(), ref.mid_lat(), ref.mid_lon(), value));
+    EXPECT_FALSE(std::isnan(value));
 }
 
 TEST(NpzFieldBounds, OutsideTheLatitudeAxisIsNaN) {
@@ -249,10 +274,10 @@ TEST(NpzFieldBounds, OutsideTheLatitudeAxisIsNaN) {
     const NpzField field = NpzField::load(fixture("region_u16.npz"));
     const double north = ref.lat_at(ref.nlat - 1);
 
-    EXPECT_TRUE(std::isnan(field.sample(ref.mid_time(), ref.lat0 - 0.01, ref.mid_lon())));
-    EXPECT_TRUE(std::isnan(field.sample(ref.mid_time(), north + 0.01, ref.mid_lon())));
-    EXPECT_FALSE(std::isnan(field.sample(ref.mid_time(), ref.lat0, ref.mid_lon())));
-    EXPECT_FALSE(std::isnan(field.sample(ref.mid_time(), north, ref.mid_lon())));
+    EXPECT_TRUE(std::isnan(sample(field, ref.mid_time(), ref.lat0 - 0.01, ref.mid_lon())));
+    EXPECT_TRUE(std::isnan(sample(field, ref.mid_time(), north + 0.01, ref.mid_lon())));
+    EXPECT_FALSE(std::isnan(sample(field, ref.mid_time(), ref.lat0, ref.mid_lon())));
+    EXPECT_FALSE(std::isnan(sample(field, ref.mid_time(), north, ref.mid_lon())));
 }
 
 TEST(NpzFieldBounds, OutsideTheLongitudeAxisIsNaNWhenTheGridDoesNotWrap) {
@@ -261,12 +286,12 @@ TEST(NpzFieldBounds, OutsideTheLongitudeAxisIsNaNWhenTheGridDoesNotWrap) {
     const NpzField field = NpzField::load(fixture("region_u16.npz"));
     const double east = ref.lon_at(ref.nlon - 1);
 
-    EXPECT_TRUE(std::isnan(field.sample(ref.mid_time(), ref.mid_lat(), ref.lon0 - 0.01)));
-    EXPECT_TRUE(std::isnan(field.sample(ref.mid_time(), ref.mid_lat(), east + 0.01)));
+    EXPECT_TRUE(std::isnan(sample(field, ref.mid_time(), ref.mid_lat(), ref.lon0 - 0.01)));
+    EXPECT_TRUE(std::isnan(sample(field, ref.mid_time(), ref.mid_lat(), east + 0.01)));
     // The far side of the planet is off this grid too, not wrapped onto it.
-    EXPECT_TRUE(std::isnan(field.sample(ref.mid_time(), ref.mid_lat(), ref.lon0 + 180.0)));
-    EXPECT_FALSE(std::isnan(field.sample(ref.mid_time(), ref.mid_lat(), ref.lon0)));
-    EXPECT_FALSE(std::isnan(field.sample(ref.mid_time(), ref.mid_lat(), east)));
+    EXPECT_TRUE(std::isnan(sample(field, ref.mid_time(), ref.mid_lat(), ref.lon0 + 180.0)));
+    EXPECT_FALSE(std::isnan(sample(field, ref.mid_time(), ref.mid_lat(), ref.lon0)));
+    EXPECT_FALSE(std::isnan(sample(field, ref.mid_time(), ref.mid_lat(), east)));
 }
 
 TEST(NpzFieldBounds, NaNQueriesAreNaN) {
@@ -274,8 +299,8 @@ TEST(NpzFieldBounds, NaNQueriesAreNaN) {
     const NpzField field = NpzField::load(fixture("region_u16.npz"));
     const double nan = std::nan("");
 
-    EXPECT_TRUE(std::isnan(field.sample(ref.mid_time(), nan, ref.mid_lon())));
-    EXPECT_TRUE(std::isnan(field.sample(ref.mid_time(), ref.mid_lat(), nan)));
+    EXPECT_TRUE(std::isnan(sample(field, ref.mid_time(), nan, ref.mid_lon())));
+    EXPECT_TRUE(std::isnan(sample(field, ref.mid_time(), ref.mid_lat(), nan)));
 }
 
 // --------------------------------------------------------------------------
@@ -291,11 +316,11 @@ TEST(NpzFieldLongitude, AnyFrameOfReferenceGivesTheSameSample) {
 
         for (int64_t k = 0; k + 1 < ref.nlon; k += 11) {
             const double lon = ref.lon_at(k) + 0.3 * ref.dlon;
-            const float base = field.sample(ref.mid_time(), ref.mid_lat(), lon);
+            const float base = sample(field, ref.mid_time(), ref.mid_lat(), lon);
             ASSERT_FALSE(std::isnan(base)) << "lon " << lon;
             for (const double turns : {-720.0, -360.0, 360.0, 720.0}) {
                 EXPECT_FLOAT_EQ(
-                    field.sample(ref.mid_time(), ref.mid_lat(), lon + turns), base)
+                    sample(field, ref.mid_time(), ref.mid_lat(), lon + turns), base)
                     << "lon " << lon << " shifted by " << turns;
             }
         }
@@ -314,12 +339,12 @@ TEST(NpzFieldLongitude, GlobalGridBlendsAcrossTheAntimeridian) {
     const double hi = ref.node(i, j, 0);            // which is its eastern neighbour
 
     for (const double f : {0.0, 0.25, 0.5, 0.75}) {
-        EXPECT_NEAR(field.sample(ref.time_at(i), ref.lat_at(j), west + f * ref.dlon),
+        EXPECT_NEAR(sample(field, ref.time_at(i), ref.lat_at(j), west + f * ref.dlon),
                     lo + (hi - lo) * f, tolerance(ref))
             << "fraction " << f << " across the seam";
     }
     // Stepping a full cell past the last column arrives back at the first one.
-    EXPECT_NEAR(field.sample(ref.time_at(i), ref.lat_at(j), west + ref.dlon),
+    EXPECT_NEAR(sample(field, ref.time_at(i), ref.lat_at(j), west + ref.dlon),
                 hi, tolerance(ref));
 }
 
@@ -328,7 +353,7 @@ TEST(NpzFieldLongitude, GlobalGridHasNoUnreachableLongitude) {
     const NpzField field = NpzField::load(fixture("global_u16.npz"));
 
     for (double lon = -180.0; lon < 180.0; lon += 0.5) {
-        EXPECT_FALSE(std::isnan(field.sample(ref.mid_time(), 0.0, lon)))
+        EXPECT_FALSE(std::isnan(sample(field, ref.mid_time(), 0.0, lon)))
             << "lon " << lon;
     }
 }
@@ -337,10 +362,10 @@ TEST(NpzFieldLongitude, PolesAreInsideCoverageButBeyondThemIsNot) {
     const Reference ref{"global_u16.npz"};
     const NpzField field = NpzField::load(fixture("global_u16.npz"));
 
-    EXPECT_FALSE(std::isnan(field.sample(ref.mid_time(), -90.0, 0.0)));
-    EXPECT_FALSE(std::isnan(field.sample(ref.mid_time(), 90.0, 0.0)));
-    EXPECT_TRUE(std::isnan(field.sample(ref.mid_time(), -90.001, 0.0)));
-    EXPECT_TRUE(std::isnan(field.sample(ref.mid_time(), 90.001, 0.0)));
+    EXPECT_FALSE(std::isnan(sample(field, ref.mid_time(), -90.0, 0.0)));
+    EXPECT_FALSE(std::isnan(sample(field, ref.mid_time(), 90.0, 0.0)));
+    EXPECT_TRUE(std::isnan(sample(field, ref.mid_time(), -90.001, 0.0)));
+    EXPECT_TRUE(std::isnan(sample(field, ref.mid_time(), 90.001, 0.0)));
 }
 
 // --------------------------------------------------------------------------
@@ -367,8 +392,8 @@ TEST(NpzFieldDtype, QuantisedAgreesWithFloat32OverTheSameWindow) {
             for (int64_t k = 0; k < exact.nlon; k += 5) {
                 const seconds t = exact.time_at(i);
                 const double lat = exact.lat_at(j), lon = exact.lon_at(k);
-                const double got = a.sample(t, lat, lon);
-                const double want = b.sample(t, lat, lon);
+                const double got = sample(a, t, lat, lon);
+                const double want = sample(b, t, lat, lon);
                 worst = std::max(worst, std::abs(got - want));
                 peak = std::max(peak, want);
             }
@@ -400,8 +425,8 @@ TEST(NpzFieldDtype, DequantisesFieldsThatTakeBothSigns) {
             for (int64_t k = 0; k < exact.nlon; k += 3) {
                 const seconds t = exact.time_at(i);
                 const double lat = exact.lat_at(j), lon = exact.lon_at(k);
-                const double want = b.sample(t, lat, lon);
-                worst = std::max(worst, std::abs(a.sample(t, lat, lon) - want));
+                const double want = sample(b, t, lat, lon);
+                worst = std::max(worst, std::abs(sample(a, t, lat, lon) - want));
                 lowest = std::min(lowest, want);
                 highest = std::max(highest, want);
             }
@@ -418,7 +443,7 @@ TEST(NpzFieldDtype, Float32PathReturnsStoredValuesVerbatim) {
 
     for (int64_t j = 0; j < ref.nlat; j += 9) {
         for (int64_t k = 0; k < ref.nlon; k += 9) {
-            EXPECT_FLOAT_EQ(field.sample(ref.time_at(1), ref.lat_at(j), ref.lon_at(k)),
+            EXPECT_FLOAT_EQ(sample(field, ref.time_at(1), ref.lat_at(j), ref.lon_at(k)),
                             static_cast<float>(ref.node(1, j, k)));
         }
     }
@@ -436,7 +461,7 @@ TEST(SolarPhysics, IrradianceIsNonNegativeAndBelowTheSolarConstant) {
     for (int64_t i = 0; i < ref.nt; ++i) {
         for (int64_t j = 0; j < ref.nlat; ++j) {
             for (int64_t k = 0; k < ref.nlon; ++k) {
-                const float w = field.sample(ref.time_at(i), ref.lat_at(j), ref.lon_at(k));
+                const float w = sample(field, ref.time_at(i), ref.lat_at(j), ref.lon_at(k));
                 ASSERT_FALSE(std::isnan(w)) << "hole at (" << i << "," << j << "," << k << ")";
                 ASSERT_GE(w, 0.0f);
                 // Surface downward short-wave cannot exceed what arrives at the
@@ -458,8 +483,8 @@ TEST(SolarPhysics, JanuaryPolarNightIsDarkAndAntarcticSummerIsNot) {
     double arctic = 0.0, antarctic = 0.0;
     for (int64_t i = 0; i < ref.nt; ++i) {
         for (double lon = -180.0; lon < 180.0; lon += 10.0) {
-            arctic = std::max<double>(arctic, field.sample(ref.time_at(i), 85.0, lon));
-            antarctic = std::max<double>(antarctic, field.sample(ref.time_at(i), -85.0, lon));
+            arctic = std::max<double>(arctic, sample(field, ref.time_at(i), 85.0, lon));
+            antarctic = std::max<double>(antarctic, sample(field, ref.time_at(i), -85.0, lon));
         }
     }
     EXPECT_LT(arctic, 1.0) << "the Arctic is lit in January";
@@ -483,7 +508,7 @@ TEST(SolarPhysics, DaylightPeaksNearLocalNoon) {
     double best_hour = 0.0, best = -1.0;
     const int64_t span = (ref.nt - 1) * ref.dt;
     for (int64_t offset = 0; offset <= span; offset += 300) {
-        const double w = field.sample(seconds{ref.t0 + offset}, lat, lon);
+        const double w = sample(field, seconds{ref.t0 + offset}, lat, lon);
         ASSERT_FALSE(std::isnan(w));
         if (w > best) {
             best = w;
@@ -526,9 +551,9 @@ TEST(SolarPhysics, NightIsDarkAndDayIsNot) {
         return ref.time_at(best);
     };
 
-    EXPECT_LT(field.sample(frame_nearest_local_hour(0.0), lat, lon), 1.0)
+    EXPECT_LT(sample(field, frame_nearest_local_hour(0.0), lat, lon), 1.0)
         << "local midnight is not dark";
-    EXPECT_GT(field.sample(frame_nearest_local_hour(12.0), lat, lon), 50.0)
+    EXPECT_GT(sample(field, frame_nearest_local_hour(12.0), lat, lon), 50.0)
         << "local noon is not lit";
 }
 
