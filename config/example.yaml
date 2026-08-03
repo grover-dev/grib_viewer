@@ -1,0 +1,45 @@
+# A boatforge invocation: one output directory, and the runs that fill it.
+# Every key maps onto a member of Sim::config_t / Sim::run_t.
+#
+#   boatforge config/example.yaml
+#
+# Relative paths (out_directory, solar_field) resolve against this file's
+# directory, so a config travels with the data it names.
+
+out_directory: ../out
+
+# Applied to every run below. A run repeating one of these keys overrides it
+# for itself, so a sweep only has to write the field that varies -- which for a
+# start-day sweep is start_time, and nothing else.
+defaults:
+  # Gridded solar field, as written by scripts/grib_npz.py. Runs naming the
+  # same file share a single load.
+  solar_field: ../data/ssrd_global_20250101_10.npz
+
+  # Degrees, WGS84. Roughly off the coast of spain...
+  start: {lat: 40.0, lon: -13.0}
+  # ...to further off the coast of spain.
+  end: {lat: 36.0, lon: -22.0}
+
+  # Steps of blackboard::time_step (1 h) before a run gives up.
+  max_steps: 100
+
+# Each run is written to <out_directory>/<name>.npz, so the names have to be
+# distinct -- the loader refuses a config where two runs would collide. Omit
+# `name` and it is filled in from the run's position (run_00, run_01, ...).
+runs:
+  # Departure, UTC. Either an ISO stamp as here, or plain seconds since the
+  # Unix epoch (1735776000 + 12h is the same instant as the first).
+  - name: jan02
+    start_time: 2025-01-02T12:00:00Z
+
+  - name: jan03
+    start_time: 2025-01-03T12:00:00Z
+
+  - name: jan04
+    start_time: 2025-01-04T12:00:00Z
+
+  # Overriding a default: same departure as jan02, different destination.
+  - name: jan02_south
+    start_time: 2025-01-02T12:00:00Z
+    end: {lat: 34.0, lon: -20.0}

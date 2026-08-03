@@ -63,44 +63,44 @@ inline double great_circle_distance_m(double lat1, double lon1, double lat2, dou
 struct blackboard
 {
     // FIXME: easier to treat as chrono time? tbd, will need to convert to UTC for look ups at somepoint
-    std::chrono::seconds time;
+    std::chrono::seconds time{};
     const std::chrono::seconds time_step = std::chrono::hours(1);
 
     /* Solver may eventually run way points, for now this will be hard coded at init time */
-    double end_lat;
-    double end_lon;
+    double end_lat{};
+    double end_lon{};
     /* Meters, great-circle, refreshed each Solver::step() */
-    double distance_to_end;
+    double distance_to_end{};
 
     /* Degrees, WGS84. current_lon is normalized to [-180, 180) after every step */
-    double current_lat;
-    double current_lon;
+    double current_lat{};
+    double current_lon{};
     double total_traversed_distance = 0.0;
 
     /* Boat outputs, headings in degrees clockwise from true north, velocity in m/s */
-    double powered_heading;
-    double powered_velocity;
+    double powered_heading{};
+    double powered_velocity{};
 
     /* Combined effect from wind, current, etc... */
-    double environment_heading;
-    double environment_velocity;
+    double environment_heading{};
+    double environment_velocity{};
 
     /* This creates our vector */
-    double combined_heading;
-    double combined_velocity;
+    double combined_heading{};
+    double combined_velocity{};
 
     // FIXME: This will eventually be fed by a configuration
     const float surface_area_m = 5.0f;
-    float solar_power_in_w;
+    float solar_power_in_w{};
 
     /* FIXME: assuming 1 hour steps? tbd... */
     float power_stored_wh = 1000.0;  // FIXME: <- Include a starting value...
 
-    float applied_motor_power_out_w;
-    float avionics_power_out_w;  // <- estimation based on state, this will be used with load shed algorithms, tbd
+    float applied_motor_power_out_w{};
+    float avionics_power_out_w{};  // <- estimation based on state, this will be used with load shed algorithms, tbd
     // FIXME: power out?
-    uint32_t steps;
-    std::chrono::seconds total_time;
+    uint32_t steps{};
+    std::chrono::seconds total_time{};
 };
 
 /**

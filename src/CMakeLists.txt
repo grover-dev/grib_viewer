@@ -6,5 +6,5 @@ add_executable(boatforge
 )
 
 target_link_libraries(boatforge
-    PRIVATE boatforge::headers npy_tools::npy_tools boatforge::options
+    PRIVATE boatforge::headers npy_tools::npy_tools boatforge::options yaml-cpp::yaml-cpp
 )
