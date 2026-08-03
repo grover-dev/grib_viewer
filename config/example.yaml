@@ -16,13 +16,13 @@ defaults:
   # same file share a single load.
   solar_field: ../data/ssrd_global_20250101_10.npz
 
-  # Degrees, WGS84. Roughly off the coast of spain...
-  start: {lat: 40.0, lon: -13.0}
+  # Degrees, WGS84. Approximately LA
+  start: { lat: 33.5, lon: -120.0 }
   # ...to further off the coast of spain.
-  end: {lat: 36.0, lon: -22.0}
+  end: { lat: 19, 0, lon: -154.0 }
 
   # Steps of blackboard::time_step (1 h) before a run gives up.
-  max_steps: 100
+  max_steps: 1000
 
 # Each run is written to <out_directory>/<name>.npz, so the names have to be
 # distinct -- the loader refuses a config where two runs would collide. Omit
@@ -56,6 +56,6 @@ runs:
     start_time: 2025-01-08T12:00:00Z
 
   # Overriding a default: same departure as jan02, different destination.
-  - name: jan02_south
-    start_time: 2025-01-02T12:00:00Z
-    end: {lat: 34.0, lon: -20.0}
+  # - name: jan02_south
+  #   start_time: 2025-01-02T12:00:00Z
+  #   end: {lat: 34.0, lon: -20.0}

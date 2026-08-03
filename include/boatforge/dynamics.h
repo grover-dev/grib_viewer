@@ -100,6 +100,7 @@ struct blackboard
     float solar_power_in_w{};
 
     /* FIXME: assuming 1 hour steps? tbd... */
+    const float max_power_storage_wh = 2000.0f;
     float power_stored_wh = 1000.0;  // FIXME: <- Include a starting value...
 
     float applied_motor_power_out_w{};
@@ -204,6 +205,11 @@ public:
          * into account */
         bb_.solar_power_in_w = bb_.surface_area_m * bb_.solar_power_in_w;
         bb_.power_stored_wh += (bb_.solar_power_in_w) - (bb_.applied_motor_power_out_w + bb_.avionics_power_out_w);
+
+        if (bb_.power_stored_wh >= bb_.max_power_storage_wh)
+        {
+            bb_.power_stored_wh = bb_.max_power_storage_wh;
+        }
     }
 
 private:
