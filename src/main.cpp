@@ -1,21 +1,21 @@
 #include <cstddef>
+#include <cstdio>
 #include <exception>
 #include <filesystem>
 #include <print>
 #include <string>
 
+#include <boatforge/dynamics.h>
 #include <boatforge/sim.h>
 
 int main(int argc, char** argv)
 {
-    /**
-     * How to start?
-     * - Map has been created, lets architect the iteration loop
-     *   - Will probably need to optimize, problem for later
-     *
-     *
-     *
-     */
+    if (argc < 3)
+    {
+        std::printf("Need at least 3 arguments");
+        return 1;
+    }
+    // FIXME: change this to take in larger blocks of data
     const std::string path = argc > 1 ? argv[1] : "input.npz";
 
     std::println("boatforge — reading {}", path);
@@ -30,8 +30,11 @@ int main(int argc, char** argv)
     end.lat = 36.0;
     end.lon = -22.0;
 
-    const std::string out_path = argc > 2 ? argv[2] : "track.npz";
-    Sim simulator(std::chrono::seconds(1735776000), start, end, path, out_path);
+    auto solar_field = boatforge::NpzField::load(path);
+
+    const std::string out_directory = argv[2];
+
+    Sim simulator(std::chrono::seconds(1735776000) + std::chrono::hours(12), start, end, solar_field, out_directory);
 
     while (simulator.step())
     {

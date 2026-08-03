@@ -54,7 +54,9 @@ Options:
     --track-scale {unit,normalized}   the default for channels with no suffix:
                       0..1, or the channel's own range -- raw channels need
                       the latter or they clamp to a single colour
-    --track-plot      plot the chosen channels against time, one panel each
+    --track-plot      plot the chosen channels against time, one panel each,
+                      in a window of its own -- plot_track.py does the same
+                      thing on its own, without needing the globe at all
     --coastlines {10m,50m,110m,none}   coastline detail (default 50m)
     --graticule DEG   meridian/parallel spacing, 0 to disable (default 15)
     --view LAT LON    camera target (default: centre of the map's bbox)
@@ -80,7 +82,6 @@ Controls
 from __future__ import annotations
 
 import argparse
-import multiprocessing
 import time
 from pathlib import Path
 
@@ -90,17 +91,24 @@ from h3.api import basic_int as h3
 from matplotlib.colors import LinearSegmentedColormap
 
 from map_utils import NavMap, lonlat_to_xyz, xyz_to_lonlat
+# The chart palette and the track-plot machinery live in plot_track, which knows
+# nothing about PyVista -- so a run can be plotted without the globe.
+from plot_track import (
+    COAST,
+    GRATICULE,
+    INK,
+    SURFACE,
+    TRACK,
+    channel_names,
+    load_track,
+    plot_channels,
+)
 
 # Palette: one sequential blue hue for magnitude, neutrals for everything that is
 # not data. Checked pairwise in OKLab under normal vision and simulated
 # protan/deutan/tritan -- worst pair 17.0 normal, 15.8 CVD.
-SURFACE = "#0d0d0d"
 LAND = "#262623"
 EXCLUDED = "#898781"
-COAST = "#c3c2b7"
-GRATICULE = "#2c2c2a"
-TRACK = "#eb6834"  # the one warm accent, reserved for the boat
-INK = "#ffffff"
 
 # blue steps 400 -> 100: low margin is deepest, open ocean palest
 MARGIN_CMAP = LinearSegmentedColormap.from_list(
@@ -487,124 +495,6 @@ def camera_distance(bbox) -> float:
         return 4.6
     lat0, lon0, lat1, lon1 = bbox
     return 2.6 + 2.0 * min(max(lat1 - lat0, lon1 - lon0), 180.0) / 180.0
-
-
-def load_track(path: str) -> dict[str, np.ndarray]:
-    """A track written by demo_run.py, or anything with the same keys.
-
-    `lat`, `lng` and `time` are required. Every other 1-D array of the same
-    length is offered as a plottable scalar, so a new channel is a new key.
-    """
-    z = np.load(path)
-    track = {k: z[k] for k in z.files}
-    missing = {"lat", "lng", "time"} - set(track)
-    if missing:
-        raise SystemExit(f"{path}: track is missing {sorted(missing)}")
-    return track
-
-
-def _build_channel_figure(plt, times, channels: dict):
-    """The figure itself, given a live pyplot. Shared by the window and the file.
-
-    Several channels become stacked panels sharing the time axis, never two
-    scales on one pair of axes: watts and kilometres on a shared y is a
-    comparison the reader cannot make, and a shared x is the one that matters
-    here. Each panel is a single series, so its title names it and no legend is
-    needed, and only the two extremes carry a value -- a number on every point
-    is unreadable at a hundred-odd samples, and the ends are exactly what the
-    scalar bar is stretched over.
-    """
-    times = np.asarray(times, dtype=float)
-    span = float(times[-1] - times[0]) or 1.0
-
-    fig, axes = plt.subplots(
-        len(channels), 1, sharex=True, squeeze=False,
-        figsize=(9.0, 1.0 + 2.4 * len(channels)), facecolor=SURFACE,
-    )
-    for ax, (label, values) in zip(axes[:, 0], channels.items()):
-        values = np.asarray(values, dtype=float)
-        ax.set_facecolor(SURFACE)
-        ax.plot(times, values, color=TRACK, linewidth=2.0, solid_capstyle="round")
-
-        for i, above in ((int(np.argmin(values)), False),
-                         (int(np.argmax(values)), True)):
-            # An extreme often falls on the first or last sample, where a
-            # centred label overhangs the axis; anchor it inward there instead.
-            edge = (times[i] - times[0]) / span
-            ha = "left" if edge < 0.05 else "right" if edge > 0.95 else "center"
-            ax.plot(times[i], values[i], "o", color=TRACK, markersize=6)
-            ax.annotate(
-                f"{values[i]:.4g}", (times[i], values[i]),
-                textcoords="offset points", xytext=(0, 10 if above else -16),
-                ha=ha, color=INK, fontsize=9,
-            )
-
-        ax.set_title(label, color=INK, fontsize=12, loc="left", pad=10)
-        # Recessive frame: horizontal rules only, and no box around the data.
-        ax.grid(True, axis="y", color=GRATICULE, linewidth=0.8)
-        ax.set_axisbelow(True)
-        for side in ("top", "right"):
-            ax.spines[side].set_visible(False)
-        for side in ("bottom", "left"):
-            ax.spines[side].set_color(GRATICULE)
-        ax.tick_params(colors=COAST, labelsize=9)
-        # Vertical breathing room so a label under a minimum sitting on the
-        # floor does not land on the axis tick beneath it.
-        ax.margins(x=0.01, y=0.16)
-
-    axes[-1, 0].set_xlabel("hours since departure", color=COAST, fontsize=10)
-    fig.tight_layout()
-    return fig
-
-
-def _channel_plot_worker(times, channels: dict) -> None:
-    """Entry point for the plot subprocess: draw, then run matplotlib's loop."""
-    import matplotlib.pyplot as plt
-
-    _build_channel_figure(plt, times, channels)
-    plt.show()
-
-
-def plot_channels(times, channels: dict, path: str | None = None):
-    """Track channels against time, in the globe's palette.
-
-    The colour map answers "high or low here"; this answers "what shape over the
-    passage", which no amount of shading on a course that doubles back on itself
-    can show.
-
-    With a `path` the figure is written and nothing is opened. Without one it
-    goes to a *separate process*, and that is not incidental: matplotlib's Qt
-    backend and VTK's interactor are two GUI event loops, and only one of them
-    can own this thread. Drawn in-process the window appears and then sits there
-    dead -- the window manager eventually offers to kill it -- because VTK is
-    running the loop and nothing is dispatching Qt's events. A child process has
-    a loop of its own, so both windows stay live.
-
-    Returns the child process, or None once written to `path`.
-    """
-    if path is not None:
-        import matplotlib
-
-        matplotlib.use("Agg")  # --save/--record is headless; there is no window
-        import matplotlib.pyplot as plt
-
-        fig = _build_channel_figure(plt, times, channels)
-        fig.savefig(path, dpi=140, facecolor=SURFACE)
-        plt.close(fig)
-        print(f"wrote {path}")
-        return None
-
-    # spawn, not fork: a forked child inherits this process's VTK and Qt state
-    # mid-flight, which is its own source of hangs. Not a daemon, so the plot
-    # outlives the globe and the run ends when both windows are closed.
-    ctx = multiprocessing.get_context("spawn")
-    proc = ctx.Process(
-        target=_channel_plot_worker,
-        args=(np.asarray(times, dtype=float),
-              {k: np.asarray(v, dtype=float) for k, v in channels.items()}),
-    )
-    proc.start()
-    return proc
 
 
 # --------------------------------------------------------------------------
@@ -1186,7 +1076,7 @@ def main() -> None:
         # Centre on the course, not the bbox: the bbox centre is often over water
         # the (K, W) rules excluded, which points the camera at nothing.
         target = (float(np.mean(lat)), float(np.mean(lng)))
-        available = [k for k, v in tr.items() if getattr(v, "shape", None) == lat.shape]
+        available = channel_names(tr)
         print(f"track: {len(lat)} points over {hours[-1]:.1f} h, channels {available}")
 
         # Keep the order asked for, drop what the file does not have, and say

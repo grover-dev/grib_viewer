@@ -59,6 +59,7 @@ inline double great_circle_distance_m(double lat1, double lon1, double lat2, dou
 // FIXME: Each environment model changes different parts of the sim...
 // - how to structure...
 // FIXME: Think about how to composite this properly (how horizon was meant to work)
+// FIXME: load off of yaml instead of recompiling shit
 struct blackboard
 {
     // FIXME: easier to treat as chrono time? tbd, will need to convert to UTC for look ups at somepoint
@@ -93,7 +94,7 @@ struct blackboard
     float solar_power_in_w;
 
     /* FIXME: assuming 1 hour steps? tbd... */
-    float power_stored_wh;  // FIXME: <- Include a starting value...
+    float power_stored_wh = 1000.0;  // FIXME: <- Include a starting value...
 
     float applied_motor_power_out_w;
     float avionics_power_out_w;  // <- estimation based on state, this will be used with load shed algorithms, tbd
@@ -113,8 +114,7 @@ class SolarIsolationField  // TODO: Generalize to environment models
 {
 public:
     // FIXME: This will need to load and sample data...
-    SolarIsolationField(blackboard& bb, const std::filesystem::path& path)
-        : bb_(bb), field_(boatforge::NpzField::load(path))
+    SolarIsolationField(blackboard& bb, boatforge::NpzField& field) : bb_(bb), field_(field)
     {
     }
 
@@ -126,7 +126,7 @@ public:
 
 private:
     blackboard& bb_;
-    boatforge::NpzField field_;
+    boatforge::NpzField& field_;
 };
 
 class EnvironmentField

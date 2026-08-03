@@ -4,18 +4,19 @@
 #include <npy_tools/npz_recorder.h>
 #include <filesystem>
 
+#include <npy_tools/npz_field.h>
 class Sim
 {
 public:
+    // FIXME: move this into the blackboard def eventuall,y no need for special structs
     struct lat_lon
     {
         double lat;
         double lon;
     };
-    // FIXME: add start lat/lon, end lat/lon
-    Sim(const std::chrono::seconds start_time, const lat_lon start, const lat_lon end,
-        const std::filesystem::path& path, std::filesystem::path output_path)
-        : solar_field_(blackboard_, path),
+    Sim(const std::chrono::seconds start_time, const lat_lon start, const lat_lon end, boatforge::NpzField& solar_field,
+        std::filesystem::path output_path)
+        : solar_field_(blackboard_, solar_field),
           solver_(blackboard_),
           boat_(blackboard_),
           world_(blackboard_),
@@ -32,6 +33,10 @@ public:
         sample();
     }
 
+    // TODO:
+    // - run multi start day sims, track duration + energy, minimize for duration and off time
+    // - stick to waypointed great circle distance for now, eentually move to something more intelligent
+    //   - as a basic option can hand plot a few routes, then check their performance. avoid a lot of unnecessary search
     bool step()
     {
         solar_field_.sample();
@@ -50,8 +55,10 @@ public:
         return count_ > 0;  // FIXME: For now only do a fixed number of steps
     }
 
+    // FIXME: move to destructor
     void end()
     {
+        // FIXME: rework the recorder to take in a  data dict eventually
         recorder_.save(output_path_);
     }
 
@@ -65,6 +72,7 @@ private:
      * epoch value looks like there). */
     void sample()
     {
+        // FIXME: find a way to make blackboard auto add these... tbd
         recorder_.record("lat", blackboard_.current_lat);
         recorder_.record("lng", blackboard_.current_lon);
         recorder_.record("time",
