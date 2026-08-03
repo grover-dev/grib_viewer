@@ -89,7 +89,7 @@ struct blackboard
     double combined_velocity;
 
     // FIXME: This will eventually be fed by a configuration
-    const float surface_area_m = 1.0f;
+    const float surface_area_m = 5.0f;
     float solar_power_in_w;
 
     /* FIXME: assuming 1 hour steps? tbd... */
@@ -182,8 +182,8 @@ public:
     {
         /* May need to split this out into its own class to run before the solver, solver will eventually take power
          * into account */
-        bb_.power_stored_wh =
-            (bb_.surface_area_m * bb_.solar_power_in_w) - (bb_.applied_motor_power_out_w + bb_.avionics_power_out_w);
+        bb_.solar_power_in_w = bb_.surface_area_m * bb_.solar_power_in_w;
+        bb_.power_stored_wh += (bb_.solar_power_in_w) - (bb_.applied_motor_power_out_w + bb_.avionics_power_out_w);
     }
 
 private:

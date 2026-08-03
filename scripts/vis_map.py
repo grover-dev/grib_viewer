@@ -233,7 +233,8 @@ class TrackLayer(TimeLayer):
     name = "track"
 
     def __init__(self, plotter, lat, lng, times, values=None, cmap=None,
-                 color=TRACK, width=5.0, boat_size=13.0, radius=None, clim=None):
+                 color=TRACK, width=5.0, boat_size=13.0, radius=None, clim=None,
+                 scalar_bar=False, label=None):
         self.plotter = plotter
         self.times = np.asarray(times, dtype=float)
         self.pts = lonlat_to_xyz(lat, lng, radius or RADII["track"])
@@ -246,13 +247,31 @@ class TrackLayer(TimeLayer):
         self.mesh.verts = np.empty(0, dtype=np.int64)
         self.mesh.lines = np.empty(0, dtype=np.int64)
         kw = dict(line_width=width, lighting=False, show_scalar_bar=False)
+        self.values = None
+        self.clim = None
         if values is not None:
-            self.mesh.point_data["value"] = np.asarray(values, dtype=float)
+            self.values = np.asarray(values, dtype=float)
+            self.mesh.point_data["value"] = self.values
             # Default 0..1: the channel this was built for is a battery
             # fraction. A raw channel (W, km) needs its own range passed in or
             # it clamps to a single colour -- see --track-scale.
-            kw.update(scalars="value", cmap=cmap or BATTERY_CMAP,
-                      clim=clim or (0.0, 1.0))
+            self.clim = tuple(clim) if clim is not None else (0.0, 1.0)
+            kw.update(scalars="value", cmap=cmap or BATTERY_CMAP, clim=self.clim)
+            if scalar_bar:
+                # The ends are spelled out in the title as well as marked on the
+                # bar: the bar says where a colour sits, the title says what the
+                # colours were stretched over, and with --track-scale those are
+                # two different questions.
+                kw["show_scalar_bar"] = True
+                kw["scalar_bar_args"] = dict(
+                    title=f"{label or 'value'}    "
+                    f"{self.clim[0]:.4g} .. {self.clim[1]:.4g}",
+                    n_labels=5, fmt="%.4g", color=INK,
+                    title_font_size=14, label_font_size=11,
+                    # Bottom left, clear of the cells bar centred at 0.36 and
+                    # above the clock in the corner beneath it.
+                    width=0.26, height=0.045, position_x=0.04, position_y=0.09,
+                )
         else:
             kw["color"] = color
         self.actor = plotter.add_mesh(self.mesh, **kw)
@@ -265,17 +284,30 @@ class TrackLayer(TimeLayer):
     def span(self) -> tuple[float, float]:
         return float(self.times[0]), float(self.times[-1])
 
-    def update(self, t: float) -> None:
+    def _bracket(self, t: float):
+        """The samples either side of `t`, and how far between them it falls."""
         k = int(np.searchsorted(self.times, t, side="right"))
+        i = min(max(k - 1, 0), len(self.times) - 1)
+        j = min(i + 1, len(self.times) - 1)
+        dt = self.times[j] - self.times[i]
+        f = 0.0 if dt <= 0 else float(np.clip((t - self.times[i]) / dt, 0.0, 1.0))
+        return k, i, j, f
+
+    def value_at(self, t: float) -> float | None:
+        """The shading channel where the boat is, interpolated the same way the
+        position is, so the readout and the colour under it always agree."""
+        if self.values is None:
+            return None
+        _, i, j, f = self._bracket(t)
+        return float(self.values[i] * (1 - f) + self.values[j] * f)
+
+    def update(self, t: float) -> None:
+        k, i, j, f = self._bracket(t)
         if k >= 2:
             self.mesh.lines = np.concatenate([[k], np.arange(k)]).astype(np.int64)
         else:
             self.mesh.lines = np.empty(0, dtype=np.int64)
         # place the boat between the two bracketing samples
-        i = min(max(k - 1, 0), len(self.times) - 1)
-        j = min(i + 1, len(self.times) - 1)
-        dt = self.times[j] - self.times[i]
-        f = 0.0 if dt <= 0 else float(np.clip((t - self.times[i]) / dt, 0.0, 1.0))
         p = self.pts[i] * (1 - f) + self.pts[j] * f
         self.boat.points = (p / np.linalg.norm(p) * RADII["marker"])[None, :]
 
@@ -340,6 +372,40 @@ class ClockLayer(TimeLayer):
         self.actor.SetText(self._LOWER_LEFT, self.fmt(t))
 
 
+class TrackValueLayer(TimeLayer):
+    """A heads-up readout of the channel the course is shaded by, at the boat.
+
+    The colour map and the scalar bar together answer "where in the range is
+    this"; the number answers "how much", which is what you actually want when
+    the boat is mid-passage and the bar is at the other end of the window.
+    """
+
+    name = "track_value"
+
+    # index of the lower-right corner in vtkCornerAnnotation
+    _LOWER_RIGHT = 1
+
+    def __init__(self, plotter, track, label: str, fmt: str = "{:.4g}"):
+        self.track = track
+        self.label = label
+        self.fmt = fmt
+        # Same reasoning as ClockLayer: built once, written in place.
+        self.actor = plotter.add_text(
+            self._text(track.span()[0]), position="lower_right",
+            font_size=11, color=INK, name="track_value",
+        )
+
+    def _text(self, t: float) -> str:
+        value = self.track.value_at(t)
+        return "" if value is None else f"{self.label}  {self.fmt.format(value)}"
+
+    def span(self) -> tuple[float, float]:
+        return self.track.span()
+
+    def update(self, t: float) -> None:
+        self.actor.SetText(self._LOWER_RIGHT, self._text(t))
+
+
 # --------------------------------------------------------------------------
 # framing
 # --------------------------------------------------------------------------
@@ -366,6 +432,67 @@ def load_track(path: str) -> dict[str, np.ndarray]:
     if missing:
         raise SystemExit(f"{path}: track is missing {sorted(missing)}")
     return track
+
+
+def plot_channel(times, values, label: str, path: str | None = None):
+    """One track channel against time, in its own window, in the globe's palette.
+
+    The colour map answers "high or low here"; this answers "what shape over the
+    passage", which no amount of shading on a course that doubles back on itself
+    can show. Returns the figure, or None once it has been written to `path`.
+
+    A single series, so no legend -- the title names it -- and only the two
+    extremes are labelled. A value on every point is unreadable at a hundred-odd
+    samples, and the ends are exactly what the scalar bar is stretched over.
+    """
+    import matplotlib
+
+    if path is not None:
+        matplotlib.use("Agg")  # --save/--record is headless; there is no window
+    import matplotlib.pyplot as plt
+
+    times = np.asarray(times, dtype=float)
+    values = np.asarray(values, dtype=float)
+
+    fig, ax = plt.subplots(figsize=(9.0, 3.4), facecolor=SURFACE)
+    ax.set_facecolor(SURFACE)
+    ax.plot(times, values, color=TRACK, linewidth=2.0, solid_capstyle="round")
+
+    lo, hi = int(np.argmin(values)), int(np.argmax(values))
+    span = float(times[-1] - times[0]) or 1.0
+    for i, above in ((lo, False), (hi, True)):
+        # An extreme often falls on the first or last sample, where a centred
+        # label overhangs the axis; anchor it inward there instead.
+        edge = (times[i] - times[0]) / span
+        ha = "left" if edge < 0.05 else "right" if edge > 0.95 else "center"
+        ax.plot(times[i], values[i], "o", color=TRACK, markersize=6)
+        ax.annotate(
+            f"{values[i]:.4g}", (times[i], values[i]),
+            textcoords="offset points", xytext=(0, 10 if above else -16),
+            ha=ha, color=INK, fontsize=9,
+        )
+
+    ax.set_title(label, color=INK, fontsize=12, loc="left", pad=12)
+    ax.set_xlabel("hours since departure", color=COAST, fontsize=10)
+    # Recessive frame: horizontal rules only, and no box around the data.
+    ax.grid(True, axis="y", color=GRATICULE, linewidth=0.8)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("bottom", "left"):
+        ax.spines[side].set_color(GRATICULE)
+    ax.tick_params(colors=COAST, labelsize=9)
+    # Vertical breathing room so a label under a minimum sitting on the floor
+    # does not land on the axis tick beneath it.
+    ax.margins(x=0.01, y=0.14)
+    fig.tight_layout()
+
+    if path is None:
+        return fig
+    fig.savefig(path, dpi=140, facecolor=SURFACE)
+    plt.close(fig)
+    print(f"wrote {path}")
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -479,18 +606,21 @@ class GlobeView:
         width: float = 4.0,
         cmap=None,
         clim=None,
+        scalar_bar=False,
+        label=None,
     ):
         """A course over the globe.
 
         `values` colours it by any per-point scalar, over `clim` if given and
-        0..1 otherwise. Passing `times` makes it a time layer instead of a
-        static line: the course is then drawn as it is sailed, with the boat at
-        the head, and it registers with the timeline.
+        0..1 otherwise, with a legend if `scalar_bar`. Passing `times` makes it
+        a time layer instead of a static line: the course is then drawn as it is
+        sailed, with the boat at the head, and it registers with the timeline.
         """
         if times is not None:
             layer = TrackLayer(
                 self.plotter, lat, lng, times, values=values, cmap=cmap,
-                color=color, width=width, clim=clim,
+                color=color, width=width, clim=clim, scalar_bar=scalar_bar,
+                label=label,
             )
             self.timeline.add(layer)
             self.actors[name] = layer.actor
@@ -512,6 +642,14 @@ class GlobeView:
         layer = CellFieldLayer(self.plotter, cells, frames, times, **kw)
         self.timeline.add(layer)
         self.actors[layer.name] = layer.actor
+        return layer
+
+    def add_track_readout(self, track, label: str, *, name="track_value",
+                          fmt: str = "{:.4g}"):
+        """Live value of the channel `track` is shaded by, at the boat."""
+        layer = TrackValueLayer(self.plotter, track, label, fmt=fmt)
+        self.timeline.add(layer)
+        self.actors[name] = layer.actor
         return layer
 
     def add_clock(self, fmt=None):
@@ -840,6 +978,12 @@ def main() -> None:
         "outside that range clamps to one colour. normalized: shade over the "
         "channel's own min..max, for raw channels like W or km.",
     )
+    p.add_argument(
+        "--track-plot",
+        action="store_true",
+        help="also open a matplotlib window plotting the shading channel against "
+        "time; written beside --save/--record instead when running headless",
+    )
     p.add_argument("--coastlines", default="50m", choices=("10m", "50m", "110m", "none"))
     p.add_argument("--graticule", type=int, default=15, metavar="DEG", help="0 to disable")
     p.add_argument("--view", type=float, nargs=2, metavar=("LAT", "LON"))
@@ -883,6 +1027,7 @@ def main() -> None:
         view.add_graticule(args.graticule)
 
     target = art.centre
+    channel_fig = None
     if args.track:
         tr = load_track(args.track)
         lat, lng, hours = tr["lat"], tr["lng"], tr["time"]
@@ -916,10 +1061,27 @@ def main() -> None:
             print(f"  shading by {args.track_scalar} ({lo:.4g}..{hi:.4g}), "
                   f"scale {args.track_scale}")
 
-        view.add_track(lat, lng, values=scalar, times=hours, width=5, clim=clim)
+        track = view.add_track(
+            lat, lng, values=scalar, times=hours, width=5, clim=clim,
+            scalar_bar=scalar is not None, label=args.track_scalar,
+        )
+        if scalar is not None:
+            view.add_track_readout(track, args.track_scalar)
         view.add_markers([lat[0], lat[-1]], [lng[0], lng[-1]], labels=["start", "goal"])
         view.add_clock(lambda t: f"T+{t:5.1f} h   day {int(t // 24) + 1}")
         print(f"track: {len(lat)} points over {hours[-1]:.1f} h, channels {channels}")
+
+        if args.track_plot:
+            if scalar is None:
+                print(f"  nothing to plot: no channel {args.track_scalar!r}")
+            else:
+                headless = args.save or args.record
+                out = (
+                    f"{Path(headless).with_suffix('')}.{args.track_scalar}.png"
+                    if headless
+                    else None
+                )
+                channel_fig = plot_channel(hours, scalar, args.track_scalar, out)
 
     view.add_title(
         f"navigable ocean   K={art.K:g} km   W={art.W:g} km",
@@ -931,6 +1093,15 @@ def main() -> None:
         distance=args.distance or camera_distance(art.bbox),
     )
 
+    # Drawn before the globe takes the foreground so both are on screen at once.
+    # It cannot handle its own events while VTK owns the loop, hence the blocking
+    # show below once the globe closes, which hands it back.
+    if channel_fig is not None:
+        import matplotlib.pyplot as plt
+
+        plt.show(block=False)
+        plt.pause(0.001)
+
     if args.record:
         view.record(args.record, n_frames=args.frames, fps=args.fps)
     elif args.save:
@@ -939,6 +1110,11 @@ def main() -> None:
         view.play(fps=args.fps, speed=args.speed)
     else:
         view.show()
+
+    if channel_fig is not None:
+        import matplotlib.pyplot as plt
+
+        plt.show()
 
 
 if __name__ == "__main__":
