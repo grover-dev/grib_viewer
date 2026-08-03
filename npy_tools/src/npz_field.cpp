@@ -68,7 +68,7 @@ NpzField NpzField::load(const std::filesystem::path& path)
     {
         throw NpyError{
             std::format("field npz is version {}, this build reads version {}; regenerate it "
-                        "with scripts/solar_npz.py",
+                        "with scripts/grib_npz.py",
                         version, supported_version)};
     }
 

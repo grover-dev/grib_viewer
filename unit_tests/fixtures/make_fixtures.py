@@ -2,16 +2,18 @@
 
     uv run make_fixtures.py [path/to/data.grib]
 
-They are real ERA5 ssrd, cut small enough to commit, because the point of the
+They are real ERA5 fields, cut small enough to commit, because the point of the
 tests is to validate this pipeline end to end -- a synthetic cube would only
-check that the sampler agrees with itself.
+check that the sampler agrees with itself. Three fields appear here, each for a
+property the others cannot exercise: ssrd for the accumulation handling, u10 for
+values that go negative, swh for grids with holes in them.
 
-The expected values in solar_test.cpp are derived from the fixtures at runtime
+The expected values in npz_field_test.cpp are derived from the fixtures at runtime
 rather than hardcoded, so regenerating from a different source GRIB is fine as
 long as each fixture keeps its *shape*: regional vs global, quantised vs float.
 That is what the individual tests actually depend on, and it is asserted below.
 
-Driven through solar_npz.py's command line rather than by importing it, so what
+Driven through grib_npz.py's command line rather than by importing it, so what
 the fixtures exercise is exactly the interface the docs tell you to use.
 """
 
@@ -25,7 +27,7 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
-GENERATOR = REPO / "scripts" / "solar_npz.py"
+GENERATOR = REPO / "scripts" / "grib_npz.py"
 DEFAULT_GRIB = REPO / "data" / "18fdfe51416fefbcd1cd10d5e52abfe5" / "data.grib"
 
 # North Atlantic, 6 hours spanning local dawn -- so the window holds both night
@@ -33,40 +35,41 @@ DEFAULT_GRIB = REPO / "data" / "18fdfe51416fefbcd1cd10d5e52abfe5" / "data.grib"
 REGION = ["--frames", "6:12", "--bbox", "-30", "-10", "30", "50"]
 
 # Same idea, smaller, and pulling a field that takes both signs.
-SIGNED = ["--var", "u10", "--frames", "6:10", "--bbox", "-25", "-15", "35", "45"]
+SIGNED = ["--frames", "6:10", "--bbox", "-25", "-15", "35", "45"]
 
+# (filename, GRIB field, extra options)
 FIXTURES = [
     # Regional and quantised. Non-wrapping, so it exercises out-of-range
     # rejection at all four edges.
-    ("region_u16.npz", REGION),
+    ("region_u16.npz", "ssrd", REGION),
     # The same window as float32, so the tests can prove the quantised path
     # agrees with the unquantised one instead of only being self-consistent.
-    ("region_f32.npz", REGION + ["--dtype", "f32"]),
+    ("region_f32.npz", "ssrd", REGION + ["--dtype", "f32"]),
     # Global, thinned to 2 degrees: 180 columns x 2 deg == 360, so the longitude
     # axis wraps and the antimeridian seam becomes testable.
-    ("global_u16.npz", ["--frames", "0:3", "--thin", "8"]),
+    ("global_u16.npz", "ssrd", ["--frames", "0:3", "--thin", "8"]),
     # A full 24 hours over one small patch of ocean at 40N 20W. Tiny in area but
     # complete in time, so a test can find where daylight peaks and check it
     # against local noon -- which is what proves the half-step centring.
-    ("diurnal_u16.npz", ["--frames", "0:24", "--bbox", "-21", "-19", "39", "41"]),
+    ("diurnal_u16.npz", "ssrd", ["--frames", "0:24", "--bbox", "-21", "-19", "39", "41"]),
     # Not solar at all: the 10 m wind U component, which goes negative. Every
     # radiation fixture quantises with offset == 0 because irradiance is floored
     # at zero, so without a signed field the dequantiser's offset term is never
     # actually exercised. This also covers a field that is not an accumulation,
     # and so gets neither the J/m^2 conversion nor the half-step shift.
-    ("signed_u16.npz", SIGNED),
-    ("signed_f32.npz", SIGNED + ["--dtype", "f32"]),
+    ("signed_u16.npz", "u10", SIGNED),
+    ("signed_f32.npz", "u10", SIGNED + ["--dtype", "f32"]),
     # Significant wave height over the Bay of Biscay and western France, which
     # is undefined on land. Radiation and wind are defined everywhere, so this
     # is the only fixture carrying the no-data marker -- without it the
     # dequantiser's fill check is dead code as far as the tests can tell.
-    ("holes_u16.npz",
-     ["--var", "swh", "--frames", "6:10", "--bbox", "-10", "5", "40", "50"]),
+    ("holes_u16.npz", "swh",
+     ["--frames", "6:10", "--bbox", "-10", "5", "40", "50"]),
 ]
 
 
 def expectations(name: str, npz) -> list[tuple[str, bool]]:
-    """What solar_test.cpp assumes about each fixture, checked here so a bad
+    """What npz_field_test.cpp assumes about each fixture, checked here so a bad
     regeneration fails loudly rather than as a puzzling C++ assertion."""
     wraps = bool(npz["lon_wrap"])
     dtype = npz["data"].dtype
@@ -114,18 +117,18 @@ def main() -> None:
     if not grib.exists():
         raise SystemExit(f"no such GRIB: {grib}")
 
-    for name, options in FIXTURES:
+    for name, var, options in FIXTURES:
         out = HERE / name
         print(f"\n=== {name} " + "=" * (60 - len(name)))
         subprocess.run(
-            [sys.executable, str(GENERATOR), str(grib), str(out), *options],
-            cwd=GENERATOR.parent,  # solar_npz.py imports grib_utils as a sibling
+            [sys.executable, str(GENERATOR), str(grib), var, str(out), *options],
+            cwd=GENERATOR.parent,  # grib_npz.py imports grib_utils as a sibling
             check=True,
         )
 
     print("\nverifying what the C++ tests rely on:")
     failed = False
-    for name, _ in FIXTURES:
+    for name, _, _ in FIXTURES:
         path = HERE / name
         with np.load(path) as npz:
             checks = expectations(name, npz)

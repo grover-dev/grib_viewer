@@ -10,7 +10,7 @@
 namespace boatforge {
 
 // An environment field on a regular lat/lon grid and a uniform time axis, in
-// the npz layout scripts/solar_npz.py writes. Nothing below is specific to
+// the npz layout scripts/grib_npz.py writes. Nothing below is specific to
 // radiation -- any field cut to that layout loads and samples identically.
 //
 // Sampling costs no search. The grid is regular and the time axis uniform, so

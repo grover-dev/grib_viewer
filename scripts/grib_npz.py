@@ -1,11 +1,11 @@
-"""Extract solar radiation from a GRIB into an .npz the C++ side can sample in O(1).
+"""Extract one GRIB field into an .npz the C++ side can sample in O(1).
 
-    uv run solar_npz.py data/18fdfe.../data.grib solar.npz --frames 0:48
-    uv run solar_npz.py data/18fdfe.../data.grib atl.npz --bbox -40 5 20 60
-    uv run solar_npz.py data/18fdfe.../data.grib solar.npz --list
+    uv run grib_npz.py data/18fdfe.../data.grib --list
+    uv run grib_npz.py data/18fdfe.../data.grib ssrd solar.npz --frames 0:48
+    uv run grib_npz.py data/18fdfe.../data.grib swh  waves.npz --bbox -40 5 20 60
 
 The point of the output format is that *no search is needed to sample it*. ERA5
-ships a regular lat/lon grid on a uniform hourly axis, so a (time, lat, lon)
+ships a regular lat/lon grid on a uniform time axis, so a (time, lat, lon)
 query resolves by arithmetic:
 
     i = (t - t0) / dt        j = (lat - lat0) / dlat        k = (lon - lon0) / dlon
@@ -13,24 +13,27 @@ query resolves by arithmetic:
 No k-d tree, no binary search, no index -- three divides and a strided load.
 So the file stores those six constants as scalars, and the payload is one dense
 C-order cube. The explicit `time`/`lat`/`lon` axes are also written, but only for
-Python-side convenience and verification; boatforge::SolarField ignores them.
+python-side convenience and verification; boatforge::NpzField ignores them.
 
-Two conversions happen on the way out, both because ERA5 stores radiation as an
-accumulation rather than a rate:
+Any field in the file works: radiation, wind components, wave height, pressure,
+temperature. Two things are decided per field rather than hardcoded:
 
-* **J/m^2 -> W/m^2.** Each value is the energy accumulated over the preceding
-  model step. Dividing by that step's length gives the mean irradiance, which is
-  what a panel model actually wants.
+* **Accumulations become rates.** ERA5 stores radiation as energy accumulated
+  over the model step (J/m^2), not as a flux. Those are divided by the step
+  length to give W/m^2, which is what a panel model wants. Fields already stored
+  as instantaneous values (u10, swh, t2m, ...) are passed through untouched.
 
-* **The time axis is shifted back half a step.** A value stamped 12:00 covers
-  11:00..12:00, so the mean irradiance it represents is centred on 11:30.
-  Interpolating against the raw stamps biases every sample half an hour late.
-  `--no-center` keeps the original stamps.
+* **Accumulation stamps are re-centred.** A value stamped 12:00 covers
+  11:00..12:00, so the mean it represents belongs at 11:30. Interpolating
+  against the raw stamps biases every sample half a step late. Instantaneous
+  fields are already stamped at the instant they describe and are left alone.
 
-Values are quantised to uint16 with a scale/offset by default -- irradiance tops
-out near 1400 W/m^2, so ~0.02 W/m^2 of resolution is far below the accuracy of
-the underlying reanalysis, and it halves the file. `--dtype f32` stores the
-floats verbatim.
+`--accumulated` overrides the guess, which matters for fields that accumulate
+without saying so in their units -- total precipitation is metres, not a rate.
+
+Values are quantised to uint16 with a scale/offset by default, which halves the
+file for a resolution loss far below the accuracy of the underlying reanalysis.
+`--dtype f32` stores the floats verbatim.
 """
 
 from __future__ import annotations
@@ -42,13 +45,13 @@ import numpy as np
 
 import grib_utils as gu
 
-# Preference order when --var isn't given. ssrd is what reaches a horizontal
-# surface at sea level and so is the one a panel sees; the others are fallbacks
-# for files that don't carry it (the 16 GB January request, for instance, has
-# cdir and tsr but no ssrd).
-SOLAR_VARS = ("ssrd", "cdir", "tsr")
-
+# Units that mean "accumulated over the step" for the purposes of the two
+# conversions above. ERB5 writes radiation this way; see --accumulated for the
+# fields that accumulate without advertising it.
 ACCUMULATED_UNITS = ("j m**-2", "j/m2", "j m-2")
+
+# What an accumulated field becomes once divided by its step length.
+RATE_UNITS = {"j m**-2": "W m**-2", "j/m2": "W m**-2", "j m-2": "W m**-2"}
 
 # uint16 payload: 65535 is reserved for "no data", leaving 0..65534 for values.
 U16_FILL = 65535
@@ -88,21 +91,19 @@ def uniform_step(values: np.ndarray, what: str, tol: float) -> float:
     return float(steps.mean())
 
 
-def pick_var(fields: dict, requested: str | None) -> str:
-    if requested:
-        if requested not in fields:
-            raise SystemExit(
-                f"{requested!r} not in this GRIB; it has: {', '.join(sorted(fields))}"
-            )
-        return requested
-    for name in SOLAR_VARS:
-        if name in fields:
-            return name
-    raise SystemExit(
-        "no solar field found (looked for "
-        f"{', '.join(SOLAR_VARS)}); this GRIB has: {', '.join(sorted(fields))}\n"
-        "pass --var to choose one explicitly"
-    )
+def list_fields(path: Path, fields: dict) -> None:
+    """Every field in the file, with what it would cost to extract."""
+    print(f"\n{path}")
+    times = gu.available_times(fields)
+    print(f"  {len(times)} frames, {gu.fmt_time(times[0])} .. {gu.fmt_time(times[-1])}\n")
+    print(f"  {'name':<8} {'long name':<44} {'units':>10}  {'grid':>11} {'frames':>7}")
+    for name, da in sorted(fields.items()):
+        ydim, xdim = gu.ydim_of(da), gu.xdim_of(da)
+        units = (da.attrs.get("units") or "-")[:10]
+        mark = "*" if units.strip().lower() in ACCUMULATED_UNITS else " "
+        print(f" {mark}{name:<8} {(da.attrs.get('long_name') or '?')[:44]:<44} "
+              f"{units:>10}  {da.sizes[ydim]:>5}x{da.sizes[xdim]:<5} {da.sizes['time']:>7}")
+    print("\n  * accumulated over the step: converted to a rate and re-centred in time\n")
 
 
 def main() -> None:
@@ -110,10 +111,10 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("grib", help="source GRIB")
-    p.add_argument("npz", nargs="?", help="output .npz (omit with --list)")
+    p.add_argument("var", nargs="?", help="field to extract; see --list")
+    p.add_argument("npz", nargs="?", help="output .npz")
     p.add_argument("--list", action="store_true",
-                   help="show the solar fields available and exit")
-    p.add_argument("--var", help=f"field to extract (default: first of {'/'.join(SOLAR_VARS)})")
+                   help="show every field in the file and exit")
 
     sel = p.add_argument_group("selection (--frames and --start/--end are mutually exclusive)")
     sel.add_argument("--start", help="first time to keep, YYYY-MM-DD[THH:MM] (inclusive)")
@@ -128,18 +129,20 @@ def main() -> None:
     out = p.add_argument_group("output")
     out.add_argument("--dtype", choices=("u16", "f32"), default="u16",
                      help="payload type: quantised uint16 (default) or raw float32")
+    out.add_argument("--accumulated", choices=("auto", "yes", "no"), default="auto",
+                     help="treat the field as accumulated over the step. 'auto' (default) "
+                          "decides from the units; 'yes' for accumulations that do not "
+                          "advertise it, such as total precipitation")
     out.add_argument("--no-compress", action="store_true",
                      help="store members uncompressed (bigger, loads faster)")
     out.add_argument("--no-center", action="store_true",
-                     help="keep ERA5's end-of-accumulation stamps instead of centring them")
+                     help="keep the source stamps instead of centring accumulations")
     out.add_argument("--keep-units", action="store_true",
-                     help="do not convert J/m^2 to W/m^2")
+                     help="do not divide accumulations by the step length")
     args = p.parse_args()
 
     if args.frames and (args.start or args.end):
         raise SystemExit("choose either --frames or --start/--end, not both")
-    if not args.npz and not args.list:
-        raise SystemExit("give an output path, or --list to see what's available")
 
     src = Path(args.grib)
     if not src.exists():
@@ -148,19 +151,27 @@ def main() -> None:
     fields = gu.open_grib(str(src))
 
     if args.list:
-        print(f"\n{src}\nfields carrying radiation:")
-        for k in sorted(fields):
-            a = fields[k].attrs
-            mark = "*" if k in SOLAR_VARS else " "
-            units = a.get("units", "?")
-            if "j m" in units.lower() or "w m" in units.lower():
-                print(f" {mark} {k:<8} {a.get('long_name', '?')[:46]:<46} {units}")
-        print("\n  * = picked automatically, in the order listed\n")
+        list_fields(src, fields)
         return
+    if not args.var or not args.npz:
+        raise SystemExit(
+            "give a field and an output path, or --list to see what is available\n"
+            f"  fields in this file: {', '.join(sorted(fields))}"
+        )
+    if args.var not in fields:
+        raise SystemExit(
+            f"{args.var!r} is not in this GRIB.\n"
+            f"  available: {', '.join(sorted(fields))}"
+        )
 
-    da = fields[pick_var(fields, args.var)]
-    var = da.name
+    da = fields[args.var]
     units = (da.attrs.get("units") or "").strip().lower()
+
+    # Whether the two accumulation conversions apply. Deciding once, here, keeps
+    # the unit change and the time shift from drifting apart -- they describe the
+    # same property of the field and must agree.
+    accumulated = units in ACCUMULATED_UNITS if args.accumulated == "auto" \
+        else args.accumulated == "yes"
 
     # --- time selection ---------------------------------------------------
     # Accumulation length comes from the *source* spacing, before any striding:
@@ -195,7 +206,7 @@ def main() -> None:
                 f"bad longitudes: need W < E, got W={west} E={east}. "
                 "This tool does not cross the dateline; slice_grib.py does."
             )
-        (da,) = gu.subset_area({var: da}, tuple(args.bbox)).values()
+        (da,) = gu.subset_area({args.var: da}, tuple(args.bbox)).values()
 
     ydim, xdim = gu.ydim_of(da), gu.xdim_of(da)
 
@@ -225,10 +236,11 @@ def main() -> None:
     times = da["time"].values.astype("datetime64[s]").astype("int64")
     dt = uniform_step(times, "time", tol=0.0)
 
-    convert = not args.keep_units and units in ACCUMULATED_UNITS
-    center = not args.no_center and convert
+    convert = accumulated and not args.keep_units
+    center = accumulated and not args.no_center
     if center:
         times = times - int(round(step_s / 2))
+    out_units = RATE_UNITS.get(units, units) if convert else units
 
     nt, nlat, nlon = da.sizes["time"], lat.size, lon.size
 
@@ -237,7 +249,10 @@ def main() -> None:
     lon_wrap = abs(nlon * dlon - 360.0) < 1e-6
 
     print(f"\n{src}")
-    print(f"  field       {var}  ({da.attrs.get('long_name', '?')}) [{units or '?'}]")
+    print(f"  field       {args.var}  ({da.attrs.get('long_name', '?')}) [{units or '?'}]"
+          + (f" -> [{out_units}]" if convert else ""))
+    print(f"  treated as  {'accumulated over the step' if accumulated else 'instantaneous'}"
+          + ("" if args.accumulated == "auto" else f"  (--accumulated {args.accumulated})"))
     print(f"  selected    {how}, stride {args.stride}"
           + (f", bbox {tuple(args.bbox)}" if args.bbox else "")
           + (f", thin {args.thin}" if args.thin > 1 else ""))
@@ -273,10 +288,11 @@ def main() -> None:
             raise SystemExit("every value is NaN; nothing to write")
         if convert:
             lo_v, hi_v = lo_v / step_s, hi_v / step_s
-        # Irradiance is floored at zero physically; anchoring there keeps the
-        # quantisation grid aligned to a meaningful origin.
-        offset = min(0.0, lo_v)
-        scale = max(hi_v - offset, 1e-6) / U16_MAX
+        # Anchored on the field's own minimum rather than on zero, so a narrow
+        # band far from the origin -- sea surface temperature in kelvin, say --
+        # spends its 16 bits on the range it actually occupies.
+        offset = lo_v
+        scale = max(hi_v - lo_v, 1e-12) / U16_MAX
 
     for i in range(nt):
         frame = np.asarray(da.isel(time=i).values, dtype="float32")
@@ -326,9 +342,8 @@ def main() -> None:
     print(f"\nwrote {dst}: {disk / 1e6:.1f} MB on disk"
           f"  ({raw / 1e6:.1f} MB in memory as {payload.dtype})")
     if args.dtype == "u16":
-        unit = "W m**-2" if convert else (units or "?")
         print(f"  quantised: value = raw * {scale:.6g} + {offset:.6g}"
-              f"  (step {scale:.4g} {unit})")
+              f"  (step {scale:.4g} {out_units or '?'})")
     print()
 
 

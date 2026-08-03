@@ -426,7 +426,7 @@ TEST(NpzFieldDtype, Float32PathReturnsStoredValuesVerbatim) {
 
 // --------------------------------------------------------------------------
 // Physical sanity of what the extractor produced. These would catch a unit
-// error in solar_npz.py that all the arithmetic tests above would sail past.
+// error in grib_npz.py that all the arithmetic tests above would sail past.
 // --------------------------------------------------------------------------
 
 TEST(SolarPhysics, IrradianceIsNonNegativeAndBelowTheSolarConstant) {

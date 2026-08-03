@@ -34,6 +34,8 @@ int main(int argc, char** argv)
 
     const std::string out_directory = argv[2];
 
+    // FIXME: take in a list of start + end conditions
+    //
     Sim simulator(std::chrono::seconds(1735776000) + std::chrono::hours(12), start, end, solar_field, out_directory);
 
     while (simulator.step())

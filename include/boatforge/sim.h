@@ -14,8 +14,17 @@ public:
         double lat;
         double lon;
     };
-    Sim(const std::chrono::seconds start_time, const lat_lon start, const lat_lon end, boatforge::NpzField& solar_field,
-        std::filesystem::path output_path)
+
+    struct run_t
+    {
+        const std::chrono::seconds start_time;
+        const lat_lon start;
+        const lat_lon end;
+        boatforge::NpzField& solar_field;
+        std::string output_name
+    };
+
+    Sim(std::span<run_t> runs)
         : solar_field_(blackboard_, solar_field),
           solver_(blackboard_),
           boat_(blackboard_),
@@ -24,11 +33,10 @@ public:
           output_path_(std::move(output_path)),
           start_time_(start_time)
     {
-        blackboard_.time = start_time;
-        blackboard_.current_lat = start.lat;
-        blackboard_.current_lon = start.lon;
-        blackboard_.end_lat = end.lat;
-        blackboard_.end_lon = end.lon;
+        for (auto& run : runs)
+        {
+            instances.push_back(sim_t{run});
+        }
 
         sample();
     }
@@ -87,17 +95,38 @@ private:
         recorder_.record("distance_to_end_km", blackboard_.distance_to_end / 1000.0);
     }
 
-    blackboard blackboard_;
-    SolarIsolationField solar_field_;
-    Solver solver_;
-    BoatState boat_;
-    WorldPropogation world_;
-    Info info_;
+    struct sim_t
+    {
+        run_t& run_;
+        blackboard blackboard_;
+        SolarIsolationField solar_field_;
+        Solver solver_;
+        BoatState boat_;
+        WorldPropogation world_;
+        Info info_;
+
+        sim_t(run_t& run)
+            : run_(run),
+              solar_field_(blackboard_, run_.solar_field),
+              solver_(blackboard_),
+              boat_(blackboard_),
+              world_(blackboard_),
+              info_(blackboard_),
+        {
+            blackboard_.time = run_.start_time;
+            blackboard_.current_lat = run_.start.lat;
+            blackboard_.current_lon = run_.start.lon;
+            blackboard_.end_lat = run_.end.lat;
+            blackboard_.end_lon = run_.end.lon;
+        }
+    };
+
+    std::vector<sim_t> instances;
+
     /* By value, not by reference: main.cpp passes a temporary path built from a
      * std::string, so a reference member would dangle by the time end() runs. */
-    const std::filesystem::path output_path_;
+    // const std::filesystem::path output_path_;
 
-    const std::chrono::seconds start_time_;
     uint16_t count_ = 100;
     boatforge::NpzRecorder recorder_;
 };
