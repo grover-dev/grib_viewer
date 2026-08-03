@@ -80,6 +80,7 @@ Controls
 from __future__ import annotations
 
 import argparse
+import multiprocessing
 import time
 from pathlib import Path
 
@@ -502,12 +503,8 @@ def load_track(path: str) -> dict[str, np.ndarray]:
     return track
 
 
-def plot_channels(times, channels: dict, path: str | None = None):
-    """Track channels against time, in their own window, in the globe's palette.
-
-    The colour map answers "high or low here"; this answers "what shape over the
-    passage", which no amount of shading on a course that doubles back on itself
-    can show. Returns the figure, or None once it has been written to `path`.
+def _build_channel_figure(plt, times, channels: dict):
+    """The figure itself, given a live pyplot. Shared by the window and the file.
 
     Several channels become stacked panels sharing the time axis, never two
     scales on one pair of axes: watts and kilometres on a shared y is a
@@ -517,12 +514,6 @@ def plot_channels(times, channels: dict, path: str | None = None):
     is unreadable at a hundred-odd samples, and the ends are exactly what the
     scalar bar is stretched over.
     """
-    import matplotlib
-
-    if path is not None:
-        matplotlib.use("Agg")  # --save/--record is headless; there is no window
-    import matplotlib.pyplot as plt
-
     times = np.asarray(times, dtype=float)
     span = float(times[-1] - times[0]) or 1.0
 
@@ -563,13 +554,57 @@ def plot_channels(times, channels: dict, path: str | None = None):
 
     axes[-1, 0].set_xlabel("hours since departure", color=COAST, fontsize=10)
     fig.tight_layout()
+    return fig
 
-    if path is None:
-        return fig
-    fig.savefig(path, dpi=140, facecolor=SURFACE)
-    plt.close(fig)
-    print(f"wrote {path}")
-    return None
+
+def _channel_plot_worker(times, channels: dict) -> None:
+    """Entry point for the plot subprocess: draw, then run matplotlib's loop."""
+    import matplotlib.pyplot as plt
+
+    _build_channel_figure(plt, times, channels)
+    plt.show()
+
+
+def plot_channels(times, channels: dict, path: str | None = None):
+    """Track channels against time, in the globe's palette.
+
+    The colour map answers "high or low here"; this answers "what shape over the
+    passage", which no amount of shading on a course that doubles back on itself
+    can show.
+
+    With a `path` the figure is written and nothing is opened. Without one it
+    goes to a *separate process*, and that is not incidental: matplotlib's Qt
+    backend and VTK's interactor are two GUI event loops, and only one of them
+    can own this thread. Drawn in-process the window appears and then sits there
+    dead -- the window manager eventually offers to kill it -- because VTK is
+    running the loop and nothing is dispatching Qt's events. A child process has
+    a loop of its own, so both windows stay live.
+
+    Returns the child process, or None once written to `path`.
+    """
+    if path is not None:
+        import matplotlib
+
+        matplotlib.use("Agg")  # --save/--record is headless; there is no window
+        import matplotlib.pyplot as plt
+
+        fig = _build_channel_figure(plt, times, channels)
+        fig.savefig(path, dpi=140, facecolor=SURFACE)
+        plt.close(fig)
+        print(f"wrote {path}")
+        return None
+
+    # spawn, not fork: a forked child inherits this process's VTK and Qt state
+    # mid-flight, which is its own source of hangs. Not a daemon, so the plot
+    # outlives the globe and the run ends when both windows are closed.
+    ctx = multiprocessing.get_context("spawn")
+    proc = ctx.Process(
+        target=_channel_plot_worker,
+        args=(np.asarray(times, dtype=float),
+              {k: np.asarray(v, dtype=float) for k, v in channels.items()}),
+    )
+    proc.start()
+    return proc
 
 
 # --------------------------------------------------------------------------
@@ -1144,7 +1179,7 @@ def main() -> None:
         view.add_graticule(args.graticule)
 
     target = art.centre if art is not None else (0.0, 0.0)
-    channel_fig = None
+    channel_plot = None
     if args.track:
         tr = load_track(args.track)
         lat, lng, hours = tr["lat"], tr["lng"], tr["time"]
@@ -1209,7 +1244,7 @@ def main() -> None:
                     if headless
                     else None
                 )
-                channel_fig = plot_channels(hours, chosen, out)
+                channel_plot = plot_channels(hours, chosen, out)
 
     if art is not None:
         view.add_title(
@@ -1229,15 +1264,6 @@ def main() -> None:
         distance=args.distance or camera_distance(art.bbox if art else None),
     )
 
-    # Drawn before the globe takes the foreground so both are on screen at once.
-    # It cannot handle its own events while VTK owns the loop, hence the blocking
-    # show below once the globe closes, which hands it back.
-    if channel_fig is not None:
-        import matplotlib.pyplot as plt
-
-        plt.show(block=False)
-        plt.pause(0.001)
-
     if args.record:
         view.record(args.record, n_frames=args.frames, fps=args.fps)
     elif args.save:
@@ -1247,10 +1273,10 @@ def main() -> None:
     else:
         view.show()
 
-    if channel_fig is not None:
-        import matplotlib.pyplot as plt
-
-        plt.show()
+    # The plot has its own window and its own process; closing the globe does
+    # not close it, and the run is over when both are gone.
+    if channel_plot is not None:
+        channel_plot.join()
 
 
 if __name__ == "__main__":
