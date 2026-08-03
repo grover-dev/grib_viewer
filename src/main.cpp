@@ -36,6 +36,8 @@ int main(int argc, char** argv)
 
     // FIXME: take in a list of start + end conditions
     //
+    // FIXME: build an array of these runs
+
     Sim simulator(std::chrono::seconds(1735776000) + std::chrono::hours(12), start, end, solar_field, out_directory);
 
     while (simulator.step())
