@@ -34,21 +34,27 @@ Running it
 ----------
 
     uv run python map_gen.py -K 5 -W 10 --save med.npz    # build a map first
-    uv run python vis_map.py med.npz                      # then look at it
+    uv run python vis_map.py --map med.npz                # then look at it
 
-    uv run python vis_map.py med.npz --show-excluded      # include rejected water
-    uv run python vis_map.py med.npz --demo-track         # example course overlay
-    uv run python vis_map.py med.npz --save globe.png     # off-screen render
-    uv run python vis_map.py med.npz --view 36 -5         # camera at lat/lon
+    uv run python vis_map.py --track run.npz              # a course, no map
+    uv run python vis_map.py --map med.npz --show-excluded   # rejected water too
+    uv run python vis_map.py --map med.npz --save globe.png  # off-screen render
+    uv run python vis_map.py --map med.npz --view 36 -5      # camera at lat/lon
+
+Either --map or --track is enough; with neither there is nothing to draw.
 
 Options:
 
+    --map NPZ         the artifact from map_gen.py --save; omit for a bare globe
     --show-excluded   draw water the (K, W) rules rejected, in neutral grey
-    --demo-track      a great-circle course through the strait, to show the hook
     --track NPZ       a track to animate; needs lat, lng and time (hours)
-    --track-scalar K  which channel of the track to shade the course by
-    --track-scale {unit,normalized}   shade over 0..1, or over the channel's
-                      own range -- raw channels need the latter or they clamp
+    --track-scalar C[:SCALE] ...   channels to shade the course by; several
+                      load together and c cycles between them in the window.
+                      SCALE is unit or normalized, per channel
+    --track-scale {unit,normalized}   the default for channels with no suffix:
+                      0..1, or the channel's own range -- raw channels need
+                      the latter or they clamp to a single colour
+    --track-plot      plot the chosen channels against time, one panel each
     --coastlines {10m,50m,110m,none}   coastline detail (default 50m)
     --graticule DEG   meridian/parallel spacing, 0 to disable (default 15)
     --view LAT LON    camera target (default: centre of the map's bbox)
@@ -63,6 +69,7 @@ Controls
     scroll          zoom, bounded so you can neither enter the planet nor lose it
     n               put north back at the top without moving the camera
     b               follow the boat -- toggles, so it keeps up during playback
+    c / C           next / previous track channel, when more than one is loaded
     space           play / pause
     left / right    step back / forward
     [ ]             slower / faster
@@ -119,6 +126,10 @@ BATTERY_CMAP = LinearSegmentedColormap.from_list(
 # limit sits just off the surface; the far one keeps the globe filling enough of
 # the frame to still be a map.
 ZOOM_LIMITS = (1.03, 12.0)
+
+# How a track channel's values map onto the colour ramp. "unit" is 0..1, for
+# fractions; "normalized" is the channel's own min..max, for raw units.
+SCALES = ("unit", "normalized")
 
 RADII = {
     "planet": 0.9994,
@@ -228,13 +239,18 @@ class TrackLayer(TimeLayer):
     The full geometry is uploaded once; each update only rewrites the line
     connectivity to expose the sailed prefix, and moves a one-point mesh to the
     interpolated position. Nothing is rebuilt per frame.
+
+    More than one channel can be loaded at a time. They all live on the same
+    geometry and only one is shown; switching rewrites the point data, the
+    colour range and the bar title in place, so cycling costs no rebuild either.
     """
 
     name = "track"
 
     def __init__(self, plotter, lat, lng, times, values=None, cmap=None,
                  color=TRACK, width=5.0, boat_size=13.0, radius=None, clim=None,
-                 scalar_bar=False, label=None):
+                 scalar_bar=False, label=None, channels=None, scale="unit",
+                 scales=None):
         self.plotter = plotter
         self.times = np.asarray(times, dtype=float)
         self.pts = lonlat_to_xyz(lat, lng, radius or RADII["track"])
@@ -246,16 +262,27 @@ class TrackLayer(TimeLayer):
         # reveal is broken when it is not.
         self.mesh.verts = np.empty(0, dtype=np.int64)
         self.mesh.lines = np.empty(0, dtype=np.int64)
+
+        # A lone `values` is the one-channel case of `channels`, so there is only
+        # one path below to get wrong.
+        if channels is None and values is not None:
+            channels = {label or "value": values}
+        self.channels = {
+            k: np.asarray(v, dtype=float) for k, v in (channels or {}).items()
+        }
+        self.names = list(self.channels)
+        self.index = 0
+        # `scale` is the fallback; `scales` overrides it per channel, because a
+        # battery fraction and a watt reading loaded together want different
+        # ones and there is only one flag.
+        self.scale = scale
+        self.scales = dict(scales or {})
+        self._clim_override = tuple(clim) if clim is not None else None
+        self.bar = None
+
         kw = dict(line_width=width, lighting=False, show_scalar_bar=False)
-        self.values = None
-        self.clim = None
-        if values is not None:
-            self.values = np.asarray(values, dtype=float)
+        if self.names:
             self.mesh.point_data["value"] = self.values
-            # Default 0..1: the channel this was built for is a battery
-            # fraction. A raw channel (W, km) needs its own range passed in or
-            # it clamps to a single colour -- see --track-scale.
-            self.clim = tuple(clim) if clim is not None else (0.0, 1.0)
             kw.update(scalars="value", cmap=cmap or BATTERY_CMAP, clim=self.clim)
             if scalar_bar:
                 # The ends are spelled out in the title as well as marked on the
@@ -264,8 +291,7 @@ class TrackLayer(TimeLayer):
                 # two different questions.
                 kw["show_scalar_bar"] = True
                 kw["scalar_bar_args"] = dict(
-                    title=f"{label or 'value'}    "
-                    f"{self.clim[0]:.4g} .. {self.clim[1]:.4g}",
+                    title=self._bar_title(),
                     n_labels=5, fmt="%.4g", color=INK,
                     title_font_size=14, label_font_size=11,
                     # Bottom left, clear of the cells bar centred at 0.36 and
@@ -275,11 +301,52 @@ class TrackLayer(TimeLayer):
         else:
             kw["color"] = color
         self.actor = plotter.add_mesh(self.mesh, **kw)
+        if self.names and scalar_bar:
+            self.bar = plotter.scalar_bars[self._bar_title()]
 
         self.boat = pv.PolyData(self.pts[:1].copy())
         self.boat_actor = plotter.add_points(
             self.boat, color=INK, point_size=boat_size, render_points_as_spheres=True
         )
+
+    @property
+    def label(self) -> str | None:
+        """Name of the channel currently shading the course."""
+        return self.names[self.index] if self.names else None
+
+    @property
+    def values(self):
+        return self.channels[self.label] if self.names else None
+
+    @property
+    def clim(self) -> tuple[float, float]:
+        """The range the colour map is stretched over for the active channel.
+
+        Default 0..1: the channel this was built for is a battery fraction. A
+        raw channel (W, km) needs "normalized" or it clamps to a single colour.
+        """
+        if self._clim_override is not None:
+            return self._clim_override
+        values = self.values
+        lo, hi = float(np.min(values)), float(np.max(values))
+        # A flat channel has no range to spread a colour map over.
+        if self.scales.get(self.label, self.scale) == "normalized" and hi > lo:
+            return lo, hi
+        return 0.0, 1.0
+
+    def _bar_title(self) -> str:
+        lo, hi = self.clim
+        return f"{self.label or 'value'}    {lo:.4g} .. {hi:.4g}"
+
+    def set_channel(self, index: int) -> None:
+        """Show channel `index`, wrapping. Rewrites data, range and title."""
+        if not self.names:
+            return
+        self.index = index % len(self.names)
+        self.mesh.point_data["value"] = self.values
+        self.actor.mapper.scalar_range = self.clim
+        if self.bar is not None:
+            self.bar.SetTitle(self._bar_title())
 
     def span(self) -> tuple[float, float]:
         return float(self.times[0]), float(self.times[-1])
@@ -385,9 +452,8 @@ class TrackValueLayer(TimeLayer):
     # index of the lower-right corner in vtkCornerAnnotation
     _LOWER_RIGHT = 1
 
-    def __init__(self, plotter, track, label: str, fmt: str = "{:.4g}"):
+    def __init__(self, plotter, track, fmt: str = "{:.4g}"):
         self.track = track
-        self.label = label
         self.fmt = fmt
         # Same reasoning as ClockLayer: built once, written in place.
         self.actor = plotter.add_text(
@@ -396,8 +462,10 @@ class TrackValueLayer(TimeLayer):
         )
 
     def _text(self, t: float) -> str:
+        # Read the label off the track rather than caching it: cycling channels
+        # has to change the name next to the number, not just the number.
         value = self.track.value_at(t)
-        return "" if value is None else f"{self.label}  {self.fmt.format(value)}"
+        return "" if value is None else f"{self.track.label}  {self.fmt.format(value)}"
 
     def span(self) -> tuple[float, float]:
         return self.track.span()
@@ -434,16 +502,20 @@ def load_track(path: str) -> dict[str, np.ndarray]:
     return track
 
 
-def plot_channel(times, values, label: str, path: str | None = None):
-    """One track channel against time, in its own window, in the globe's palette.
+def plot_channels(times, channels: dict, path: str | None = None):
+    """Track channels against time, in their own window, in the globe's palette.
 
     The colour map answers "high or low here"; this answers "what shape over the
     passage", which no amount of shading on a course that doubles back on itself
     can show. Returns the figure, or None once it has been written to `path`.
 
-    A single series, so no legend -- the title names it -- and only the two
-    extremes are labelled. A value on every point is unreadable at a hundred-odd
-    samples, and the ends are exactly what the scalar bar is stretched over.
+    Several channels become stacked panels sharing the time axis, never two
+    scales on one pair of axes: watts and kilometres on a shared y is a
+    comparison the reader cannot make, and a shared x is the one that matters
+    here. Each panel is a single series, so its title names it and no legend is
+    needed, and only the two extremes carry a value -- a number on every point
+    is unreadable at a hundred-odd samples, and the ends are exactly what the
+    scalar bar is stretched over.
     """
     import matplotlib
 
@@ -452,39 +524,44 @@ def plot_channel(times, values, label: str, path: str | None = None):
     import matplotlib.pyplot as plt
 
     times = np.asarray(times, dtype=float)
-    values = np.asarray(values, dtype=float)
-
-    fig, ax = plt.subplots(figsize=(9.0, 3.4), facecolor=SURFACE)
-    ax.set_facecolor(SURFACE)
-    ax.plot(times, values, color=TRACK, linewidth=2.0, solid_capstyle="round")
-
-    lo, hi = int(np.argmin(values)), int(np.argmax(values))
     span = float(times[-1] - times[0]) or 1.0
-    for i, above in ((lo, False), (hi, True)):
-        # An extreme often falls on the first or last sample, where a centred
-        # label overhangs the axis; anchor it inward there instead.
-        edge = (times[i] - times[0]) / span
-        ha = "left" if edge < 0.05 else "right" if edge > 0.95 else "center"
-        ax.plot(times[i], values[i], "o", color=TRACK, markersize=6)
-        ax.annotate(
-            f"{values[i]:.4g}", (times[i], values[i]),
-            textcoords="offset points", xytext=(0, 10 if above else -16),
-            ha=ha, color=INK, fontsize=9,
-        )
 
-    ax.set_title(label, color=INK, fontsize=12, loc="left", pad=12)
-    ax.set_xlabel("hours since departure", color=COAST, fontsize=10)
-    # Recessive frame: horizontal rules only, and no box around the data.
-    ax.grid(True, axis="y", color=GRATICULE, linewidth=0.8)
-    ax.set_axisbelow(True)
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    for side in ("bottom", "left"):
-        ax.spines[side].set_color(GRATICULE)
-    ax.tick_params(colors=COAST, labelsize=9)
-    # Vertical breathing room so a label under a minimum sitting on the floor
-    # does not land on the axis tick beneath it.
-    ax.margins(x=0.01, y=0.14)
+    fig, axes = plt.subplots(
+        len(channels), 1, sharex=True, squeeze=False,
+        figsize=(9.0, 1.0 + 2.4 * len(channels)), facecolor=SURFACE,
+    )
+    for ax, (label, values) in zip(axes[:, 0], channels.items()):
+        values = np.asarray(values, dtype=float)
+        ax.set_facecolor(SURFACE)
+        ax.plot(times, values, color=TRACK, linewidth=2.0, solid_capstyle="round")
+
+        for i, above in ((int(np.argmin(values)), False),
+                         (int(np.argmax(values)), True)):
+            # An extreme often falls on the first or last sample, where a
+            # centred label overhangs the axis; anchor it inward there instead.
+            edge = (times[i] - times[0]) / span
+            ha = "left" if edge < 0.05 else "right" if edge > 0.95 else "center"
+            ax.plot(times[i], values[i], "o", color=TRACK, markersize=6)
+            ax.annotate(
+                f"{values[i]:.4g}", (times[i], values[i]),
+                textcoords="offset points", xytext=(0, 10 if above else -16),
+                ha=ha, color=INK, fontsize=9,
+            )
+
+        ax.set_title(label, color=INK, fontsize=12, loc="left", pad=10)
+        # Recessive frame: horizontal rules only, and no box around the data.
+        ax.grid(True, axis="y", color=GRATICULE, linewidth=0.8)
+        ax.set_axisbelow(True)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("bottom", "left"):
+            ax.spines[side].set_color(GRATICULE)
+        ax.tick_params(colors=COAST, labelsize=9)
+        # Vertical breathing room so a label under a minimum sitting on the
+        # floor does not land on the axis tick beneath it.
+        ax.margins(x=0.01, y=0.16)
+
+    axes[-1, 0].set_xlabel("hours since departure", color=COAST, fontsize=10)
     fig.tight_layout()
 
     if path is None:
@@ -508,6 +585,7 @@ class GlobeView:
         self.plotter.set_background(SURFACE)
         self.actors: dict[str, object] = {}
         self.timeline = Timeline()
+        self.track = None  # set by add_track, so the keys can reach the channels
         self._slider = None
         self.following = False
         self._interacting = False
@@ -608,22 +686,28 @@ class GlobeView:
         clim=None,
         scalar_bar=False,
         label=None,
+        channels=None,
+        scale="unit",
+        scales=None,
     ):
         """A course over the globe.
 
         `values` colours it by any per-point scalar, over `clim` if given and
-        0..1 otherwise, with a legend if `scalar_bar`. Passing `times` makes it
-        a time layer instead of a static line: the course is then drawn as it is
-        sailed, with the boat at the head, and it registers with the timeline.
+        0..1 otherwise, with a legend if `scalar_bar`. `channels` takes several
+        named scalars instead, of which one is shown at a time -- see
+        `cycle_track_channel`. Passing `times` makes it a time layer instead of
+        a static line: the course is then drawn as it is sailed, with the boat
+        at the head, and it registers with the timeline.
         """
         if times is not None:
             layer = TrackLayer(
                 self.plotter, lat, lng, times, values=values, cmap=cmap,
                 color=color, width=width, clim=clim, scalar_bar=scalar_bar,
-                label=label,
+                label=label, channels=channels, scale=scale, scales=scales,
             )
             self.timeline.add(layer)
             self.actors[name] = layer.actor
+            self.track = layer
             return layer
         pts = lonlat_to_xyz(lat, lng, RADII["track"])
         line = pv.lines_from_points(pts)
@@ -644,13 +728,24 @@ class GlobeView:
         self.actors[layer.name] = layer.actor
         return layer
 
-    def add_track_readout(self, track, label: str, *, name="track_value",
-                          fmt: str = "{:.4g}"):
+    def add_track_readout(self, track, *, name="track_value", fmt: str = "{:.4g}"):
         """Live value of the channel `track` is shaded by, at the boat."""
-        layer = TrackValueLayer(self.plotter, track, label, fmt=fmt)
+        layer = TrackValueLayer(self.plotter, track, fmt=fmt)
         self.timeline.add(layer)
         self.actors[name] = layer.actor
         return layer
+
+    def cycle_track_channel(self, step: int = 1) -> None:
+        """Show the next loaded channel on the course."""
+        if self.track is None or len(self.track.names) < 2:
+            return
+        self.track.set_channel(self.track.index + step)
+        # Reseek rather than wait for the next tick: paused, nothing else would
+        # redraw the readout, and it would go on naming the previous channel.
+        self.timeline.seek(self.timeline.t)
+        self.plotter.render()
+        lo, hi = self.track.clim
+        print(f"  shading by {self.track.label} ({lo:.4g} .. {hi:.4g})")
 
     def add_clock(self, fmt=None):
         span = self.timeline.span
@@ -796,6 +891,9 @@ class GlobeView:
         # raises even though they take nothing required.
         self.plotter.add_key_event("n", lambda: self.align_north())
         self.plotter.add_key_event("b", lambda: self.toggle_follow())
+        if self.track is not None and len(self.track.names) > 1:
+            self.plotter.add_key_event("c", lambda: self.cycle_track_channel(1))
+            self.plotter.add_key_event("C", lambda: self.cycle_track_channel(-1))
 
     def show(self, title: str = "boatforge - ocean map"):
         self._watch_zoom()
@@ -956,7 +1054,12 @@ def main() -> None:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("npz", help="artifact from  map_gen.py --save")
+    p.add_argument(
+        "--map",
+        metavar="NPZ",
+        help="artifact from map_gen.py --save; omit to draw the bare globe, "
+        "which is what you want when the track is the subject",
+    )
     p.add_argument("--show-excluded", action="store_true", help="draw rejected water too")
     p.add_argument(
         "--color-by",
@@ -967,22 +1070,29 @@ def main() -> None:
     p.add_argument("--track", metavar="NPZ", help="a track from demo_run.py, animated")
     p.add_argument(
         "--track-scalar",
-        default="battery",
-        help="which channel of the track to shade it by (default battery)",
+        nargs="+",
+        default=["battery"],
+        metavar="CHANNEL[:SCALE]",
+        help="channels of the track to shade it by (default battery). More than "
+        "one loads them all and shows the first; press c in the window to cycle. "
+        "A ':unit' or ':normalized' suffix sets that channel's scale, which is "
+        "what mixing a battery fraction with raw watts needs.",
     )
     p.add_argument(
         "--track-scale",
-        choices=("unit", "normalized"),
+        choices=SCALES,
         default="unit",
-        help="unit: shade over 0..1, for fractions like battery -- anything "
-        "outside that range clamps to one colour. normalized: shade over the "
-        "channel's own min..max, for raw channels like W or km.",
+        help="default scale for channels with no ':SCALE' suffix. unit: shade "
+        "over 0..1, for fractions like battery -- anything outside that range "
+        "clamps to one colour. normalized: shade over the channel's own "
+        "min..max, for raw channels like W or km.",
     )
     p.add_argument(
         "--track-plot",
         action="store_true",
-        help="also open a matplotlib window plotting the shading channel against "
-        "time; written beside --save/--record instead when running headless",
+        help="also open a matplotlib window plotting the shading channels "
+        "against time, one panel each; written beside --save/--record instead "
+        "when running headless",
     )
     p.add_argument("--coastlines", default="50m", choices=("10m", "50m", "110m", "none"))
     p.add_argument("--graticule", type=int, default=15, metavar="DEG", help="0 to disable")
@@ -1000,33 +1110,40 @@ def main() -> None:
     )
     args = p.parse_args()
 
-    art = NavMap.load(args.npz)
-    legal, margin, budget, illegal = art.leaves()
-    values = budget if args.color_by == "budget" else margin
-    bar = {"margin": "clearance margin (km)", "budget": "travel budget (km)"}[args.color_by]
-    print(f"K={art.K} km, W={art.W} km, res {art.res_min}..{art.res_base}")
-    print(f"{len(legal):,} navigable cells, {len(illegal):,} excluded")
-    print(f"margin {margin.min():.1f}..{margin.max():.1f} km")
-    print(f"budget {budget.min():.1f}..{budget.max():.1f} km")
+    if not args.map and not args.track:
+        p.error("nothing to draw: pass --map, --track, or both")
+
+    art = None
+    if args.map:
+        art = NavMap.load(args.map)
+        legal, margin, budget, illegal = art.leaves()
+        values = budget if args.color_by == "budget" else margin
+        bar = {"margin": "clearance margin (km)",
+               "budget": "travel budget (km)"}[args.color_by]
+        print(f"K={art.K} km, W={art.W} km, res {art.res_min}..{art.res_base}")
+        print(f"{len(legal):,} navigable cells, {len(illegal):,} excluded")
+        print(f"margin {margin.min():.1f}..{margin.max():.1f} km")
+        print(f"budget {budget.min():.1f}..{budget.max():.1f} km")
 
     view = GlobeView(size=tuple(args.size), off_screen=bool(args.save))
     view.add_planet()
-    if args.show_excluded and len(illegal):
-        # Held translucent on purpose: a coarse cell is "wholly illegal" on the
-        # evidence of the water sampled inside it, but the hexagon also spans any
-        # land in there, which was never sampled. Letting the coastline read
-        # through keeps the claim honest.
-        view.add_cells(illegal, name="excluded", color=EXCLUDED, opacity=0.55)
-    view.add_cells(
-        legal, values, name="navigable", clim=(0, float(np.percentile(values, 98))),
-        scalar_bar=bar,
-    )
+    if art is not None:
+        if args.show_excluded and len(illegal):
+            # Held translucent on purpose: a coarse cell is "wholly illegal" on
+            # the evidence of the water sampled inside it, but the hexagon also
+            # spans any land in there, which was never sampled. Letting the
+            # coastline read through keeps the claim honest.
+            view.add_cells(illegal, name="excluded", color=EXCLUDED, opacity=0.55)
+        view.add_cells(
+            legal, values, name="navigable",
+            clim=(0, float(np.percentile(values, 98))), scalar_bar=bar,
+        )
     if args.coastlines != "none":
         view.add_coastlines(args.coastlines)
     if args.graticule:
         view.add_graticule(args.graticule)
 
-    target = art.centre
+    target = art.centre if art is not None else (0.0, 0.0)
     channel_fig = None
     if args.track:
         tr = load_track(args.track)
@@ -1034,63 +1151,82 @@ def main() -> None:
         # Centre on the course, not the bbox: the bbox centre is often over water
         # the (K, W) rules excluded, which points the camera at nothing.
         target = (float(np.mean(lat)), float(np.mean(lng)))
-        channels = [k for k, v in tr.items() if getattr(v, "shape", None) == lat.shape]
-        scalar = tr.get(args.track_scalar)
-        if scalar is not None and scalar.shape != lat.shape:
-            scalar = None  # e.g. speed_kmh, a header value rather than a channel
+        available = [k for k, v in tr.items() if getattr(v, "shape", None) == lat.shape]
+        print(f"track: {len(lat)} points over {hours[-1]:.1f} h, channels {available}")
 
-        # Say so rather than falling back to a flat orange line, which reads as
-        # "the shading is broken" instead of "that channel is not in the file".
-        clim = None
-        if scalar is None:
+        # Keep the order asked for, drop what the file does not have, and say
+        # which -- silently falling back to a flat orange line reads as "the
+        # shading is broken" rather than "that channel is not in there".
+        chosen, scales, missing = {}, {}, []
+        for spec in args.track_scalar:
+            # "name" or "name:unit" / "name:normalized". Only a suffix that
+            # names a real mode is taken as one, so a channel with a colon in
+            # its name still resolves.
+            head, sep, tail = spec.rpartition(":")
+            name, mode = (head, tail) if sep and tail in SCALES else (spec, "")
+
+            values = tr.get(name)
+            if values is None or values.shape != lat.shape:
+                missing.append(name)  # absent, or a header value not a channel
+                continue
+            chosen[name] = values
+            scales[name] = mode or args.track_scale
+        if missing:
             print(
-                f"  no channel {args.track_scalar!r} to shade by; "
-                f"drawing the course unshaded. available: {channels}"
+                f"  no channel{'s' if len(missing) > 1 else ''} "
+                f"{', '.join(repr(m) for m in missing)}; available: {available}"
             )
-        else:
-            lo, hi = float(np.min(scalar)), float(np.max(scalar))
-            if args.track_scale == "normalized":
-                # A flat channel has no range to spread a colour map over.
-                clim = (lo, hi) if hi > lo else None
-            elif lo < 0.0 or hi > 1.0:
-                print(
-                    f"  {args.track_scalar} spans {lo:.4g}..{hi:.4g}, outside the "
-                    "0..1 unit scale; pass --track-scale normalized to spread the "
-                    "colour map over it"
-                )
-            print(f"  shading by {args.track_scalar} ({lo:.4g}..{hi:.4g}), "
-                  f"scale {args.track_scale}")
+        if not chosen:
+            print("  drawing the course unshaded")
+
+        for name, values in chosen.items():
+            lo, hi = float(np.min(values)), float(np.max(values))
+            note = ""
+            if scales[name] == "unit" and (lo < 0.0 or hi > 1.0):
+                note = f"  -- outside the 0..1 unit scale, use {name}:normalized"
+            print(f"  channel {name} ({lo:.4g}..{hi:.4g}) {scales[name]}{note}")
+        if chosen:
+            print(f"  shading by {next(iter(chosen))}"
+                  + ("   [c] cycles" if len(chosen) > 1 else ""))
 
         track = view.add_track(
-            lat, lng, values=scalar, times=hours, width=5, clim=clim,
-            scalar_bar=scalar is not None, label=args.track_scalar,
+            lat, lng, times=hours, width=5, channels=chosen or None,
+            scale=args.track_scale, scales=scales, scalar_bar=bool(chosen),
         )
-        if scalar is not None:
-            view.add_track_readout(track, args.track_scalar)
+        if chosen:
+            view.add_track_readout(track)
         view.add_markers([lat[0], lat[-1]], [lng[0], lng[-1]], labels=["start", "goal"])
         view.add_clock(lambda t: f"T+{t:5.1f} h   day {int(t // 24) + 1}")
-        print(f"track: {len(lat)} points over {hours[-1]:.1f} h, channels {channels}")
 
         if args.track_plot:
-            if scalar is None:
-                print(f"  nothing to plot: no channel {args.track_scalar!r}")
+            if not chosen:
+                print("  nothing to plot: no channel selected")
             else:
                 headless = args.save or args.record
+                stem = "-".join(chosen)
                 out = (
-                    f"{Path(headless).with_suffix('')}.{args.track_scalar}.png"
+                    f"{Path(headless).with_suffix('')}.{stem}.png"
                     if headless
                     else None
                 )
-                channel_fig = plot_channel(hours, scalar, args.track_scalar, out)
+                channel_fig = plot_channels(hours, chosen, out)
 
-    view.add_title(
-        f"navigable ocean   K={art.K:g} km   W={art.W:g} km",
-        f"{len(legal):,} cells, res {art.res_min}-{art.res_base}   |   shaded by {args.color_by}"
-        + ("   |   excluded water in grey" if args.show_excluded else ""),
-    )
+    if art is not None:
+        view.add_title(
+            f"navigable ocean   K={art.K:g} km   W={art.W:g} km",
+            f"{len(legal):,} cells, res {art.res_min}-{art.res_base}   |   "
+            f"shaded by {args.color_by}"
+            + ("   |   excluded water in grey" if args.show_excluded else ""),
+        )
+    elif args.track:
+        # Without a map the course is the subject, so the title says what it is.
+        view.add_title(
+            Path(args.track).stem,
+            f"{len(lat)} points over {hours[-1]:.1f} h",
+        )
     view.look_at(
         *(args.view if args.view else target),
-        distance=args.distance or camera_distance(art.bbox),
+        distance=args.distance or camera_distance(art.bbox if art else None),
     )
 
     # Drawn before the globe takes the foreground so both are on screen at once.
