@@ -140,12 +140,16 @@ NpzField NpzField::load(const std::filesystem::path& path)
     // Loaded here rather than on first use: a single-file field has nothing to
     // defer to, and a caller that got a field back has always been able to
     // assume the file was readable.
-    field.make_resident(0);
+    field.make_active(0);
     return field;
 }
 
-NpzField NpzField::load_directory(const std::filesystem::path& dir)
+NpzField NpzField::load_directory(const std::filesystem::path& dir, std::size_t cached_parts)
 {
+    if (cached_parts == 0)
+    {
+        throw NpyError{"a field needs at least one part in memory to sample"};
+    }
     if (!std::filesystem::is_directory(dir))
     {
         throw NpyError{std::format("{} is not a directory", dir.string())};
@@ -168,6 +172,7 @@ NpzField NpzField::load_directory(const std::filesystem::path& dir)
     std::sort(files.begin(), files.end());
 
     NpzField field;
+    field.cache_limit_ = cached_parts;
     bool first = true;
     for (const auto& path : files)
     {
@@ -211,16 +216,31 @@ NpzField NpzField::load_directory(const std::filesystem::path& dir)
     std::sort(field.parts_.begin(), field.parts_.end(),
               [](const Part& a, const Part& b) { return a.t0 < b.t0; });
 
+    // A cache bigger than the field wastes nothing, but reporting it back as
+    // the limit would overstate what is held.
+    field.cache_limit_ = std::min(field.cache_limit_, field.parts_.size());
+
     // Deliberately not loaded: the point of a directory is that the first
     // sample decides which part is worth reading.
     return field;
 }
 
-void NpzField::make_resident(std::size_t index) const
+void NpzField::make_active(std::size_t index) const
 {
-    if (index == resident_)
+    if (active_ != npos && cache_[active_].part == index)
     {
         return;
+    }
+
+    // Already in memory from an earlier crossing: this is the whole point of a
+    // cache deeper than one, and it costs a scan of at most cache_limit_ slots.
+    for (std::size_t slot = 0; slot < cache_.size(); ++slot)
+    {
+        if (cache_[slot].part == index)
+        {
+            active_ = slot;
+            return;
+        }
     }
 
     const Part& part = parts_[index];
@@ -232,25 +252,23 @@ void NpzField::make_resident(std::size_t index) const
         throw NpyError{std::format("{}: not a gridded field npz: no 'data' array", part.path.string())};
     }
 
-    // Assigned, not swapped in beside the old one: the previous payload is
-    // released here, so peak memory stays at one part rather than two. Moved
-    // rather than copied because the archive is dead after this point anyway.
-    data_ = std::move(data_it->second);
-    t0_ = part.t0;
-    nt_ = part.nt;
+    Loaded loaded;
+    // Moved, not copied: a part is up to the writer's whole byte budget and the
+    // archive is dead after this point anyway.
+    loaded.data = std::move(data_it->second);
+    loaded.t0 = part.t0;
+    loaded.nt = part.nt;
 
-    const std::vector<std::size_t>& shape = data_.shape();
-    if (shape.size() != 3 || shape[0] != nt_ || shape[1] != nlat_ || shape[2] != nlon_)
+    const std::vector<std::size_t>& shape = loaded.data.shape();
+    if (shape.size() != 3 || shape[0] != loaded.nt || shape[1] != nlat_ || shape[2] != nlon_)
     {
-        resident_ = npos;
         throw NpyError{std::format("{}: 'data' has shape {}, but the axes say ({}, {}, {})", part.path.string(),
-                                   data_.shape_string(), nt_, nlat_, nlon_)};
+                                   loaded.data.shape_string(), loaded.nt, nlat_, nlon_)};
     }
-    if (data_.fortran_order())
+    if (loaded.data.fortran_order())
     {
-        resident_ = npos;
-        throw NpyError{std::format("{}: 'data' is Fortran-ordered; the sampler indexes it C-order",
-                                   part.path.string())};
+        throw NpyError{
+            std::format("{}: 'data' is Fortran-ordered; the sampler indexes it C-order", part.path.string())};
     }
 
     // The dtype the writer chose is what says whether values are quantised;
@@ -258,49 +276,66 @@ void NpzField::make_resident(std::size_t index) const
     // part, not once for the field: each part carries its own, and while
     // grib_npz.py quantises a split field against one shared range, a directory
     // assembled by other means need not.
-    switch (data_.dtype())
+    switch (loaded.data.dtype())
     {
         case DType::UInt16:
-            quantised_ = true;
-            scale_ = scalar<double>(npz, "scale");
-            offset_ = scalar<double>(npz, "offset");
-            fill_ = static_cast<uint16_t>(scalar<int64_t>(npz, "fill"));
+            loaded.quantised = true;
+            loaded.scale = scalar<double>(npz, "scale");
+            loaded.offset = scalar<double>(npz, "offset");
+            loaded.fill = static_cast<uint16_t>(scalar<int64_t>(npz, "fill"));
             break;
         case DType::Float32:
-            quantised_ = false;
+            loaded.quantised = false;
             break;
         default:
-            resident_ = npos;
             throw NpyError{std::format("{}: 'data' is {}; expected uint16 (quantised) or float32",
-                                       part.path.string(), to_string(data_.dtype()))};
+                                       part.path.string(), to_string(loaded.data.dtype()))};
     }
 
-    resident_ = index;
+    // Built to one side and committed here, so a part that fails to load leaves
+    // the cache exactly as it was rather than punching a hole in it.
+    loaded.part = index;
+    if (cache_.size() < cache_limit_)
+    {
+        active_ = cache_.size();
+        cache_.push_back(std::move(loaded));
+    }
+    else
+    {
+        // Overwritten in place: the evicted payload is released by the
+        // assignment, so peak memory is the limit plus the part being read, not
+        // the limit doubled.
+        active_ = next_slot_;
+        cache_[next_slot_] = std::move(loaded);
+    }
+    next_slot_ = (active_ + 1) % cache_limit_;
 }
 
 float NpzField::at(std::size_t i, std::size_t j, std::size_t k) const
 {
+    const Loaded& loaded = cache_[active_];
     const std::size_t index = (i * nlat_ + j) * nlon_ + k;
-    if (!quantised_)
+    if (!loaded.quantised)
     {
-        return data_.as<float>()[index];
+        return loaded.data.as<float>()[index];
     }
-    const uint16_t raw = data_.as<uint16_t>()[index];
-    if (raw == fill_)
+    const uint16_t raw = loaded.data.as<uint16_t>()[index];
+    if (raw == loaded.fill)
     {
         return not_a_number;
     }
-    return static_cast<float>(static_cast<double>(raw) * scale_ + offset_);
+    return static_cast<float>(static_cast<double>(raw) * loaded.scale + loaded.offset);
 }
 
 bool NpzField::sample(std::chrono::seconds when, double lat, double lon, float& value) const
 {
     // --- which part answers this ------------------------------------------
-    // The resident part is tried first, and on a forward walk it keeps
-    // answering until the field steps off its end -- so the scan below, and the
-    // load after it, happen once per boundary crossed rather than once per
-    // sample. The scan being linear costs nothing next to the load it precedes.
-    if (resident_ == npos || when < t0_ || when > parts_[resident_].end)
+    // The part the last sample used is tried first, and on a walk forward it
+    // keeps answering until time steps off its end -- so the scan below, and
+    // the load that may follow it, happen once per boundary crossed rather than
+    // once per sample. The scan being linear costs nothing next to the load it
+    // precedes, and nothing at all when the part is still cached.
+    if (active_ == npos || when < cache_[active_].t0 || when > parts_[cache_[active_].part].end)
     {
         std::size_t found = npos;
         for (std::size_t i = 0; i < parts_.size(); ++i)
@@ -318,17 +353,18 @@ bool NpzField::sample(std::chrono::seconds when, double lat, double lon, float& 
             // single-file field -- nothing is loaded to find that out.
             return false;
         }
-        make_resident(found);
+        make_active(found);
     }
 
-    if (nt_ == 0)
+    const Loaded& loaded = cache_[active_];
+    if (loaded.nt == 0)
     {
         return false;
     }
 
     // --- fractional indices, by arithmetic ---------------------------------
-    const double ti = static_cast<double>((when - t0_).count()) / static_cast<double>(step_.count());
-    if (!(ti >= 0.0) || ti > static_cast<double>(nt_ - 1))
+    const double ti = static_cast<double>((when - loaded.t0).count()) / static_cast<double>(step_.count());
+    if (!(ti >= 0.0) || ti > static_cast<double>(loaded.nt - 1))
     {
         return false;  // also rejects NaN input, via the negated comparison
     }
@@ -360,7 +396,7 @@ bool NpzField::sample(std::chrono::seconds when, double lat, double lon, float& 
     const std::size_t j0 = static_cast<std::size_t>(yi);
     const std::size_t k0 = static_cast<std::size_t>(xi);
 
-    const std::size_t i1 = i0 + 1 < nt_ ? i0 + 1 : i0;
+    const std::size_t i1 = i0 + 1 < loaded.nt ? i0 + 1 : i0;
     const std::size_t j1 = j0 + 1 < nlat_ ? j0 + 1 : j0;
     // On a global axis the cell after the last one is the first one again, so
     // the seam blends instead of clamping.

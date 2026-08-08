@@ -36,20 +36,24 @@ public:
     // Nothing is loaded here. The constructor reads each part's axis constants
     // -- a few hundred bytes, skipping the payload entirely -- and keeps the
     // window each file covers. The first sample() loads the part that answers
-    // it; a later sample() outside that window loads the part that holds it and
-    // drops the previous one. So the resident cost is one part, not one field,
+    // it, and a sample outside every loaded part loads the one that holds it.
+    // So the resident cost is `cached_parts` parts, not the whole field,
     // whatever the directory adds up to.
     //
-    // That makes a *forward* walk cheap -- one load per part crossed -- and a
-    // walk that alternates across a boundary expensive, since each alternation
-    // is a full decompression. Sims that share one field across runs at
-    // different times (Sim does) will thrash if their windows differ; see the
-    // note on sample().
+    // `cached_parts` is what that costs against what it saves. One part is the
+    // least memory and is enough for a single walk forward through time: each
+    // boundary is crossed once. It is the wrong answer for callers that
+    // interleave several walks at different times through one field -- Sim
+    // does, stepping every run round-robin -- because each alternation across a
+    // boundary would evict the part the other walk is about to want, and every
+    // eviction costs a full decompression. Sizing the cache to the number of
+    // distinct windows in flight turns that back into one load per part.
     //
     // Throws NpyError if `dir` holds no .npz, if any part is not a field npz,
     // or if the parts disagree on the grid or the time step -- they have to
-    // interchange under one set of axis constants to be one field.
-    static NpzField load_directory(const std::filesystem::path& dir);
+    // interchange under one set of axis constants to be one field. Also throws
+    // if `cached_parts` is 0.
+    static NpzField load_directory(const std::filesystem::path& dir, std::size_t cached_parts = 2);
 
     // Which parts back this field, in time order. One entry naming the file
     // itself for a single-file load, so the two cases report the same shape.
@@ -66,13 +70,24 @@ public:
         return parts_;
     }
 
-    // Index into parts() of the part currently in memory, or npos if none is --
-    // which is the state a directory field starts in, before the first sample.
     static constexpr std::size_t npos = static_cast<std::size_t>(-1);
 
+    // Index into parts() of the part the last sample was answered from, or npos
+    // before the first one -- which is the state a directory field starts in.
     std::size_t resident() const
     {
-        return resident_;
+        return active_ == npos ? npos : cache_[active_].part;
+    }
+
+    // How many parts are in memory now, and the ceiling on that.
+    std::size_t cached() const
+    {
+        return cache_.size();
+    }
+
+    std::size_t cache_limit() const
+    {
+        return cache_limit_;
     }
 
     // The field's value at a point, trilinear in (time, latitude, longitude),
@@ -105,9 +120,10 @@ private:
     // Dequantised value at a grid node. NaN where the source marked no data.
     float at(std::size_t i, std::size_t j, std::size_t k) const;
 
-    // Makes parts_[index] the resident part, replacing whatever was. No-op if
-    // it already is, so the common case costs one comparison.
-    void make_resident(std::size_t index) const;
+    // Makes parts_[index] the part sampling reads from, loading it if it is not
+    // already cached. No-op if it is already active, so the common case costs
+    // one comparison.
+    void make_active(std::size_t index) const;
 
     // Grid and time step, shared by every part -- checked at index time, since
     // parts that disagree cannot be sampled through one set of constants.
@@ -122,24 +138,39 @@ private:
     // swap needs no second directory scan.
     std::vector<Part> parts_;
 
-    // The part in memory, and what about the field is true only while it is.
-    // Mutable because sampling a directory field is what triggers the load:
-    // hiding that behind a const sample() keeps callers that hold a
-    // `const NpzField&` -- and the single-file case, where nothing is ever
-    // reloaded -- unchanged.
+    // One part in memory, and what about the field is true only while it is.
     //
     // Payload is kept in the dtype the script wrote it in. A quantised cube is
     // half the size of the float one, and for a global month that difference
     // is gigabytes -- so it is dequantised per access rather than up front.
     // scale/offset/fill are read verbatim from the npz; quantised comes from
     // the payload's own dtype rather than a flag that could contradict it.
-    mutable std::size_t resident_ = npos;
-    mutable std::chrono::seconds t0_{0};  // frame 0 of the resident part
-    mutable std::size_t nt_ = 0;
-    mutable NpyArray data_;
-    mutable bool quantised_ = false;
-    mutable double scale_ = 1.0, offset_ = 0.0;
-    mutable uint16_t fill_ = 0;
+    struct Loaded
+    {
+        std::size_t part = npos;  // index into parts_
+        std::chrono::seconds t0{0};
+        std::size_t nt = 0;
+        NpyArray data;
+        bool quantised = false;
+        double scale = 1.0, offset = 0.0;
+        uint16_t fill = 0;
+    };
+
+    // A ring, not an LRU: a sim steps time forward, so parts are loaded in time
+    // order and the oldest slot is always the one furthest behind the walk --
+    // which is what an LRU would pick anyway, without the bookkeeping. A caller
+    // that jumped around the time axis at random would get worse hit rates than
+    // an LRU here, and should size the cache rather than expect the eviction
+    // order to save it.
+    //
+    // Mutable because sampling a directory field is what triggers the load:
+    // hiding that behind a const sample() keeps callers that hold a
+    // `const NpzField&` -- and the single-file case, where nothing is ever
+    // reloaded -- unchanged.
+    mutable std::vector<Loaded> cache_;  // grows to cache_limit_, then is overwritten in place
+    mutable std::size_t next_slot_ = 0;  // where the next load lands
+    mutable std::size_t active_ = npos;  // slot the last sample read from
+    std::size_t cache_limit_ = 1;
 };
 
 }  // namespace boatforge

@@ -40,9 +40,13 @@ public:
         lat_lon start{};
         lat_lon end{};
 
-        /* npz written by scripts/grib_npz.py. Loaded by Sim, and shared between
-         * runs that name the same file, so a sweep of start days over one
-         * weather cube only pays for the load once. */
+        /* npz written by scripts/grib_npz.py, or a directory of the parts it
+         * writes when one cube would exceed its byte limit -- which of the two
+         * is decided by what is on disk, not by a second key. Loaded by Sim,
+         * and shared between runs that name the same path, so a sweep of start
+         * days over one weather cube only pays for the load once. A directory
+         * additionally loads only the parts being sampled; see
+         * config_t::field_cache_parts. */
         std::filesystem::path solar_field{};
 
         /* Steps of blackboard::time_step to run before giving up on reaching
@@ -57,6 +61,17 @@ public:
     struct config_t
     {
         std::filesystem::path out_directory = ".";
+
+        /* Parts of a split field kept in memory at once, per field. Runs are
+         * stepped round-robin and share one field, so a sweep whose start days
+         * fall in different parts has that many windows in flight at once --
+         * and a cache smaller than that reloads a part on every alternation.
+         * Two is enough for a sweep spanning one boundary; widen it for a
+         * sweep spread over more, at one part of memory each.
+         *
+         * Ignored by a field that is a single npz: there is nothing to evict. */
+        std::size_t field_cache_parts = 2;
+
         std::vector<run_t> runs;
     };
 
@@ -70,7 +85,14 @@ public:
             auto field = solar_fields_.find(run.solar_field);
             if (field == solar_fields_.end())
             {
-                field = solar_fields_.emplace(run.solar_field, boatforge::NpzField::load(run.solar_field)).first;
+                /* A directory is a field split along time, a file is the whole
+                 * cube. Asking the filesystem rather than the config keeps the
+                 * two from disagreeing about what is there. */
+                boatforge::NpzField loaded =
+                    std::filesystem::is_directory(run.solar_field)
+                        ? boatforge::NpzField::load_directory(run.solar_field, config_.field_cache_parts)
+                        : boatforge::NpzField::load(run.solar_field);
+                field = solar_fields_.emplace(run.solar_field, std::move(loaded)).first;
             }
 
             instances_.emplace_back(run, field->second, config_.out_directory);

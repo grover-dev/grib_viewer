@@ -99,6 +99,14 @@ Sim::config_t load_config(const std::filesystem::path& config_path)
     {
         config.out_directory = resolve(base, document["out_directory"].as<std::string>());
     }
+    if (document["field_cache_parts"])
+    {
+        config.field_cache_parts = document["field_cache_parts"].as<std::size_t>();
+        if (config.field_cache_parts == 0)
+        {
+            throw std::runtime_error("field_cache_parts is 0; a field needs at least one part in memory");
+        }
+    }
 
     Sim::run_t defaults;
     if (document["defaults"])

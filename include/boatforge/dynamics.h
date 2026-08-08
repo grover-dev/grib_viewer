@@ -179,6 +179,7 @@ public:
             bb_.avionics_power_out_w = 100.0;
         }
 
+        // FIXME: eventually this should be based on sensor data
         bb_.powered_heading = initial_bearing_deg(bb_.current_lat, bb_.current_lon, bb_.end_lat, bb_.end_lon);
 
         bb_.powered_velocity =

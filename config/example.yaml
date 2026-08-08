@@ -8,19 +8,40 @@
 
 out_directory: ../out
 
+# Parts of a split field (see solar_field below) held in memory at once. Runs
+# are stepped round-robin over one shared field, so this wants to be at least
+# the number of *different parts* the runs are sampling at any moment: with a
+# smaller cache, each alternation between two runs in different parts evicts the
+# part the other is about to ask for and pays to decompress it again. A sweep of
+# start days landing either side of one boundary is happy at 2; spread the sweep
+# wider and raise this, at one part's worth of memory each (whatever --max-mib
+# grib_npz.py was given, so 512 MiB by default).
+#
+# Ignored when solar_field is a single npz -- there is nothing to evict.
+field_cache_parts: 2
+
 # Applied to every run below. A run repeating one of these keys overrides it
 # for itself, so a sweep only has to write the field that varies -- which for a
 # start-day sweep is start_time, and nothing else.
 defaults:
   # Gridded solar field, as written by scripts/grib_npz.py. Runs naming the
-  # same file share a single load.
+  # same path share a single load.
+  #
+  # Either a single npz, or a directory of the parts grib_npz.py writes when
+  # one cube would exceed its byte limit (name.000.npz, name.001.npz, ...).
+  # Which one it is comes from what is on disk, so pointing this at a directory
+  # is the whole of the change -- a split field then loads only the parts being
+  # sampled, and field_cache_parts above decides how many that is. The parts
+  # have to share a grid and a time step; a directory mixing fields is refused
+  # rather than sampled inconsistently.
   # solar_field: ../data/ssrd_global_20250101_10.npz
+  # solar_field: ../data/ssrd_global_2025          # a directory of parts
   solar_field: ../data/ssrd_global_2025_jan.npz
 
   # Degrees, WGS84. Approximately LA
   start: { lat: 33.5, lon: -120.0 }
   # ...to further off the coast of spain.
-  end: { lat: 19, 0, lon: -154.0 }
+  end: { lat: 19.0, lon: -154.0 }
 
   # Steps of blackboard::time_step (1 h) before a run gives up.
   max_steps: 1000

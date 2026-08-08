@@ -206,7 +206,8 @@ TEST(NpzFieldSplit, NothingIsResidentUntilTheFirstSample) {
     TempDir dir{"deferred"};
     split_fixture("region_u16.npz", dir.path(), 3);
 
-    const NpzField split = NpzField::load_directory(dir.path());
+    const NpzField split = NpzField::load_directory(dir.path(), 1);
+    EXPECT_EQ(split.cached(), 0u);
     EXPECT_GT(split.parts().size(), 1u);
     EXPECT_EQ(split.resident(), NpzField::npos);
 
@@ -226,7 +227,7 @@ TEST(NpzFieldSplit, WalkingForwardSwapsPartsInOrderAndOnlyAtBoundaries) {
     TempDir dir{"walk"};
     split_fixture("region_u16.npz", dir.path(), 3);
 
-    const NpzField split = NpzField::load_directory(dir.path());
+    const NpzField split = NpzField::load_directory(dir.path(), 1);
     const Grid grid = grid_of("region_u16.npz");
     const seconds t0 = split.parts().front().t0;
 
@@ -248,7 +249,8 @@ TEST(NpzFieldSplit, ResamplingInsideTheResidentPartLoadsNothing) {
     TempDir dir{"sticky"};
     split_fixture("region_u16.npz", dir.path(), 3);
 
-    const NpzField split = NpzField::load_directory(dir.path());
+    // One slot, so the parts deleted below cannot be answered from the cache.
+    const NpzField split = NpzField::load_directory(dir.path(), 1);
     const Grid grid = grid_of("region_u16.npz");
 
     // Take the last part resident, then delete every file: further samples
@@ -302,6 +304,135 @@ TEST(NpzFieldSplit, AGapBetweenPartsIsAMiss) {
     if (hole > split.parts().front().end && hole < split.parts()[1].t0) {
         EXPECT_TRUE(std::isnan(sample(split, hole, grid.lat, grid.lon)));
     }
+}
+
+// --------------------------------------------------------------------------
+// The cache: how many parts stay in memory, and what that buys.
+// --------------------------------------------------------------------------
+
+// Counts loads by watching resident() change is not enough -- a part answered
+// from the cache also changes it. Files are made unreadable instead, so a load
+// that does happen is unmistakable.
+TEST(NpzFieldCache, HoldsUpToTheLimitAndNoMore) {
+    TempDir dir{"limit"};
+    split_fixture("region_u16.npz", dir.path(), 2);
+
+    const NpzField split = NpzField::load_directory(dir.path(), 3);
+    ASSERT_GT(split.parts().size(), 3u);
+    EXPECT_EQ(split.cache_limit(), 3u);
+
+    const Grid grid = grid_of("region_u16.npz");
+    for (const auto& part : split.parts()) {
+        sample(split, part.end, grid.lat, grid.lon);
+        EXPECT_LE(split.cached(), 3u);
+    }
+    EXPECT_EQ(split.cached(), 3u);
+}
+
+// The case the depth exists for: two walks a few parts apart, stepped
+// alternately the way Sim steps its runs round-robin. With one slot each
+// alternation evicts what the other walk wants; with two, neither reloads.
+TEST(NpzFieldCache, InterleavedWalksDoNotEvictEachOther) {
+    TempDir dir{"interleaved"};
+    split_fixture("region_u16.npz", dir.path(), 2);
+
+    const NpzField split = NpzField::load_directory(dir.path(), 2);
+    ASSERT_GE(split.parts().size(), 2u);
+    const Grid grid = grid_of("region_u16.npz");
+
+    // Both parts loaded, then every file removed: further alternation can only
+    // be served from the cache.
+    const seconds a = split.parts().front().t0;
+    const seconds b = split.parts()[1].end;
+    sample(split, a, grid.lat, grid.lon);
+    sample(split, b, grid.lat, grid.lon);
+    ASSERT_EQ(split.cached(), 2u);
+
+    for (const auto& part : split.parts()) {
+        std::filesystem::remove(part.path);
+    }
+
+    for (int i = 0; i < 8; ++i) {
+        EXPECT_FALSE(std::isnan(sample(split, a, grid.lat, grid.lon)));
+        EXPECT_FALSE(std::isnan(sample(split, b, grid.lat, grid.lon)));
+    }
+}
+
+// The same alternation with one slot has to reload every time -- the property
+// that makes the depth worth having.
+TEST(NpzFieldCache, OneSlotReloadsOnEveryAlternation) {
+    TempDir dir{"thrash"};
+    split_fixture("region_u16.npz", dir.path(), 2);
+
+    const NpzField split = NpzField::load_directory(dir.path(), 1);
+    const Grid grid = grid_of("region_u16.npz");
+    const seconds a = split.parts().front().t0;
+    const seconds b = split.parts()[1].end;
+
+    sample(split, a, grid.lat, grid.lon);
+    sample(split, b, grid.lat, grid.lon);
+    EXPECT_EQ(split.cached(), 1u);
+
+    for (const auto& part : split.parts()) {
+        std::filesystem::remove(part.path);
+    }
+    EXPECT_THROW(sample(split, a, grid.lat, grid.lon), NpyError);
+}
+
+// Eviction is by insertion order, and insertion order is time order, so the
+// slot reused is always the one furthest behind the walk.
+TEST(NpzFieldCache, EvictsInLoadOrder) {
+    TempDir dir{"ring"};
+    split_fixture("region_u16.npz", dir.path(), 2);
+
+    const NpzField split = NpzField::load_directory(dir.path(), 2);
+    ASSERT_GE(split.parts().size(), 3u);
+    const Grid grid = grid_of("region_u16.npz");
+
+    // Load parts 0 and 1, then 2 -- which must take part 0's slot.
+    sample(split, split.parts()[0].t0, grid.lat, grid.lon);
+    sample(split, split.parts()[1].end, grid.lat, grid.lon);
+    sample(split, split.parts()[2].end, grid.lat, grid.lon);
+    ASSERT_EQ(split.cached(), 2u);
+
+    std::filesystem::remove(split.parts()[0].path);
+    // 1 and 2 are still cached...
+    EXPECT_FALSE(std::isnan(sample(split, split.parts()[1].end, grid.lat, grid.lon)));
+    EXPECT_FALSE(std::isnan(sample(split, split.parts()[2].end, grid.lat, grid.lon)));
+    // ...and 0 is the one that was dropped.
+    EXPECT_THROW(sample(split, split.parts()[0].t0, grid.lat, grid.lon), NpyError);
+}
+
+TEST(NpzFieldCache, DepthDoesNotChangeAnyAnswer) {
+    const NpzField whole = NpzField::load(fixture("region_u16.npz"));
+    const Grid grid = grid_of("region_u16.npz");
+
+    TempDir dir{"depths"};
+    split_fixture("region_u16.npz", dir.path(), 2);
+
+    for (const std::size_t depth : {1u, 2u, 4u, 99u}) {
+        SCOPED_TRACE(depth);
+        const NpzField split = NpzField::load_directory(dir.path(), depth);
+        for (const seconds when : probe_times(whole, grid.dt, grid.nt)) {
+            ASSERT_FLOAT_EQ(sample(whole, when, grid.lat, grid.lon),
+                            sample(split, when, grid.lat, grid.lon))
+                << when.count();
+        }
+    }
+}
+
+TEST(NpzFieldCache, IsCappedAtThePartCount) {
+    TempDir dir{"oversized"};
+    split_fixture("region_u16.npz", dir.path(), 3);
+
+    const NpzField split = NpzField::load_directory(dir.path(), 1000);
+    EXPECT_EQ(split.cache_limit(), split.parts().size());
+}
+
+TEST(NpzFieldCache, ZeroIsRejected) {
+    TempDir dir{"zero"};
+    split_fixture("region_u16.npz", dir.path(), 3);
+    EXPECT_THROW(NpzField::load_directory(dir.path(), 0), NpyError);
 }
 
 // --------------------------------------------------------------------------
