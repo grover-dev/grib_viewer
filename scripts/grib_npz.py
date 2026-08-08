@@ -34,6 +34,20 @@ without saying so in their units -- total precipitation is metres, not a rate.
 Values are quantised to uint16 with a scale/offset by default, which halves the
 file for a resolution loss far below the accuracy of the underlying reanalysis.
 `--dtype f32` stores the floats verbatim.
+
+A long selection is split across several outputs rather than written as one
+cube, so neither this script nor its reader ever holds more than `--max-mib` of
+payload at once. The split is along time -- the grid is never cut, so every part
+is a complete field over a shorter window, addressed by the same arithmetic. See
+`plan_chunks` for how the boundaries are placed.
+
+The manifest is embedded rather than written alongside: each part carries
+`part`, `nparts`, `part_t0` and `part_nt`, the last two being the first stamp
+and frame count of *every* part. So opening any single part answers which file
+covers a given instant, and parts cannot drift out of sync with an index that
+lives somewhere else. Filenames are not stored -- they follow the `chunk_path`
+pattern. All four members are additive, and `version` stays 1, so a reader that
+predates the split still loads a part as the ordinary field it also is.
 """
 
 from __future__ import annotations
@@ -91,6 +105,44 @@ def uniform_step(values: np.ndarray, what: str, tol: float) -> float:
     return float(steps.mean())
 
 
+def plan_chunks(nt: int, frame_bytes: int, limit: int) -> list[tuple[int, int]]:
+    """Time ranges, end-exclusive, each at most `limit` bytes of payload.
+
+    Consecutive parts overlap by one frame. A sampler at time t needs the frames
+    on either side of it, so without the overlap the interval between the last
+    frame of one part and the first of the next would belong to no file at all --
+    a hole at every boundary. Duplicating one frame costs a fraction of a percent
+    and makes each part independently samplable across its whole span.
+
+    A single frame over the limit cannot be split further -- the grid is not cut --
+    so it is emitted alone and over budget rather than refused.
+    """
+    per_chunk = max(1, limit // max(frame_bytes, 1))
+    if per_chunk >= nt:
+        return [(0, nt)]
+
+    chunks, start = [], 0
+    while start < nt:
+        stop = min(nt, start + per_chunk)
+        chunks.append((start, stop))
+        if stop >= nt:
+            break
+        # Step back one so this part's last frame is the next part's first.
+        start = stop - 1 if per_chunk > 1 else stop
+    return chunks
+
+
+def chunk_path(dst: Path, index: int, total: int) -> Path:
+    """'waves.npz' -> 'waves.npz' alone, or 'waves.000.npz', 'waves.001.npz', ...
+
+    Zero-padded so the parts sort in time order in a shell glob, and the suffix
+    is kept last so they still look like npz files to everything downstream.
+    """
+    if total == 1:
+        return dst
+    return dst.with_suffix(f".{index:03d}{dst.suffix}")
+
+
 def list_fields(path: Path, fields: dict) -> None:
     """Every field in the file, with what it would cost to extract."""
     print(f"\n{path}")
@@ -133,6 +185,11 @@ def main() -> None:
                      help="treat the field as accumulated over the step. 'auto' (default) "
                           "decides from the units; 'yes' for accumulations that do not "
                           "advertise it, such as total precipitation")
+    out.add_argument("--max-mib", type=float, default=512.0, metavar="MiB",
+                     help="largest payload to put in one file (default 512). A longer "
+                          "selection is split along time into <name>.000.npz, "
+                          "<name>.001.npz, ... which overlap by one frame; 0 disables "
+                          "splitting")
     out.add_argument("--no-compress", action="store_true",
                      help="store members uncompressed (bigger, loads faster)")
     out.add_argument("--no-center", action="store_true",
@@ -244,6 +301,16 @@ def main() -> None:
 
     nt, nlat, nlon = da.sizes["time"], lat.size, lon.size
 
+    # How the selection is cut up. The grid is never split, so the unit of
+    # division is one frame and the plan is fixed before anything is read --
+    # which is what keeps the peak allocation below to one chunk, not one cube.
+    itemsize = 2 if args.dtype == "u16" else 4
+    frame_bytes = nlat * nlon * itemsize
+    if args.max_mib < 0:
+        raise SystemExit(f"--max-mib must be >= 0, got {args.max_mib}")
+    limit = int(args.max_mib * (1 << 20))
+    chunks = plan_chunks(nt, frame_bytes, limit) if limit else [(0, nt)]
+
     # A global axis wraps: the cell after the last one is the first one again,
     # so a query at 179.9 interpolates across the seam instead of falling off it.
     lon_wrap = abs(nlon * dlon - 360.0) < 1e-6
@@ -264,12 +331,18 @@ def main() -> None:
     print(f"  grid        {nlat}x{nlon} @ {abs(dlat):g}deg x {abs(dlon):g}deg   "
           f"lat {lat[0]:g}..{lat[-1]:g}   lon {lon[0]:g}..{lon[-1]:g}"
           + ("   (wraps)" if lon_wrap else ""))
+    total_bytes = nt * frame_bytes
+    if len(chunks) > 1:
+        print(f"  split       {len(chunks)} files of <= {args.max_mib:g} MiB "
+              f"({total_bytes / (1 << 20):.1f} MiB total, {frame_bytes / (1 << 20):.2f} MiB "
+              f"per frame, 1 frame of overlap between parts)")
+    elif limit and frame_bytes > limit:
+        print(f"  split       none possible: one frame is {frame_bytes / (1 << 20):.1f} MiB, "
+              f"over the {args.max_mib:g} MiB limit")
 
     # --- read, convert, quantise -----------------------------------------
     # One frame at a time: the source is dask-backed and a global cube is ~1 GB
     # as float32, so materialising it whole just to rescale it is avoidable.
-    payload = np.empty((nt, nlat, nlon),
-                       dtype="uint16" if args.dtype == "u16" else "float32")
     scale, offset = 1.0, 0.0
 
     if args.dtype == "u16":
@@ -294,53 +367,97 @@ def main() -> None:
         offset = lo_v
         scale = max(hi_v - lo_v, 1e-12) / U16_MAX
 
-    for i in range(nt):
-        frame = np.asarray(da.isel(time=i).values, dtype="float32")
-        if convert:
-            frame = frame / np.float32(step_s)
-        if args.dtype == "u16":
-            q = np.rint((frame - offset) / scale)
-            np.clip(q, 0, U16_MAX, out=q)
-            payload[i] = np.where(np.isfinite(frame), q, U16_FILL).astype("uint16")
-        else:
-            payload[i] = frame
-        print(f"\r  converting  {i + 1}/{nt}", end="", flush=True)
-    print()
-
     # --- write ------------------------------------------------------------
     # Scalars are int64/float64 0-d arrays; the C++ reader pulls them by name and
     # never has to parse a string, so no text metadata is written at all.
-    members = dict(
-        version=np.int32(1),
-        t0=np.int64(times[0]),
-        dt=np.int64(round(dt)),
-        nt=np.int64(nt),
-        lat0=np.float64(lat[0]),
-        dlat=np.float64(dlat),
-        nlat=np.int64(nlat),
-        lon0=np.float64(lon[0]),
-        dlon=np.float64(dlon),
-        nlon=np.int64(nlon),
-        lon_wrap=np.int32(1 if lon_wrap else 0),
-        scale=np.float64(scale),
-        offset=np.float64(offset),
-        fill=np.int64(U16_FILL if args.dtype == "u16" else -1),
-        data=payload,
-        # For python-side use and for verifying the arithmetic above; the C++
-        # sampler derives its indices from the scalars and ignores these.
-        time=times,
-        lat=lat,
-        lon=lon,
-    )
+    #
+    # The manifest follows that rule instead of sitting in a sidecar file: every
+    # part carries the time span of *every* part, so opening any one of them
+    # reveals the whole layout -- which part covers a given instant, and whether
+    # more exist -- without a second format to parse or a file that can go
+    # missing. Part filenames are not stored; they follow from `chunk_path`.
+    # These members are additive and `version` stays 1, so a reader built before
+    # the split still loads a part as the plain field it also is.
+    part_t0 = np.array([times[lo] for lo, _ in chunks], dtype="int64")
+    part_nt = np.array([hi - lo for lo, hi in chunks], dtype="int64")
 
-    save = np.savez if args.no_compress else np.savez_compressed
     dst = Path(args.npz)
-    save(dst, **members)
+    save = np.savez if args.no_compress else np.savez_compressed
+    written: list[tuple[Path, int, int]] = []
+    done = 0
 
-    raw = payload.nbytes
-    disk = dst.stat().st_size
-    print(f"\nwrote {dst}: {disk / 1e6:.1f} MB on disk"
-          f"  ({raw / 1e6:.1f} MB in memory as {payload.dtype})")
+    for index, (lo, hi) in enumerate(chunks):
+        span = hi - lo
+        # Allocated per part, not per selection: this buffer is what the byte
+        # limit actually bounds, and it is reused only in the sense that the
+        # previous one is freed before the next is taken.
+        payload = np.empty((span, nlat, nlon),
+                           dtype="uint16" if args.dtype == "u16" else "float32")
+
+        for i in range(span):
+            frame = np.asarray(da.isel(time=lo + i).values, dtype="float32")
+            if convert:
+                frame = frame / np.float32(step_s)
+            if args.dtype == "u16":
+                q = np.rint((frame - offset) / scale)
+                np.clip(q, 0, U16_MAX, out=q)
+                payload[i] = np.where(np.isfinite(frame), q, U16_FILL).astype("uint16")
+            else:
+                payload[i] = frame
+            done += 1
+            print(f"\r  converting  {done}/{nt + len(chunks) - 1}", end="", flush=True)
+
+        members = dict(
+            version=np.int32(1),
+            t0=np.int64(times[lo]),
+            dt=np.int64(round(dt)),
+            nt=np.int64(span),
+            lat0=np.float64(lat[0]),
+            dlat=np.float64(dlat),
+            nlat=np.int64(nlat),
+            lon0=np.float64(lon[0]),
+            dlon=np.float64(dlon),
+            nlon=np.int64(nlon),
+            lon_wrap=np.int32(1 if lon_wrap else 0),
+            scale=np.float64(scale),
+            offset=np.float64(offset),
+            fill=np.int64(U16_FILL if args.dtype == "u16" else -1),
+            # Embedded manifest: which part this is, and the span of each.
+            part=np.int32(index),
+            nparts=np.int32(len(chunks)),
+            part_t0=part_t0,
+            part_nt=part_nt,
+            overlap=np.int32(1 if len(chunks) > 1 and part_nt[0] > 1 else 0),
+            data=payload,
+            # For python-side use and for verifying the arithmetic above; the C++
+            # sampler derives its indices from the scalars and ignores these.
+            time=times[lo:hi],
+            lat=lat,
+            lon=lon,
+        )
+
+        out_path = chunk_path(dst, index, len(chunks))
+        save(out_path, **members)
+        written.append((out_path, payload.nbytes, out_path.stat().st_size))
+        del payload
+    print()
+
+    raw_total = sum(raw for _, raw, _ in written)
+    disk_total = sum(disk for _, _, disk in written)
+    dtype_name = "uint16" if args.dtype == "u16" else "float32"
+    print()
+    for (path, raw, disk), (lo, hi) in zip(written, chunks):
+        print(f"wrote {path}: {disk / 1e6:.1f} MB on disk"
+              f"  ({raw / 1e6:.1f} MB in memory as {dtype_name})")
+        print(f"      frames {lo}:{hi}  "
+              f"{gu.fmt_time(np.datetime64(int(times[lo]), 's'))} .. "
+              f"{gu.fmt_time(np.datetime64(int(times[hi - 1]), 's'))}")
+    if len(written) > 1:
+        print(f"\n{len(written)} parts, {disk_total / 1e6:.1f} MB on disk total"
+              f"  ({raw_total / 1e6:.1f} MB in memory, largest part "
+              f"{max(raw for _, raw, _ in written) / (1 << 20):.1f} MiB)")
+        print("  each part also carries the span of every part (part, nparts, "
+              "part_t0, part_nt)")
     if args.dtype == "u16":
         print(f"  quantised: value = raw * {scale:.6g} + {offset:.6g}"
               f"  (step {scale:.4g} {out_units or '?'})")

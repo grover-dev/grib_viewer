@@ -14,7 +14,8 @@ out_directory: ../out
 defaults:
   # Gridded solar field, as written by scripts/grib_npz.py. Runs naming the
   # same file share a single load.
-  solar_field: ../data/ssrd_global_20250101_10.npz
+  # solar_field: ../data/ssrd_global_20250101_10.npz
+  solar_field: ../data/ssrd_global_2025_jan.npz
 
   # Degrees, WGS84. Approximately LA
   start: { lat: 33.5, lon: -120.0 }
@@ -33,27 +34,27 @@ runs:
   - name: jan02
     start_time: 2025-01-02T12:00:00Z
 
-  - name: jan03
-    start_time: 2025-01-03T12:00:00Z
+  # - name: jan03
+  #   start_time: 2025-01-03T12:00:00Z
 
-  - name: jan04
-    start_time: 2025-01-04T12:00:00Z
+  # - name: jan04
+  #   start_time: 2025-01-04T12:00:00Z
 
-  - name: jan05
-    start_time: 2025-01-05T12:00:00Z
+  # - name: jan05
+  #   start_time: 2025-01-05T12:00:00Z
 
-  - name: jan06
-    start_time: 2025-01-06T12:00:00Z
+  # - name: jan06
+  #   start_time: 2025-01-06T12:00:00Z
 
-  - name: jan07
-    start_time: 2025-01-07T12:00:00Z
+  # - name: jan07
+  #   start_time: 2025-01-07T12:00:00Z
 
   # The field is a 10-day cut from the 1st, and 100 hourly steps is a little
   # over four days -- so this one runs off the end of the time axis and samples
   # NaN for its tail. Widen the npz, or trim max_steps, before reading anything
   # into its power numbers.
-  - name: jan08
-    start_time: 2025-01-08T12:00:00Z
+  # - name: jan08
+  #   start_time: 2025-01-08T12:00:00Z
 
   # Overriding a default: same departure as jan02, different destination.
   # - name: jan02_south

@@ -163,11 +163,15 @@ public:
         /* Re-aim at the destination every step: on a sphere the great-circle
          * bearing changes as we move, so a heading fixed at t0 would sail a
          * rhumb line instead. */
-
-        if (bb_.power_stored_wh <= 400.0f)
+        if (bb_.power_stored_wh <= 0.0f)
         {
             bb_.applied_motor_power_out_w = 0.0;
-            bb_.avionics_power_out_w = 50.0;
+            bb_.avionics_power_out_w = 0.0;
+        }
+        else if (bb_.power_stored_wh <= 600.0f)
+        {
+            bb_.applied_motor_power_out_w = 0.0;
+            bb_.avionics_power_out_w = 25.0;
         }
         else
         {
@@ -178,7 +182,7 @@ public:
         bb_.powered_heading = initial_bearing_deg(bb_.current_lat, bb_.current_lon, bb_.end_lat, bb_.end_lon);
 
         bb_.powered_velocity =
-            2.0 * (bb_.applied_motor_power_out_w / 500.0);  // FIXME: Make this real F(power), 2ms ~4 knots
+            3.0 * (bb_.applied_motor_power_out_w / 500.0);  // FIXME: Make this real F(power), 2ms ~4 knots
         bb_.distance_to_end = great_circle_distance_m(bb_.current_lat, bb_.current_lon, bb_.end_lat, bb_.end_lon);
         // FIXME: Eventually make this real
 
