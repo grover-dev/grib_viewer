@@ -1,0 +1,802 @@
+"""Extract one NetCDF4 field into an .npz the C++ side can sample in O(1).
+
+    uv run netcdf4_npz.py data/cmems.nc --list
+    uv run netcdf4_npz.py data/cmems.nc uo current.npz --at depth=0
+    uv run netcdf4_npz.py data/cmems.nc usi ice.npz --bbox -40 5 20 60
+
+Same output as `grib_npz.py`, same reader on the other side -- see that file for
+what the format promises and `npz_out.py` for the members that promise it. This
+is only a different way in: HDF5 datasets instead of GRIB messages.
+
+**Read through h5py, not netCDF4 or xarray.** NetCDF4 *is* HDF5 -- a variable is
+a dataset, a dimension is an HDF5 dimension scale, and everything else is
+attributes. Reading it directly means one dependency (h5py) instead of a C
+netCDF library plus its bindings, and it means a batch of frames is one strided
+`dset[a:b, ..., ys, xs]` that HDF5 satisfies from the file, with no lazy graph
+to build and no scheduler to pay. The cost is that CF decoding is this script's
+job rather than a library's, so it is done explicitly and in one place:
+
+* **Packing.** `scale_factor` / `add_offset` are applied on read, and
+  `_FillValue` / `missing_value` are matched against the *raw* values before
+  unpacking, which is what CF specifies and the only point where the comparison
+  is exact. `valid_min` / `valid_max` are deliberately ignored -- they are
+  advisory, frequently stale, and masking on them silently deletes real data.
+
+* **Time.** `units` is a CF "<unit> since <reference>" string, which is parsed
+  here into epoch seconds. Only the real-world calendars are accepted; a
+  `360_day` or `noleap` model calendar has no fixed-length step and cannot be
+  addressed by `t0 + i*dt` at all, so it is refused rather than approximated.
+
+* **Axes.** NetCDF usually stores lat/lon as float32, and a 1/12 degree step is
+  not representable in it: on the CMEMS global grid consecutive differences
+  range over 0.083328..0.083336 from rounding alone. That spread is an artefact,
+  not a non-uniform grid, so the step is taken from the endpoints -- where the
+  error is divided by n-1 -- and the axis is checked by fitting rather than by
+  differencing. See `axis_step`.
+
+Fields with dimensions beyond (time, lat, lon) -- depth, a member number -- are
+reduced to one index with `--at DIM=INDEX`, defaulting to 0, because the npz
+holds one cube and not a hypercube.
+
+Longitude convention needs no handling here: the sampler resolves it modulo 360
+(npz_field.cpp), so a 0..360 file and a -180..180 file address identically and
+neither is rolled. `--bbox` is likewise given in -180..180 whatever the file
+uses, and is refused only when the box would cross the file's own seam and make
+the stored axis non-monotonic.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import h5py
+import numpy as np
+
+from npz_out import (
+    U16_FILL,
+    U16_MAX,
+    chunk_path,
+    field_members,
+    parse_frames,
+    plan_chunks,
+    save_npz,
+    uniform_step,
+)
+
+Y_NAMES = ("latitude", "lat", "y", "nav_lat")
+X_NAMES = ("longitude", "lon", "x", "nav_lon")
+T_NAMES = ("time", "valid_time", "t")
+
+# Units that mean "accumulated over the step"; CF files usually also say so in
+# cell_methods, which is checked first. See --accumulated for the fields that
+# accumulate without advertising it either way.
+ACCUMULATED_UNITS = ("j m**-2", "j/m2", "j m-2", "j m^-2")
+
+# What an accumulated field becomes once divided by its step length.
+RATE_UNITS = {"j m**-2": "W m**-2", "j/m2": "W m**-2",
+              "j m-2": "W m**-2", "j m^-2": "W m**-2"}
+
+# CF time units, in seconds. Months and years are not here on purpose: they are
+# not fixed-length, so they cannot produce the constant dt the format needs.
+TIME_UNITS = {
+    "second": 1.0, "seconds": 1.0, "sec": 1.0, "secs": 1.0, "s": 1.0,
+    "minute": 60.0, "minutes": 60.0, "min": 60.0, "mins": 60.0,
+    "hour": 3600.0, "hours": 3600.0, "hr": 3600.0, "hrs": 3600.0, "h": 3600.0,
+    "day": 86400.0, "days": 86400.0, "d": 86400.0,
+}
+
+# Calendars that agree with numpy's proleptic Gregorian for any date a forecast
+# or reanalysis product carries. The model calendars (360_day, noleap, ...) do
+# not, and are rejected where this is used.
+REAL_CALENDARS = ("", "standard", "gregorian", "proleptic_gregorian")
+
+
+def fmt_time(t) -> str:
+    """A valid time, rendered the one way every tool in this project shows it."""
+    return np.datetime_as_string(t, unit="m") + "Z"
+
+
+def text(obj, name: str) -> str:
+    """An HDF5 string attribute, whichever of the three ways it was stored."""
+    v = obj.attrs.get(name)
+    if v is None:
+        return ""
+    if isinstance(v, np.ndarray):
+        v = v.flat[0] if v.size else ""
+    if isinstance(v, (bytes, np.bytes_)):
+        v = v.decode("utf-8", "replace")
+    return str(v).strip()
+
+
+def number(obj, name: str, dtype=None):
+    """A numeric attribute as a 0-d array of `dtype` (its own, if not given).
+
+    Kept as an array rather than a float because `_FillValue` is compared
+    against the stored values exactly, and going through python float would
+    round a float32 sentinel into something that matches nothing.
+    """
+    v = obj.attrs.get(name)
+    if v is None:
+        return None
+    v = np.asarray(v).flat[0]
+    return v if dtype is None else np.asarray(v, dtype=dtype)
+
+
+def basename(path: str) -> str:
+    return path.rsplit("/", 1)[-1]
+
+
+def dim_names(f: h5py.File, dset: h5py.Dataset) -> list[str]:
+    """The dimension name of each axis of `dset`.
+
+    NetCDF4 records this as HDF5 dimension scales: `DIMENSION_LIST[i]` holds
+    references to the scale datasets attached to axis i, and a scale's name is
+    the dimension's name. Dereferencing them recovers the whole layout without a
+    netCDF library. Files written by tools that skip the scales fall back to
+    matching an axis's length against the 1-D variables, which is ambiguous only
+    when two coordinates happen to be the same length -- and then the axis order
+    of the file decides, as it would anyway.
+    """
+    names: list[str] = []
+    refs = dset.attrs.get("DIMENSION_LIST")
+    for axis in range(dset.ndim):
+        name = ""
+        if refs is not None and axis < len(refs) and len(refs[axis]):
+            name = basename(f[refs[axis][0]].name)
+        names.append(name)
+
+    if all(names):
+        return names
+
+    # Fallback: the 1-D datasets are the candidate coordinates, matched by length.
+    coords = {d.shape[0]: basename(d.name)
+              for d in f.values() if isinstance(d, h5py.Dataset) and d.ndim == 1}
+    return [n or coords.get(dset.shape[axis], f"dim{axis}")
+            for axis, n in enumerate(names)]
+
+
+def axis_of(names: list[str], candidates: tuple[str, ...]) -> int | None:
+    """Which axis carries a dimension named like one of `candidates`."""
+    lowered = [n.lower() for n in names]
+    for want in candidates:
+        if want in lowered:
+            return lowered.index(want)
+    return None
+
+
+def parse_reference(when: str) -> np.datetime64:
+    """The '<reference>' half of a CF time unit, as a UTC second.
+
+    Written every way a writer can imagine -- '1970-01-01 00:00:00',
+    '1950-01-01T00:00:00Z', '2000-1-1 0:0:0', some with an explicit offset --
+    so it is taken apart by hand rather than handed to np.datetime64, which
+    accepts only the strict ISO spelling.
+    """
+    s = re.sub(r"\s*(UTC|GMT)\s*$", "", when.strip(), flags=re.I).rstrip("Zz").strip()
+
+    # An explicit offset is applied, not dropped: 'hours since 2020-01-01 00:00 +01:00'
+    # starts an hour before the same stamp in UTC.
+    offset_s = 0
+    m = re.search(r"([+-])(\d{1,2}):?(\d{2})$", s)
+    if m:
+        sign = -1 if m.group(1) == "+" else 1
+        offset_s = sign * (int(m.group(2)) * 3600 + int(m.group(3)) * 60)
+        s = s[:m.start()].strip()
+
+    date, _, clock = s.replace("T", " ").partition(" ")
+    try:
+        y, mo, d = (int(v) for v in date.split("-"))
+        parts = [float(v) for v in clock.split(":")] if clock.strip() else []
+    except ValueError:
+        raise SystemExit(f"cannot read the reference time in {when!r}")
+    parts += [0.0] * (3 - len(parts))
+
+    day = np.datetime64(f"{y:04d}-{mo:02d}-{d:02d}", "s")
+    seconds = int(round(parts[0] * 3600 + parts[1] * 60 + parts[2])) + offset_s
+    return day + np.timedelta64(seconds, "s")
+
+
+def decode_time(values: np.ndarray, units: str, calendar: str) -> np.ndarray:
+    """A CF time coordinate as int64 epoch seconds."""
+    m = re.match(r"\s*(\w+)\s+since\s+(.+)$", units, flags=re.I)
+    if not m:
+        raise SystemExit(
+            f"time units {units!r} are not a CF '<unit> since <reference>' string; "
+            "there is no way to place these values on a real time axis"
+        )
+    unit, when = m.group(1).lower(), m.group(2)
+    if unit not in TIME_UNITS:
+        raise SystemExit(
+            f"time unit {unit!r} is not a fixed length, so the axis cannot have a "
+            "constant step; the npz format addresses time as t0 + i*dt"
+        )
+    if calendar.lower() not in REAL_CALENDARS:
+        raise SystemExit(
+            f"calendar {calendar!r} is a model calendar, not a real one; its steps do "
+            "not map onto wall-clock time and the npz format cannot represent it"
+        )
+    epoch = int(parse_reference(when).astype("int64"))
+    return epoch + np.rint(values.astype("float64") * TIME_UNITS[unit]).astype("int64")
+
+
+def axis_step(values: np.ndarray, what: str) -> tuple[np.ndarray, float]:
+    """The step of a stored coordinate, plus the axis rebuilt exactly from it.
+
+    Differencing the stored values is the wrong test when they are float32: a
+    1/12 degree step is not representable, so neighbouring differences disagree
+    in the last bits even though the grid is perfectly regular. The step is
+    therefore taken from the endpoints, where that rounding is divided by n-1,
+    and uniformity is checked by *fitting* -- every stored value must sit within
+    a rounding of the axis the step generates. A genuinely irregular axis (a
+    stretched vertical grid, two concatenated regions) fails that by orders of
+    magnitude, so nothing is being waved through.
+
+    The rebuilt axis is what gets written out. It is the one the sampler's
+    `lat0 + j*dlat` actually walks, so storing it instead of the source values
+    makes the `lat`/`lon` members agree with the arithmetic to the last bit.
+    """
+    if values.size < 2:
+        raise SystemExit(f"{what} axis has {values.size} point(s); need at least 2")
+    v = values.astype("float64")
+    step = (v[-1] - v[0]) / (v.size - 1)
+    if step == 0.0:
+        raise SystemExit(f"{what} axis does not advance: every value is {v[0]:g}")
+    rebuilt = v[0] + step * np.arange(v.size)
+
+    eps = float(np.finfo(values.dtype).eps) if values.dtype.kind == "f" else 0.0
+    tol = max(8.0 * eps * max(abs(v[0]), abs(v[-1])), 1e-9)
+    err = float(np.abs(v - rebuilt).max())
+    if err > tol:
+        raise SystemExit(
+            f"{what} axis is not uniform (worst point is {err:g} off a constant step "
+            f"of {step:g}, tolerance {tol:g}); the npz format addresses it "
+            "arithmetically and cannot represent that"
+        )
+    return rebuilt, step
+
+
+def contiguous_run(keep: np.ndarray, what: str, detail: str) -> slice:
+    """The kept indices as one slice, or a hard error if they are in two pieces."""
+    idx = np.flatnonzero(keep)
+    if idx.size == 0:
+        raise SystemExit(f"no {what} points inside the requested range")
+    if idx.size != idx[-1] - idx[0] + 1:
+        raise SystemExit(f"the requested {what} range is split in this file: {detail}")
+    return slice(int(idx[0]), int(idx[-1]) + 1)
+
+
+def lon_window(lon: np.ndarray, west: float, east: float) -> slice:
+    """Columns inside [west, east], whatever longitude convention the file uses.
+
+    Both edges and every column are measured as degrees *east of west*, modulo
+    360, which is the same trick the sampler uses: it makes a -180..180 box and
+    a 0..360 file agree without touching either. A box that straddles the point
+    where the file's own axis restarts selects two runs and cannot be stored as
+    one uniform axis, so it is refused by `contiguous_run` rather than silently
+    reordered.
+    """
+    width = (east - west) % 360.0 or 360.0
+    return contiguous_run(
+        ((lon.astype("float64") - west) % 360.0) <= width,
+        "longitude",
+        f"its axis runs {lon.min():g}..{lon.max():g} and the box crosses that seam. "
+        "This tool does not cross the seam; slice_grib.py does."
+    )
+
+
+def find_fields(f: h5py.File) -> dict[str, tuple[h5py.Dataset, list[str]]]:
+    """Every dataset that is a (time, ..., lat, lon) field, with its dim names."""
+    found: dict[str, tuple[h5py.Dataset, list[str]]] = {}
+
+    def visit(_name, obj):
+        if not isinstance(obj, h5py.Dataset) or obj.ndim < 3:
+            return
+        if obj.attrs.get("CLASS", b"") == b"DIMENSION_SCALE":
+            return
+        names = dim_names(f, obj)
+        if all(axis_of(names, c) is not None for c in (T_NAMES, Y_NAMES, X_NAMES)):
+            found[basename(obj.name)] = (obj, names)
+
+    f.visititems(visit)
+    return found
+
+
+def list_fields(path: Path, f: h5py.File, fields: dict) -> None:
+    """Every field in the file, with what it would cost to extract."""
+    print(f"\n{path}")
+    title = text(f, "title")
+    if title:
+        print(f"  {title}")
+    print(f"\n  {'name':<10} {'long name':<40} {'units':>10}  {'grid':>11} "
+          f"{'frames':>7}  dims")
+    for name, (dset, names) in sorted(fields.items()):
+        t, y, x = (axis_of(names, c) for c in (T_NAMES, Y_NAMES, X_NAMES))
+        units = (text(dset, "units") or "-")[:10]
+        long_name = (text(dset, "long_name") or text(dset, "standard_name") or "?")[:40]
+        mark = "*" if is_accumulated(dset, units) else " "
+        print(f" {mark}{name:<10} {long_name:<40} {units:>10}  "
+              f"{dset.shape[y]:>5}x{dset.shape[x]:<5} {dset.shape[t]:>7}  "
+              f"({', '.join(names)})")
+    print("\n  * accumulated over the step: converted to a rate and re-centred in time")
+    print("  extra dims (depth, ...) are reduced with --at DIM=INDEX\n")
+
+
+def is_accumulated(dset: h5py.Dataset, units: str) -> bool:
+    """Whether the field is a sum over the step rather than an instant value.
+
+    CF says so in cell_methods ('time: sum'), which is checked first because it
+    is the statement of intent; the unit heuristic is the fallback for files
+    that carry ERA5-style accumulations without a cell_methods entry.
+    """
+    methods = text(dset, "cell_methods").lower()
+    if re.search(r"time\s*:\s*(sum|total)", methods):
+        return True
+    return units.strip().lower() in ACCUMULATED_UNITS
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    p.add_argument("nc", help="source NetCDF4 file")
+    p.add_argument("var", nargs="?", help="field to extract; see --list")
+    p.add_argument("npz", nargs="?", help="output .npz")
+    p.add_argument("--list", action="store_true",
+                   help="show every field in the file and exit")
+
+    sel = p.add_argument_group("selection (--frames and --start/--end are mutually exclusive)")
+    sel.add_argument("--start", help="first time to keep, YYYY-MM-DD[THH:MM] (inclusive)")
+    sel.add_argument("--end", help="last time to keep (inclusive)")
+    sel.add_argument("--frames", help="frame index or range, 0-based end-exclusive: '0:24', '100'")
+    sel.add_argument("--stride", type=int, default=1, help="keep every Nth step of the selection")
+    sel.add_argument("--bbox", type=float, nargs=4, metavar=("W", "E", "S", "N"),
+                     help="crop to this area, degrees in -180..180")
+    sel.add_argument("--thin", type=int, default=1, metavar="N",
+                     help="keep every Nth grid point in lat and lon (coarsens the grid)")
+    sel.add_argument("--at", action="append", default=[], metavar="DIM=INDEX",
+                     help="index to take on a dimension that is not time/lat/lon, "
+                          "such as --at depth=0 (the default for every such dim). "
+                          "Repeat for several")
+
+    out = p.add_argument_group("output")
+    out.add_argument("--dtype", choices=("u16", "f32"), default="u16",
+                     help="payload type: quantised uint16 (default) or raw float32")
+    out.add_argument("--accumulated", choices=("auto", "yes", "no"), default="auto",
+                     help="treat the field as accumulated over the step. 'auto' (default) "
+                          "decides from cell_methods and the units; 'yes' for "
+                          "accumulations that advertise it in neither, such as total "
+                          "precipitation")
+    out.add_argument("--max-mib", type=float, default=512.0, metavar="MiB",
+                     help="largest payload to put in one file (default 512). A longer "
+                          "selection is split along time into <name>.000.npz, "
+                          "<name>.001.npz, ... which overlap by one frame; 0 disables "
+                          "splitting")
+    out.add_argument("--batch-mib", type=float, default=128.0, metavar="MiB",
+                     help="how much of the time axis to read at once (default 128). "
+                          "This is the peak read buffer; HDF5 satisfies one strided "
+                          "read per batch, so a bigger batch is fewer, longer seeks")
+    out.add_argument("--writers", type=int, default=2, metavar="N",
+                     help="parts compressed in the background at once (default 2). "
+                          "zlib runs at ~70 MiB/s on one core, so writing a 512 MiB "
+                          "part takes several seconds during which nothing is read; "
+                          "overlapping the writes with the next part's reads hides "
+                          "that, at the cost of N payload buffers in flight rather "
+                          "than one. 1 restores serial behaviour")
+    out.add_argument("--compress-level", type=int, default=1, choices=range(1, 10),
+                     metavar="1-9", help="deflate level for the output (default 1)")
+    out.add_argument("--no-compress", action="store_true",
+                     help="store members uncompressed (bigger, loads faster)")
+    out.add_argument("--no-center", action="store_true",
+                     help="keep the source stamps instead of centring accumulations")
+    out.add_argument("--keep-units", action="store_true",
+                     help="do not divide accumulations by the step length")
+    args = p.parse_args()
+
+    if args.frames and (args.start or args.end):
+        raise SystemExit("choose either --frames or --start/--end, not both")
+
+    src = Path(args.nc)
+    if not src.exists():
+        raise SystemExit(f"no such file: {src}")
+
+    try:
+        f = h5py.File(src, "r")
+    except OSError as exc:
+        raise SystemExit(
+            f"{src} is not readable as HDF5 ({exc}). NetCDF *3* files are a different "
+            "format entirely and this tool cannot open them; convert with "
+            "`nccopy -k nc4 in.nc out.nc` first."
+        )
+
+    fields = find_fields(f)
+    if not fields:
+        raise SystemExit(f"no (time, lat, lon) field found in {src}")
+
+    if args.list:
+        list_fields(src, f, fields)
+        return
+    if not args.var or not args.npz:
+        raise SystemExit(
+            "give a field and an output path, or --list to see what is available\n"
+            f"  fields in this file: {', '.join(sorted(fields))}"
+        )
+    if args.var not in fields:
+        raise SystemExit(
+            f"{args.var!r} is not in this file.\n"
+            f"  available: {', '.join(sorted(fields))}"
+        )
+
+    dset, names = fields[args.var]
+    t_axis = axis_of(names, T_NAMES)
+    y_axis = axis_of(names, Y_NAMES)
+    x_axis = axis_of(names, X_NAMES)
+    units = text(dset, "units")
+
+    for dim in (names[t_axis], names[y_axis], names[x_axis]):
+        if dim not in f:
+            raise SystemExit(
+                f"dimension {dim!r} has no coordinate variable in this file, so its "
+                "axis values are unknown and the grid cannot be described"
+            )
+
+    # Whether the two accumulation conversions apply. Deciding once, here, keeps
+    # the unit change and the time shift from drifting apart -- they describe the
+    # same property of the field and must agree.
+    accumulated = is_accumulated(dset, units) if args.accumulated == "auto" \
+        else args.accumulated == "yes"
+
+    # --- the dims that are neither time nor grid --------------------------
+    # The npz holds one cube, so anything else has to collapse to a single index
+    # here rather than downstream.
+    extra: dict[int, int] = {}
+    wanted = {}
+    for spec in args.at:
+        dim, _, value = spec.partition("=")
+        if not value.strip().lstrip("-").isdigit():
+            raise SystemExit(f"--at wants DIM=INDEX, got {spec!r}")
+        wanted[dim.strip().lower()] = int(value)
+    known = {names[t_axis], names[y_axis], names[x_axis]}
+    picked: list[str] = []
+    for axis, dim in enumerate(names):
+        if dim in known:
+            continue
+        index = wanted.pop(dim.lower(), 0)
+        if not -dset.shape[axis] <= index < dset.shape[axis]:
+            raise SystemExit(f"--at {dim}={index} is outside 0..{dset.shape[axis] - 1}")
+        extra[axis] = index % dset.shape[axis]
+        label = f"{dim}[{extra[axis]}]"
+        if dim in f and f[dim].ndim == 1:
+            label += f" = {float(f[dim][extra[axis]]):g} {text(f[dim], 'units')}".rstrip()
+        picked.append(label)
+    if wanted:
+        raise SystemExit(
+            f"--at names {', '.join(sorted(wanted))}, which {args.var} does not have; "
+            f"its dims are ({', '.join(names)})"
+        )
+
+    # --- time selection ---------------------------------------------------
+    tvar = f[names[t_axis]]
+    all_times = decode_time(tvar[:], text(tvar, "units"), text(tvar, "calendar"))
+    # Accumulation length comes from the *source* spacing, before any striding:
+    # each frame still covers one model step no matter how many we keep.
+    step_s = uniform_step(all_times, "time", tol=0.0)
+
+    if args.frames:
+        lo, hi = parse_frames(args.frames, all_times.size)
+        how = f"frames {lo}:{hi}"
+    else:
+        start = (np.datetime64(args.start, "s").astype("int64") if args.start
+                 else all_times[0])
+        end = (np.datetime64(args.end, "s").astype("int64") if args.end
+               else all_times[-1])
+        if end < start:
+            raise SystemExit(
+                f"end {fmt_time(np.datetime64(int(end), 's'))} is before start "
+                f"{fmt_time(np.datetime64(int(start), 's'))}"
+            )
+        keep = (all_times >= start) & (all_times <= end)
+        span = contiguous_run(keep, "time", "the axis is not sorted")
+        lo, hi = span.start, span.stop
+        how = (f"{fmt_time(np.datetime64(int(start), 's'))} .. "
+               f"{fmt_time(np.datetime64(int(end), 's'))}")
+    if args.stride < 1:
+        raise SystemExit(f"--stride must be >= 1, got {args.stride}")
+    t_sel = slice(lo, hi, args.stride)
+    times = all_times[t_sel]
+    if times.size < 2:
+        raise SystemExit(f"{times.size} time step(s) matched {how}; need at least 2")
+
+    # --- area selection ---------------------------------------------------
+    lat_all = f[names[y_axis]][:]
+    lon_all = f[names[x_axis]][:]
+    y_sel, x_sel = slice(None), slice(None)
+    if args.bbox:
+        west, east, south, north = args.bbox
+        if not (-90 <= south < north <= 90):
+            raise SystemExit(f"bad latitudes: need -90 <= S < N <= 90, got S={south} N={north}")
+        if west >= east:
+            raise SystemExit(
+                f"bad longitudes: need W < E, got W={west} E={east}. "
+                "This tool does not cross the dateline; slice_grib.py does."
+            )
+        y_sel = contiguous_run((lat_all >= south) & (lat_all <= north),
+                               "latitude", "its axis is not monotonic")
+        x_sel = lon_window(lon_all, west, east)
+
+    if args.thin < 1:
+        raise SystemExit(f"--thin must be >= 1, got {args.thin}")
+    if args.thin > 1:
+        # Decimation, not averaging: it keeps the axes exactly uniform, which the
+        # format requires. The wrap flag below is computed from the result, so a
+        # stride that does not divide a global axis evenly simply yields a
+        # non-wrapping grid rather than a subtly wrong seam.
+        y_sel = slice(y_sel.start, y_sel.stop, args.thin)
+        x_sel = slice(x_sel.start, x_sel.stop, args.thin)
+
+    lat = lat_all[y_sel]
+    lon = lon_all[x_sel]
+    if lat.size < 2 or lon.size < 2:
+        raise SystemExit(f"the selected grid is {lat.size}x{lon.size}; need at least 2x2")
+
+    # Latitude is stored ascending so both spatial axes have a positive step and
+    # the C++ sampler needs one sign convention, not two. HDF5 has no negative
+    # stride, so unlike the other selections this one happens after the read.
+    flip_lat = lat[0] > lat[-1]
+    if flip_lat:
+        lat = lat[::-1]
+
+    lat, dlat = axis_step(lat, "latitude")
+    lon, dlon = axis_step(lon, "longitude")
+    dt = uniform_step(times, "time", tol=0.0)
+
+    convert = accumulated and not args.keep_units
+    center = accumulated and not args.no_center
+    if center:
+        times = times - int(round(step_s / 2))
+    out_units = RATE_UNITS.get(units.strip().lower(), units) if convert else units
+
+    nt, nlat, nlon = times.size, lat.size, lon.size
+
+    # A global axis wraps: the cell after the last one is the first one again, so
+    # a query at 179.9 interpolates across the seam instead of falling off it.
+    # The tolerance is a thousandth of a cell rather than a fixed 1e-6 degrees --
+    # dlon comes from float32 endpoints, and on a 4320-column grid its rounding
+    # error alone accumulates past 1e-6 over the full turn.
+    lon_wrap = abs(nlon * dlon - 360.0) < abs(dlon) * 1e-3
+
+    # --- how the payload is cut up ----------------------------------------
+    # The grid is never split, so the unit of division is one frame and the plan
+    # is fixed before anything is read -- which is what keeps the peak allocation
+    # below to one part, not one cube.
+    itemsize = 2 if args.dtype == "u16" else 4
+    frame_bytes = nlat * nlon * itemsize
+    if args.max_mib < 0:
+        raise SystemExit(f"--max-mib must be >= 0, got {args.max_mib}")
+    limit = int(args.max_mib * (1 << 20))
+    chunks = plan_chunks(nt, frame_bytes, limit) if limit else [(0, nt)]
+
+    if args.batch_mib <= 0:
+        raise SystemExit(f"--batch-mib must be > 0, got {args.batch_mib}")
+    # Frames per read. Decoded frames are float32 whatever the payload type is,
+    # so the budget is measured against that and not against `itemsize`.
+    per_batch = max(1, int(args.batch_mib * (1 << 20)) // max(nlat * nlon * 4, 1))
+
+    print(f"\n{src}")
+    print(f"  field       {args.var}  "
+          f"({text(dset, 'long_name') or text(dset, 'standard_name') or '?'}) "
+          f"[{units or '?'}]" + (f" -> [{out_units}]" if convert else ""))
+    print(f"  dims        ({', '.join(names)})  {dset.dtype}"
+          + (f", taken at {', '.join(picked)}" if picked else ""))
+    print(f"  treated as  {'accumulated over the step' if accumulated else 'instantaneous'}"
+          + ("" if args.accumulated == "auto" else f"  (--accumulated {args.accumulated})"))
+    print(f"  selected    {how}, stride {args.stride}"
+          + (f", bbox {tuple(args.bbox)}" if args.bbox else "")
+          + (f", thin {args.thin}" if args.thin > 1 else ""))
+    print(f"  time        {nt} frames, {fmt_time(np.datetime64(int(times[0]), 's'))}"
+          f" .. {fmt_time(np.datetime64(int(times[-1]), 's'))}, step {dt / 3600:g} h")
+    if center:
+        print(f"              (centred: stamps moved back {step_s / 2 / 60:g} min to the "
+              "middle of each accumulation window)")
+    print(f"  grid        {nlat}x{nlon} @ {abs(dlat):g}deg x {abs(dlon):g}deg   "
+          f"lat {lat[0]:g}..{lat[-1]:g}   lon {lon[0]:g}..{lon[-1]:g}"
+          + ("   (wraps)" if lon_wrap else "")
+          + ("   (flipped to ascending)" if flip_lat else ""))
+    print(f"  reading     {per_batch} frame(s) per batch "
+          f"({per_batch * nlat * nlon * 4 / (1 << 20):.0f} MiB)")
+    total_bytes = nt * frame_bytes
+    if len(chunks) > 1:
+        print(f"  split       {len(chunks)} files of <= {args.max_mib:g} MiB "
+              f"({total_bytes / (1 << 20):.1f} MiB total, {frame_bytes / (1 << 20):.2f} MiB "
+              f"per frame, 1 frame of overlap between parts)")
+    elif limit and frame_bytes > limit:
+        print(f"  split       none possible: one frame is {frame_bytes / (1 << 20):.1f} MiB, "
+              f"over the {args.max_mib:g} MiB limit")
+
+    # --- read and unpack ---------------------------------------------------
+    # A batch at a time, never the whole cube: a year of global hourly frames is
+    # ~36 GB as float32, so materialising it just to rescale it is out of the
+    # question.
+    #
+    # `source` is the read the whole selection reduces to -- a slice per axis,
+    # an integer for each collapsed dim -- built once because it is the same
+    # every batch but the time bounds. HDF5 walks it in one pass.
+    scale_factor = number(dset, "scale_factor")
+    add_offset = number(dset, "add_offset")
+    fill_raw = number(dset, "_FillValue", dtype=dset.dtype)
+    missing_raw = number(dset, "missing_value", dtype=dset.dtype)
+
+    # Where (time, lat, lon) end up once the collapsed dims are gone, so a file
+    # that stores its axes in another order is transposed back rather than read
+    # wrong. Almost always already (0, 1, 2).
+    surviving = [a for a in range(dset.ndim) if a not in extra]
+    order = tuple(surviving.index(a) for a in (t_axis, y_axis, x_axis))
+
+    def read(lo: int, hi: int) -> np.ndarray:
+        """Frames [lo, hi) as a writable float32 cube, unpacked, fill -> NaN."""
+        source = [slice(None)] * dset.ndim
+        source[y_axis], source[x_axis] = y_sel, x_sel
+        # lo/hi count frames of the *selection*; the file is strided, so they are
+        # mapped back onto source rows before the read.
+        source[t_axis] = slice(t_sel.start + lo * args.stride,
+                               t_sel.start + hi * args.stride, args.stride)
+        for axis, index in extra.items():
+            source[axis] = index
+        raw = dset[tuple(source)]
+        if order != (0, 1, 2):
+            raw = np.transpose(raw, order)
+
+        cube = raw.astype("float32")
+        # Sentinels are matched against the raw values, before unpacking: that is
+        # what CF specifies, and it is the only point where the comparison is
+        # exact. A NaN sentinel needs no test -- it is already NaN in the cast.
+        for sentinel in (fill_raw, missing_raw):
+            if sentinel is not None and not (sentinel.dtype.kind == "f"
+                                             and np.isnan(sentinel)):
+                cube[raw == sentinel] = np.nan
+        if scale_factor is not None:
+            cube *= np.float32(scale_factor)
+        if add_offset is not None:
+            cube += np.float32(add_offset)
+        return cube[:, ::-1, :] if flip_lat else cube
+
+    def batches(lo: int, hi: int):
+        for start in range(lo, hi, per_batch):
+            yield start, min(hi, start + per_batch)
+
+    scale, offset = 1.0, 0.0
+    if args.dtype == "u16":
+        # Two passes. The quantiser needs the range up front, and holding the
+        # float cube to avoid the second read is the very cost being dodged.
+        lo_v, hi_v = np.inf, -np.inf
+        for lo, hi in batches(0, nt):
+            cube = read(lo, hi)
+            finite = np.isfinite(cube)
+            if finite.all():
+                # The usual case, and worth its own branch: the masked gather
+                # below copies the batch, min/max over the cube itself doesn't.
+                lo_v, hi_v = min(lo_v, float(cube.min())), max(hi_v, float(cube.max()))
+            elif finite.any():
+                vals = cube[finite]
+                lo_v, hi_v = min(lo_v, float(vals.min())), max(hi_v, float(vals.max()))
+            print(f"\r  scanning    {hi}/{nt}", end="", flush=True)
+        print()
+        if not np.isfinite(lo_v):
+            raise SystemExit("every value is NaN; nothing to write")
+        if convert:
+            lo_v, hi_v = lo_v / step_s, hi_v / step_s
+        # Anchored on the field's own minimum rather than on zero, so a narrow
+        # band far from the origin -- sea surface temperature in kelvin, say --
+        # spends its 16 bits on the range it actually occupies.
+        offset = lo_v
+        scale = max(hi_v - lo_v, 1e-12) / U16_MAX
+
+    # --- write ------------------------------------------------------------
+    # The member layout, and why the manifest is embedded rather than written
+    # alongside, is in `npz_out.field_members`. Every part carries the span of
+    # every part, so both spans are computed once here, up front.
+    part_t0 = np.array([times[lo] for lo, _ in chunks], dtype="int64")
+    part_nt = np.array([hi - lo for lo, hi in chunks], dtype="int64")
+
+    dst = Path(args.npz)
+    level = 0 if args.no_compress else args.compress_level
+    if args.writers < 1:
+        raise SystemExit(f"--writers must be >= 1, got {args.writers}")
+
+    # Compression is serial within a part but the parts are independent files, so
+    # it belongs on background threads -- zlib releases the GIL, and the reads
+    # that would otherwise be stalled behind it are what fill the next buffer.
+    # The semaphore is the memory bound: a part cannot start converting until a
+    # writer has finished with one of the N buffers, so peak payload memory is N
+    # parts and not however many the reader can run ahead by.
+    slots = threading.Semaphore(args.writers)
+    pool = ThreadPoolExecutor(max_workers=args.writers, thread_name_prefix="npz-write")
+    pending = []
+    done = 0
+
+    def write_part(out_path: Path, members: dict) -> tuple[Path, int, int]:
+        try:
+            save_npz(out_path, level, **members)
+            return out_path, members["data"].nbytes, out_path.stat().st_size
+        finally:
+            slots.release()
+
+    for index, (lo, hi) in enumerate(chunks):
+        # Allocated per part, not per selection: this buffer is what the byte
+        # limit actually bounds. Ownership passes to the writer thread below, so
+        # the next iteration allocates a fresh one rather than reusing this.
+        slots.acquire()
+        payload = np.empty((hi - lo, nlat, nlon),
+                           dtype="uint16" if args.dtype == "u16" else "float32")
+
+        # The conversion is vectorised over the batch and done in place, so the
+        # only arrays alive here are the batch, its finite mask and the payload.
+        for a, b in batches(lo, hi):
+            cube = read(a, b)
+            if convert:
+                cube /= np.float32(step_s)
+            if args.dtype == "u16":
+                finite = np.isfinite(cube)      # taken before cube is overwritten
+                cube -= np.float32(offset)
+                cube /= np.float32(scale)
+                np.rint(cube, out=cube)
+                np.clip(cube, 0, U16_MAX, out=cube)
+                # `where=` on the negated mask, negated into itself, and a cast
+                # straight into the payload: no copy of the batch is made at any
+                # step, which is the difference between one batch of headroom
+                # and three.
+                np.copyto(cube, np.float32(U16_FILL),
+                          where=np.logical_not(finite, out=finite))
+            payload[a - lo:b - lo] = cube
+            done += b - a
+            print(f"\r  converting  {done}/{nt + len(chunks) - 1}", end="", flush=True)
+
+        members = field_members(
+            payload=payload, times=times[lo:hi], lat=lat, lon=lon,
+            dt=dt, dlat=dlat, dlon=dlon, lon_wrap=lon_wrap,
+            scale=scale, offset=offset,
+            fill=U16_FILL if args.dtype == "u16" else -1,
+            part=index, nparts=len(chunks), part_t0=part_t0, part_nt=part_nt,
+        )
+
+        out_path = chunk_path(dst, index, len(chunks))
+        pending.append(pool.submit(write_part, out_path, members))
+        del payload, members  # the writer owns the buffer now
+
+    # Futures resolve in chunk order because they were submitted in it, so the
+    # report below still lines up with `chunks`. A writer that raised does so
+    # here, once, rather than being swallowed in its thread.
+    if len(pending) > 1:
+        print(f"\r  converting  {done}/{nt + len(chunks) - 1}, "
+              f"finishing {min(args.writers, len(pending))} write(s)", end="", flush=True)
+    written: list[tuple[Path, int, int]] = [fut.result() for fut in pending]
+    pool.shutdown()
+    print()
+
+    raw_total = sum(raw for _, raw, _ in written)
+    disk_total = sum(disk for _, _, disk in written)
+    dtype_name = "uint16" if args.dtype == "u16" else "float32"
+    print()
+    for (path, raw, disk), (lo, hi) in zip(written, chunks):
+        print(f"wrote {path}: {disk / 1e6:.1f} MB on disk"
+              f"  ({raw / 1e6:.1f} MB in memory as {dtype_name})")
+        print(f"      frames {lo}:{hi}  "
+              f"{fmt_time(np.datetime64(int(times[lo]), 's'))} .. "
+              f"{fmt_time(np.datetime64(int(times[hi - 1]), 's'))}")
+    if len(written) > 1:
+        print(f"\n{len(written)} parts, {disk_total / 1e6:.1f} MB on disk total"
+              f"  ({raw_total / 1e6:.1f} MB in memory, largest part "
+              f"{max(raw for _, raw, _ in written) / (1 << 20):.1f} MiB)")
+        print("  each part also carries the span of every part (part, nparts, "
+              "part_t0, part_nt)")
+    if args.dtype == "u16":
+        print(f"  quantised: value = raw * {scale:.6g} + {offset:.6g}"
+              f"  (step {scale:.4g} {out_units or '?'})")
+    print()
+
+
+if __name__ == "__main__":
+    main()

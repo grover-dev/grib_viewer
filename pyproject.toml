@@ -10,6 +10,7 @@ dependencies = [
     "eccodes>=2.47.0",
     "eccodeslib>=2.47.3.22",
     "h3>=4.5.0",
+    "h5py>=3.16.0",
     "imageio>=2.37.4",
     "imageio-ffmpeg>=0.6.0",
     "matplotlib>=3.11.0",

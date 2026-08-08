@@ -204,6 +204,10 @@ private:
                 return false;
             }
 
+            // FIXME: Multi threading may cause issues here. Can add a field manager, safe to delete a field from memory
+            // only if no one is using it
+            // - To imporve paralellism we can then launch several processes with threads in each one, each process
+            // loads at most N blocks, can tune based on data size
             solar_field_.sample();
             /* Off the end of the field's coverage: everything downstream would
              * be modelled on data that is not there, so the run ends here with
@@ -228,7 +232,12 @@ private:
             blackboard_.total_time += blackboard_.time_step;
 
             sample();
+
             steps_left_--;
+            if (blackboard_.distance_to_end < blackboard_.termination_distance)
+            {
+                return false;
+            }
             return steps_left_ > 0;  // FIXME: For now only do a fixed number of steps
         }
 

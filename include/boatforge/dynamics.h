@@ -71,6 +71,8 @@ struct blackboard
     double end_lon{};
     /* Meters, great-circle, refreshed each Solver::step() */
     double distance_to_end{};
+    /* Terminate the run if we are less than 10 km from the end */
+    const double termination_distance = 10000.0f;
 
     /* Degrees, WGS84. current_lon is normalized to [-180, 180) after every step */
     double current_lat{};

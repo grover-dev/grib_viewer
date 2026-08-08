@@ -56,20 +56,20 @@ runs:
   - name: jan02
     start_time: 2025-01-02T12:00:00Z
 
-  # - name: jan03
-  #   start_time: 2025-01-03T12:00:00Z
+  - name: jan03
+    start_time: 2025-01-03T12:00:00Z
 
-  # - name: jan04
-  #   start_time: 2025-01-04T12:00:00Z
+  - name: jan04
+    start_time: 2025-01-04T12:00:00Z
 
-  # - name: jan05
-  #   start_time: 2025-01-05T12:00:00Z
+  - name: jan05
+    start_time: 2025-01-05T12:00:00Z
 
-  # - name: jan06
-  #   start_time: 2025-01-06T12:00:00Z
+  - name: jan06
+    start_time: 2025-01-06T12:00:00Z
 
-  # - name: jan07
-  #   start_time: 2025-01-07T12:00:00Z
+  - name: jan07
+    start_time: 2025-01-07T12:00:00Z
 
   # The field is a 10-day cut from the 1st, and 100 hourly steps is a little
   # over four days -- so this one runs off the end of the time axis and samples
