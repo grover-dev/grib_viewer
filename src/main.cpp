@@ -1,4 +1,5 @@
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <exception>
 #include <filesystem>
@@ -42,6 +43,55 @@ std::chrono::seconds parse_start_time(const YAML::Node& node)
     }
 
     return stamp.time_since_epoch();
+}
+
+/* Spacing between the runs of a sweep. Accepts a suffixed duration ("2d",
+ * "12h", "90m", "1800s") or plain seconds, so "a day apart" reads as `1d`
+ * rather than as 86400. Fractions are allowed -- `0.5d` is twelve hours --
+ * because the useful spacings are not all whole units of anything. */
+std::chrono::seconds parse_duration(const YAML::Node& node)
+{
+    const std::string text = node.as<std::string>();
+    if (text.empty())
+    {
+        throw std::runtime_error("empty duration");
+    }
+
+    double scale = 1.0;
+    std::string number = text;
+    switch (text.back())
+    {
+        case 'd': scale = 86400.0; break;
+        case 'h': scale = 3600.0; break;
+        case 'm': scale = 60.0; break;
+        case 's': scale = 1.0; break;
+        default: scale = 0.0; break;  // no suffix: the whole string is seconds
+    }
+    if (scale != 0.0)
+    {
+        number.pop_back();
+    }
+    else
+    {
+        scale = 1.0;
+    }
+
+    std::size_t consumed = 0;
+    double value = 0.0;
+    try
+    {
+        value = std::stod(number, &consumed);
+    }
+    catch (const std::exception&)
+    {
+        throw std::runtime_error("not a duration: " + text + " (try 1d, 12h, 90m, or seconds)");
+    }
+    if (consumed != number.size())
+    {
+        throw std::runtime_error("not a duration: " + text + " (try 1d, 12h, 90m, or seconds)");
+    }
+
+    return std::chrono::seconds{static_cast<std::int64_t>(std::llround(value * scale))};
 }
 
 Sim::lat_lon parse_lat_lon(const YAML::Node& node)
@@ -129,16 +179,64 @@ Sim::config_t load_config(const std::filesystem::path& config_path)
         run.name = std::format("run_{:02}", index);
         overlay_run(run, runs[index], base);
 
-        if (run.solar_field.empty())
+        /* `count` turns one entry into a sweep: the same run departing at a
+         * fixed interval, which is the shape a start-day study wants and the
+         * only thing that varies across it. Written as an expansion rather than
+         * as a field on run_t so that everything downstream -- the duplicate
+         * name check, Sim, the recorder -- keeps seeing a flat list of runs
+         * that could equally have been typed out by hand. */
+        std::size_t count = 1;
+        std::chrono::seconds every{0};
+        if (runs[index]["count"])
         {
-            throw std::runtime_error(run.name + ": no solar_field, in the run or in defaults");
+            count = runs[index]["count"].as<std::size_t>();
+            if (count == 0)
+            {
+                throw std::runtime_error(run.name + ": count is 0; a sweep needs at least one run");
+            }
         }
-        if (!names.insert(run.name).second)
+        if (runs[index]["every"])
         {
-            throw std::runtime_error("two runs are named " + run.name + "; they would share an output file");
+            try
+            {
+                every = parse_duration(runs[index]["every"]);
+            }
+            catch (const std::exception& e)
+            {
+                throw std::runtime_error(run.name + ": " + e.what());
+            }
+        }
+        if (count > 1 && every <= std::chrono::seconds{0})
+        {
+            throw std::runtime_error(run.name + ": count > 1 needs a positive `every`, or the runs would "
+                                                "all depart at the same instant");
         }
 
-        config.runs.push_back(std::move(run));
+        /* Wide enough for the last index, so the names sort in departure order
+         * in a directory listing rather than putting run_10 before run_2. */
+        const int width = static_cast<int>(std::to_string(count - 1).size());
+        const std::string stem = run.name;
+
+        for (std::size_t step = 0; step < count; step++)
+        {
+            Sim::run_t entry = run;
+            if (count > 1)
+            {
+                entry.name = std::format("{}_{:0{}}", stem, step, width);
+                entry.start_time = run.start_time + every * static_cast<std::int64_t>(step);
+            }
+
+            if (entry.solar_field.empty())
+            {
+                throw std::runtime_error(entry.name + ": no solar_field, in the run or in defaults");
+            }
+            if (!names.insert(entry.name).second)
+            {
+                throw std::runtime_error("two runs are named " + entry.name + "; they would share an output file");
+            }
+
+            config.runs.push_back(std::move(entry));
+        }
     }
 
     return config;

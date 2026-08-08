@@ -50,35 +50,54 @@ defaults:
 # Each run is written to <out_directory>/<name>.npz, so the names have to be
 # distinct -- the loader refuses a config where two runs would collide. Omit
 # `name` and it is filled in from the run's position (run_00, run_01, ...).
+#
+# An entry carrying `count` is a sweep: the same run repeated at a fixed
+# interval, with only the departure moving. It expands into ordinary runs before
+# anything else sees it, so `count: 6` here and six hand-written entries below
+# produce exactly the same six output files -- the sweep form is shorthand, not
+# a different kind of run.
+#
+#   count   how many runs, including the first. 1 is a plain run.
+#   every   spacing between departures: `1d`, `12h`, `90m`, `0.5d`, or bare
+#           seconds. Required once count > 1, since otherwise every run in the
+#           sweep would depart at the same instant.
+#
+# The runs are named <name>_00, <name>_01, ... zero-padded to the width of the
+# count, so `ls` and a glob both give them back in departure order. Hand-write
+# the entries instead when the names matter, or when more than the start time
+# varies between them.
 runs:
-  # Departure, UTC. Either an ISO stamp as here, or plain seconds since the
-  # Unix epoch (1735776000 + 12h is the same instant as the first).
-  - name: jan02
+  # Six departures, one a day apart, starting at noon on 2 January -- which is
+  # the shape of a start-day study: same route, same boat, different weather.
+  # Writes jan_00.npz .. jan_05.npz.
+  - name: jan
     start_time: 2025-01-02T12:00:00Z
+    count: 10
+    every: 1d
 
-  - name: jan03
-    start_time: 2025-01-03T12:00:00Z
+  # Twice a day for three days, from the same departure. Overlaps the sweep
+  # above in time but not in name, so both can run in one invocation.
+  # - name: jan_twice_daily
+  #   start_time: 2025-01-02T00:00:00Z
+  #   count: 6
+  #   every: 12h
 
-  - name: jan04
-    start_time: 2025-01-04T12:00:00Z
+  # A single run is just a sweep of one, so `count` can be left off entirely.
+  # Departure, UTC: either an ISO stamp as here, or plain seconds since the Unix
+  # epoch (1735819200 is the same instant).
+  # - name: jan02
+  #   start_time: 2025-01-02T12:00:00Z
 
-  - name: jan05
-    start_time: 2025-01-05T12:00:00Z
-
-  - name: jan06
-    start_time: 2025-01-06T12:00:00Z
-
-  - name: jan07
-    start_time: 2025-01-07T12:00:00Z
-
-  # The field is a 10-day cut from the 1st, and 100 hourly steps is a little
-  # over four days -- so this one runs off the end of the time axis and samples
-  # NaN for its tail. Widen the npz, or trim max_steps, before reading anything
-  # into its power numbers.
+  # The field is a 10-day cut from the 1st, and 1000 hourly steps is far past
+  # its end -- so a sweep reaching beyond the axis samples NaN for its tail and
+  # stops there. Widen the npz, or trim count/max_steps, before reading anything
+  # into the power numbers of the later runs.
   # - name: jan08
   #   start_time: 2025-01-08T12:00:00Z
 
-  # Overriding a default: same departure as jan02, different destination.
+  # Overriding a default: same departure as the sweep's first run, different
+  # destination. Anything from `defaults:` can be overridden per entry, and a
+  # sweep applies the override to every run it expands into.
   # - name: jan02_south
   #   start_time: 2025-01-02T12:00:00Z
   #   end: {lat: 34.0, lon: -20.0}

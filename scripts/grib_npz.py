@@ -39,36 +39,41 @@ A long selection is split across several outputs rather than written as one
 cube, so neither this script nor its reader ever holds more than `--max-mib` of
 payload at once. The split is along time -- the grid is never cut, so every part
 is a complete field over a shorter window, addressed by the same arithmetic. See
-`plan_chunks` for how the boundaries are placed.
+`npz_out.plan_chunks` for how the boundaries are placed.
 
 The manifest is embedded rather than written alongside: each part carries
 `part`, `nparts`, `part_t0` and `part_nt`, the last two being the first stamp
 and frame count of *every* part. So opening any single part answers which file
 covers a given instant, and parts cannot drift out of sync with an index that
-lives somewhere else. Filenames are not stored -- they follow the `chunk_path`
-pattern. All four members are additive, and `version` stays 1, so a reader that
-predates the split still loads a part as the ordinary field it also is.
+lives somewhere else. Filenames are not stored -- they follow the
+`npz_out.chunk_path` pattern. All four members are additive, and `version` stays
+1, so a reader that predates the split still loads a part as the ordinary field
+it also is.
+
+Everything above describes the *format*, not this script, and none of it is
+implemented here: `npz_out` holds the members, the split, the quantiser and the
+writer, so `netcdf4_npz.py` produces the identical thing from a NetCDF4 source.
+What is left below is GRIB: opening the file, finding a field in it, narrowing
+it, and handing back the frames.
 """
 
 from __future__ import annotations
 
 import argparse
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 
 import grib_utils as gu
 from npz_out import (
-    U16_FILL,
-    U16_MAX,
-    chunk_path,
-    field_members,
+    Grid,
+    add_output_args,
+    add_selection_args,
+    describe,
     parse_frames,
-    plan_chunks,
-    save_npz,
+    plan_layout,
     uniform_step,
+    write_field,
 )
 
 # Units that mean "accumulated over the step" for the purposes of the two
@@ -105,52 +110,18 @@ def main() -> None:
     p.add_argument("--list", action="store_true",
                    help="show every field in the file and exit")
 
-    sel = p.add_argument_group("selection (--frames and --start/--end are mutually exclusive)")
-    sel.add_argument("--start", help="first time to keep, YYYY-MM-DD[THH:MM] (inclusive)")
-    sel.add_argument("--end", help="last time to keep (inclusive)")
-    sel.add_argument("--frames", help="frame index or range, 0-based end-exclusive: '0:24', '100'")
-    sel.add_argument("--stride", type=int, default=1, help="keep every Nth step of the selection")
-    sel.add_argument("--bbox", type=float, nargs=4, metavar=("W", "E", "S", "N"),
-                     help="crop to this area, degrees in -180..180")
-    sel.add_argument("--thin", type=int, default=1, metavar="N",
-                     help="keep every Nth grid point in lat and lon (coarsens the grid)")
-
-    out = p.add_argument_group("output")
-    out.add_argument("--dtype", choices=("u16", "f32"), default="u16",
-                     help="payload type: quantised uint16 (default) or raw float32")
-    out.add_argument("--accumulated", choices=("auto", "yes", "no"), default="auto",
-                     help="treat the field as accumulated over the step. 'auto' (default) "
-                          "decides from the units; 'yes' for accumulations that do not "
-                          "advertise it, such as total precipitation")
-    out.add_argument("--max-mib", type=float, default=512.0, metavar="MiB",
-                     help="largest payload to put in one file (default 512). A longer "
-                          "selection is split along time into <name>.000.npz, "
-                          "<name>.001.npz, ... which overlap by one frame; 0 disables "
-                          "splitting")
-    out.add_argument("--batch-mib", type=float, default=128.0, metavar="MiB",
-                     help="how much of the time axis to decode per read (default 128). "
-                          "Frames are read in batches of this size and dask decodes "
-                          "the batch in parallel, so this is both the peak read "
-                          "buffer and the unit of parallelism -- lower it on a "
-                          "memory-tight machine, raise it on a fast disk")
-    out.add_argument("--writers", type=int, default=2, metavar="N",
-                     help="parts compressed in the background at once (default 2). "
-                          "zlib runs at ~70 MiB/s on one core, so writing a 512 MiB "
-                          "part takes several seconds during which nothing is read; "
-                          "overlapping the writes with the next part's reads hides "
-                          "that, at the cost of N payload buffers in flight rather "
-                          "than one. 1 restores the old serial behaviour")
-    out.add_argument("--compress-level", type=int, default=1, metavar="1-9",
-                     choices=range(1, 10),
-                     help="zlib level for the payload (default 1). Levels above 1 "
-                          "are not worth their time on quantised fields: on ERA5 "
-                          "radiation, 1 and 6 both compress ~2x")
-    out.add_argument("--no-compress", action="store_true",
-                     help="store members uncompressed (bigger, loads faster)")
-    out.add_argument("--no-center", action="store_true",
-                     help="keep the source stamps instead of centring accumulations")
-    out.add_argument("--keep-units", action="store_true",
-                     help="do not divide accumulations by the step length")
+    add_selection_args(p)
+    add_output_args(
+        p,
+        accumulated_help="treat the field as accumulated over the step. 'auto' (default) "
+                         "decides from the units; 'yes' for accumulations that do not "
+                         "advertise it, such as total precipitation",
+        batch_help="how much of the time axis to decode per read (default 128). "
+                   "Frames are read in batches of this size and dask decodes "
+                   "the batch in parallel, so this is both the peak read "
+                   "buffer and the unit of parallelism -- lower it on a "
+                   "memory-tight machine, raise it on a fast disk",
+    )
     args = p.parse_args()
 
     if args.frames and (args.start or args.end):
@@ -254,27 +225,15 @@ def main() -> None:
         times = times - int(round(step_s / 2))
     out_units = RATE_UNITS.get(units, units) if convert else units
 
-    nt, nlat, nlon = da.sizes["time"], lat.size, lon.size
-
-    # How the selection is cut up. The grid is never split, so the unit of
-    # division is one frame and the plan is fixed before anything is read --
-    # which is what keeps the peak allocation below to one chunk, not one cube.
-    itemsize = 2 if args.dtype == "u16" else 4
-    frame_bytes = nlat * nlon * itemsize
-    if args.max_mib < 0:
-        raise SystemExit(f"--max-mib must be >= 0, got {args.max_mib}")
-    limit = int(args.max_mib * (1 << 20))
-    chunks = plan_chunks(nt, frame_bytes, limit) if limit else [(0, nt)]
-
-    if args.batch_mib <= 0:
-        raise SystemExit(f"--batch-mib must be > 0, got {args.batch_mib}")
-    # Frames per read. Decoded frames are float32 whatever the payload type is,
-    # so the budget is measured against that and not against `itemsize`.
-    per_batch = max(1, int(args.batch_mib * (1 << 20)) // max(nlat * nlon * 4, 1))
-
     # A global axis wraps: the cell after the last one is the first one again,
     # so a query at 179.9 interpolates across the seam instead of falling off it.
-    lon_wrap = abs(nlon * dlon - 360.0) < 1e-6
+    lon_wrap = abs(lon.size * dlon - 360.0) < 1e-6
+
+    grid = Grid(times=times, lat=lat, lon=lon,
+                dt=dt, dlat=dlat, dlon=dlon, lon_wrap=lon_wrap)
+    layout = plan_layout(grid, dtype=args.dtype,
+                         max_mib=args.max_mib, batch_mib=args.batch_mib)
+    level = 0 if args.no_compress else args.compress_level
 
     print(f"\n{src}")
     print(f"  field       {args.var}  ({da.attrs.get('long_name', '?')}) [{units or '?'}]"
@@ -284,176 +243,24 @@ def main() -> None:
     print(f"  selected    {how}, stride {args.stride}"
           + (f", bbox {tuple(args.bbox)}" if args.bbox else "")
           + (f", thin {args.thin}" if args.thin > 1 else ""))
-    print(f"  time        {nt} frames, {gu.fmt_time(np.datetime64(int(times[0]), 's'))}"
-          f" .. {gu.fmt_time(np.datetime64(int(times[-1]), 's'))}, step {dt / 3600:g} h")
-    if center:
-        print(f"              (centred: stamps moved back {step_s / 2 / 60:g} min to the "
-              "middle of each accumulation window)")
-    print(f"  grid        {nlat}x{nlon} @ {abs(dlat):g}deg x {abs(dlon):g}deg   "
-          f"lat {lat[0]:g}..{lat[-1]:g}   lon {lon[0]:g}..{lon[-1]:g}"
-          + ("   (wraps)" if lon_wrap else ""))
-    print(f"  reading     {per_batch} frame(s) per batch "
-          f"({per_batch * nlat * nlon * 4 / (1 << 20):.0f} MiB, decoded in parallel)")
-    if len(chunks) > 1:
-        print(f"  writing     zlib level {args.compress_level if not args.no_compress else 0}"
-              f", up to {min(args.writers, len(chunks))} part(s) compressed in the "
-              f"background ({min(args.writers, len(chunks)) * frame_bytes * chunks[0][1] / (1 << 20):.0f}"
-              " MiB of payload buffers)")
-    total_bytes = nt * frame_bytes
-    if len(chunks) > 1:
-        print(f"  split       {len(chunks)} files of <= {args.max_mib:g} MiB "
-              f"({total_bytes / (1 << 20):.1f} MiB total, {frame_bytes / (1 << 20):.2f} MiB "
-              f"per frame, 1 frame of overlap between parts)")
-    elif limit and frame_bytes > limit:
-        print(f"  split       none possible: one frame is {frame_bytes / (1 << 20):.1f} MiB, "
-              f"over the {args.max_mib:g} MiB limit")
+    describe(grid, layout, max_mib=args.max_mib, writers=args.writers, level=level,
+             note=(f"(centred: stamps moved back {step_s / 2 / 60:g} min to the "
+                   "middle of each accumulation window)") if center else "",
+             reading_note=", decoded in parallel")
 
-    # --- read, convert, quantise -----------------------------------------
     # A batch at a time, never the whole cube: a year of global hourly frames is
     # ~36 GB as float32, so materialising it just to rescale it is out of the
     # question. The batch is what makes this fast as well as small -- one dask
-    # compute over `per_batch` frames decodes them in parallel and pays the
-    # scheduler once, where a frame-at-a-time walk pays it 8760 times over a
-    # graph 8760 tasks long. See grib_utils.frame_block.
-    scale, offset = 1.0, 0.0
-
-    def batches(lo: int, hi: int):
-        for start in range(lo, hi, per_batch):
-            yield start, min(hi, start + per_batch)
-
+    # compute over a batch decodes its frames in parallel and pays the scheduler
+    # once, where a frame-at-a-time walk pays it 8760 times over a graph 8760
+    # tasks long. See grib_utils.frame_block.
     def read(lo: int, hi: int) -> np.ndarray:
         """Frames [lo, hi) as a writable float32 cube, freshly allocated."""
         return np.asarray(gu.frame_block(da, lo, hi).compute(), dtype="float32")
 
-    if args.dtype == "u16":
-        # Two passes. The quantiser needs the range up front, and holding the
-        # float cube to avoid the second read is the very cost being dodged.
-        lo_v, hi_v = np.inf, -np.inf
-        for lo, hi in batches(0, nt):
-            cube = read(lo, hi)
-            finite = np.isfinite(cube)
-            if finite.all():
-                # The usual case, and worth its own branch: the masked gather
-                # below copies the batch, min/max over the cube itself doesn't.
-                lo_v, hi_v = min(lo_v, float(cube.min())), max(hi_v, float(cube.max()))
-            elif finite.any():
-                vals = cube[finite]
-                lo_v, hi_v = min(lo_v, float(vals.min())), max(hi_v, float(vals.max()))
-            print(f"\r  scanning    {hi}/{nt}", end="", flush=True)
-        print()
-        if not np.isfinite(lo_v):
-            raise SystemExit("every value is NaN; nothing to write")
-        if convert:
-            lo_v, hi_v = lo_v / step_s, hi_v / step_s
-        # Anchored on the field's own minimum rather than on zero, so a narrow
-        # band far from the origin -- sea surface temperature in kelvin, say --
-        # spends its 16 bits on the range it actually occupies.
-        offset = lo_v
-        scale = max(hi_v - lo_v, 1e-12) / U16_MAX
-
-    # --- write ------------------------------------------------------------
-    # The member layout, and why the manifest is embedded rather than written
-    # alongside, is in `npz_out.field_members`. Every part carries the span of
-    # every part, so both spans are computed once here, up front.
-    part_t0 = np.array([times[lo] for lo, _ in chunks], dtype="int64")
-    part_nt = np.array([hi - lo for lo, hi in chunks], dtype="int64")
-
-    dst = Path(args.npz)
-    level = 0 if args.no_compress else args.compress_level
-    if args.writers < 1:
-        raise SystemExit(f"--writers must be >= 1, got {args.writers}")
-
-    # Compression is serial within a part but the parts are independent files, so
-    # it belongs on background threads -- zlib releases the GIL, and the reads
-    # that would otherwise be stalled behind it are what fill the next buffer.
-    # The semaphore is the memory bound: a part cannot start converting until a
-    # writer has finished with one of the N buffers, so peak payload memory is N
-    # parts and not however many the reader can run ahead by.
-    slots = threading.Semaphore(args.writers)
-    pool = ThreadPoolExecutor(max_workers=args.writers, thread_name_prefix="npz-write")
-    pending = []
-    done = 0
-
-    def write_part(out_path: Path, members: dict) -> tuple[Path, int, int]:
-        try:
-            save_npz(out_path, level, **members)
-            return out_path, members["data"].nbytes, out_path.stat().st_size
-        finally:
-            slots.release()
-
-    for index, (lo, hi) in enumerate(chunks):
-        span = hi - lo
-        # Allocated per part, not per selection: this buffer is what the byte
-        # limit actually bounds. Ownership passes to the writer thread below, so
-        # the next iteration allocates a fresh one rather than reusing this.
-        slots.acquire()
-        payload = np.empty((span, nlat, nlon),
-                           dtype="uint16" if args.dtype == "u16" else "float32")
-
-        # The conversion is vectorised over the batch and done in place, so the
-        # only arrays alive here are the batch, its finite mask and the payload.
-        for a, b in batches(lo, hi):
-            cube = read(a, b)
-            if convert:
-                cube /= np.float32(step_s)
-            if args.dtype == "u16":
-                finite = np.isfinite(cube)      # taken before cube is overwritten
-                cube -= np.float32(offset)
-                cube /= np.float32(scale)
-                np.rint(cube, out=cube)
-                np.clip(cube, 0, U16_MAX, out=cube)
-                # `where=` on the negated mask, negated into itself, and a cast
-                # straight into the payload: no copy of the batch is made at any
-                # step, which is the difference between one batch of headroom
-                # and three.
-                np.copyto(cube, np.float32(U16_FILL),
-                          where=np.logical_not(finite, out=finite))
-            payload[a - lo:b - lo] = cube
-            done += b - a
-            print(f"\r  converting  {done}/{nt + len(chunks) - 1}", end="", flush=True)
-
-        members = field_members(
-            payload=payload, times=times[lo:hi], lat=lat, lon=lon,
-            dt=dt, dlat=dlat, dlon=dlon, lon_wrap=lon_wrap,
-            scale=scale, offset=offset,
-            fill=U16_FILL if args.dtype == "u16" else -1,
-            part=index, nparts=len(chunks), part_t0=part_t0, part_nt=part_nt,
-        )
-
-        out_path = chunk_path(dst, index, len(chunks))
-        pending.append(pool.submit(write_part, out_path, members))
-        del payload, members  # the writer owns the buffer now
-
-    # Futures resolve in chunk order because they were submitted in it, so the
-    # report below still lines up with `chunks`. A writer that raised does so
-    # here, once, rather than being swallowed in its thread.
-    if len(pending) > 1:
-        print(f"\r  converting  {done}/{nt + len(chunks) - 1}, "
-              f"finishing {min(args.writers, len(pending))} write(s)", end="", flush=True)
-    written: list[tuple[Path, int, int]] = [f.result() for f in pending]
-    pool.shutdown()
-    print()
-
-    raw_total = sum(raw for _, raw, _ in written)
-    disk_total = sum(disk for _, _, disk in written)
-    dtype_name = "uint16" if args.dtype == "u16" else "float32"
-    print()
-    for (path, raw, disk), (lo, hi) in zip(written, chunks):
-        print(f"wrote {path}: {disk / 1e6:.1f} MB on disk"
-              f"  ({raw / 1e6:.1f} MB in memory as {dtype_name})")
-        print(f"      frames {lo}:{hi}  "
-              f"{gu.fmt_time(np.datetime64(int(times[lo]), 's'))} .. "
-              f"{gu.fmt_time(np.datetime64(int(times[hi - 1]), 's'))}")
-    if len(written) > 1:
-        print(f"\n{len(written)} parts, {disk_total / 1e6:.1f} MB on disk total"
-              f"  ({raw_total / 1e6:.1f} MB in memory, largest part "
-              f"{max(raw for _, raw, _ in written) / (1 << 20):.1f} MiB)")
-        print("  each part also carries the span of every part (part, nparts, "
-              "part_t0, part_nt)")
-    if args.dtype == "u16":
-        print(f"  quantised: value = raw * {scale:.6g} + {offset:.6g}"
-              f"  (step {scale:.4g} {out_units or '?'})")
-    print()
+    write_field(Path(args.npz), read, grid, layout,
+                level=level, writers=args.writers,
+                divide_by=step_s if convert else None, units=out_units)
 
 
 if __name__ == "__main__":

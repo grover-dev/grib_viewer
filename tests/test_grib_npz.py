@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from grib_npz import chunk_path, plan_chunks
+from npz_out import chunk_path, plan_chunks
 
 ROOT = Path(__file__).resolve().parent.parent
 
