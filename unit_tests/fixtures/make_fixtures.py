@@ -67,6 +67,17 @@ FIXTURES = [
      ["--frames", "6:10", "--bbox", "-10", "5", "40", "50"]),
 ]
 
+# The same window as region_u16, written as a directory of parts instead of one
+# cube. The C++ split tests cut their own parts with NpzWriter, which mirrors
+# what the script does but is not the script -- so without this the two sides of
+# the format only ever agree with themselves. --max-mib is set to force a
+# boundary out of a fixture this small; a real split is 512 MiB a part.
+SPLIT_DIR = "region_split"
+# Two frames to a part: REGION is a 20x20 degree bbox on the 0.25 degree grid,
+# so a quantised frame is 81*81*2 bytes. Small parts on purpose -- the C++ cache
+# tests want several boundaries to cross, not one.
+SPLIT_MIB = 2 * 81 * 81 * 2 / (1 << 20)
+
 
 def expectations(name: str, npz) -> list[tuple[str, bool]]:
     """What npz_field_test.cpp assumes about each fixture, checked here so a bad
@@ -126,6 +137,18 @@ def main() -> None:
             check=True,
         )
 
+    split = HERE / SPLIT_DIR
+    print(f"\n=== {SPLIT_DIR} " + "=" * (60 - len(SPLIT_DIR)))
+    for stale in split.glob("*.npz"):
+        stale.unlink()  # a shrinking part count must not leave orphans behind
+    split.mkdir(exist_ok=True)
+    subprocess.run(
+        [sys.executable, str(GENERATOR), str(grib), "ssrd", str(split / "part.npz"),
+         *REGION, "--max-mib", str(SPLIT_MIB)],
+        cwd=GENERATOR.parent,
+        check=True,
+    )
+
     print("\nverifying what the C++ tests rely on:")
     failed = False
     for name, _, _ in FIXTURES:
@@ -145,6 +168,32 @@ def main() -> None:
                 same = np.array_equal(a[axis], b[axis])
                 print(f"    {'ok  ' if same else 'FAIL'}  {stem} pair shares its {axis} axis")
                 failed |= not same
+
+    # The split fixture has to be several parts that reassemble into exactly the
+    # single-file one; a run that produced one part would let the C++ split
+    # tests pass without ever crossing a boundary.
+    parts = sorted(split.glob("*.npz"))
+    print(f"  {SPLIT_DIR}/  ({len(parts)} parts)")
+    for what, ok in [
+        ("more than one part, so a boundary is crossed", len(parts) > 1),
+        ("every part reports the same part count",
+         all(int(np.load(p)["nparts"]) == len(parts) for p in parts)),
+    ]:
+        print(f"    {'ok  ' if ok else 'FAIL'}  {what}")
+        failed |= not ok
+
+    if parts:
+        times, payload = [], []
+        for path in parts:
+            with np.load(path) as part:
+                first = 1 if times and int(part["time"][0]) == times[-1] else 0
+                times += [int(t) for t in part["time"][first:]]
+                payload.append(part["data"][first:])
+        with np.load(HERE / "region_u16.npz") as whole:
+            same = (np.array_equal(np.concatenate(payload), whole["data"])
+                    and np.array_equal(np.array(times, dtype="int64"), whole["time"]))
+        print(f"    {'ok  ' if same else 'FAIL'}  reassembles into region_u16.npz exactly")
+        failed |= not same
 
     if failed:
         raise SystemExit("\nfixtures do not satisfy what the tests assume")

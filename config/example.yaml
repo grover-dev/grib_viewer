@@ -36,7 +36,8 @@ defaults:
   # rather than sampled inconsistently.
   # solar_field: ../data/ssrd_global_20250101_10.npz
   # solar_field: ../data/ssrd_global_2025          # a directory of parts
-  solar_field: ../data/ssrd_global_2025_jan.npz
+  # solar_field: ../data/ssrd_global_2025_jan.npz
+  solar_field: ../data2
 
   # Degrees, WGS84. Approximately LA
   start: { lat: 33.5, lon: -120.0 }

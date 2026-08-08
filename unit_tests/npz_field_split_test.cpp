@@ -307,6 +307,81 @@ TEST(NpzFieldSplit, AGapBetweenPartsIsAMiss) {
 }
 
 // --------------------------------------------------------------------------
+// Against the writer itself. Everything above cuts its own parts with
+// NpzWriter, which mirrors what scripts/grib_npz.py does but is not it -- so
+// on its own the suite would only prove this file agrees with itself. The
+// region_split fixture is real output from the script's command line, manifest
+// members and all.
+// --------------------------------------------------------------------------
+
+TEST(NpzFieldWriter, ReadsARealSplitFieldFromTheScript) {
+    const auto dir = fixture("region_split");
+    if (!std::filesystem::is_directory(dir)) {
+        GTEST_SKIP() << "region_split not present; run make_fixtures.py";
+    }
+
+    const NpzField split = NpzField::load_directory(dir);
+    EXPECT_GT(split.parts().size(), 1u);
+
+    // The parts are the same field as the single-file fixture they were cut
+    // from, so every query has to agree with it -- which is the actual contract
+    // between the two languages.
+    const NpzField whole = NpzField::load(fixture("region_u16.npz"));
+    const Grid grid = grid_of("region_u16.npz");
+    for (const seconds when : probe_times(whole, grid.dt, grid.nt)) {
+        ASSERT_FLOAT_EQ(sample(whole, when, grid.lat, grid.lon),
+                        sample(split, when, grid.lat, grid.lon))
+            << when.count();
+    }
+}
+
+TEST(NpzFieldWriter, ScriptPartsOverlapByOneFrame) {
+    const auto dir = fixture("region_split");
+    if (!std::filesystem::is_directory(dir)) {
+        GTEST_SKIP() << "region_split not present; run make_fixtures.py";
+    }
+
+    const NpzField split = NpzField::load_directory(dir);
+    const auto& parts = split.parts();
+    ASSERT_GT(parts.size(), 1u);
+
+    const seconds step{grid_of("region_u16.npz").dt};
+    for (std::size_t i = 0; i + 1 < parts.size(); ++i) {
+        // The next part starts on the frame this one ends with. That is what
+        // makes the interval across a boundary interpolable, and it is a
+        // property of what the script wrote, not of what this file assumed.
+        EXPECT_EQ(parts[i + 1].t0, parts[i].end) << i;
+        // ...and the two parts really do agree on the shared frame's value.
+        const Grid grid = grid_of("region_u16.npz");
+        const NpzField a = NpzField::load(parts[i].path);
+        const NpzField b = NpzField::load(parts[i + 1].path);
+        EXPECT_FLOAT_EQ(sample(a, parts[i].end, grid.lat, grid.lon),
+                        sample(b, parts[i + 1].t0, grid.lat, grid.lon));
+        EXPECT_LT(parts[i].t0, parts[i].end);
+        EXPECT_EQ(parts[i].end - parts[i].t0,
+                  step * static_cast<int64_t>(parts[i].nt - 1));
+    }
+}
+
+TEST(NpzFieldWriter, ScriptPartsTileTheWholeWindow) {
+    const auto dir = fixture("region_split");
+    if (!std::filesystem::is_directory(dir)) {
+        GTEST_SKIP() << "region_split not present; run make_fixtures.py";
+    }
+
+    const NpzField split = NpzField::load_directory(dir);
+    const NpzField whole = NpzField::load(fixture("region_u16.npz"));
+    const Grid grid = grid_of("region_u16.npz");
+
+    // Same coverage as the unsplit field: no frame lost at a seam, and nothing
+    // reachable past the end that was not reachable before.
+    EXPECT_EQ(split.parts().front().t0, whole.parts().front().t0);
+    EXPECT_EQ(split.parts().back().end, whole.parts().front().end);
+    EXPECT_TRUE(std::isnan(
+        sample(split, split.parts().back().end + seconds{1}, grid.lat, grid.lon)));
+}
+
+// --------------------------------------------------------------------------
 // The cache: how many parts stay in memory, and what that buys.
 // --------------------------------------------------------------------------
 

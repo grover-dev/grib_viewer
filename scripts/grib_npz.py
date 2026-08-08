@@ -190,6 +190,12 @@ def main() -> None:
                           "selection is split along time into <name>.000.npz, "
                           "<name>.001.npz, ... which overlap by one frame; 0 disables "
                           "splitting")
+    out.add_argument("--batch-mib", type=float, default=128.0, metavar="MiB",
+                     help="how much of the time axis to decode per read (default 128). "
+                          "Frames are read in batches of this size and dask decodes "
+                          "the batch in parallel, so this is both the peak read "
+                          "buffer and the unit of parallelism -- lower it on a "
+                          "memory-tight machine, raise it on a fast disk")
     out.add_argument("--no-compress", action="store_true",
                      help="store members uncompressed (bigger, loads faster)")
     out.add_argument("--no-center", action="store_true",
@@ -311,6 +317,12 @@ def main() -> None:
     limit = int(args.max_mib * (1 << 20))
     chunks = plan_chunks(nt, frame_bytes, limit) if limit else [(0, nt)]
 
+    if args.batch_mib <= 0:
+        raise SystemExit(f"--batch-mib must be > 0, got {args.batch_mib}")
+    # Frames per read. Decoded frames are float32 whatever the payload type is,
+    # so the budget is measured against that and not against `itemsize`.
+    per_batch = max(1, int(args.batch_mib * (1 << 20)) // max(nlat * nlon * 4, 1))
+
     # A global axis wraps: the cell after the last one is the first one again,
     # so a query at 179.9 interpolates across the seam instead of falling off it.
     lon_wrap = abs(nlon * dlon - 360.0) < 1e-6
@@ -331,6 +343,8 @@ def main() -> None:
     print(f"  grid        {nlat}x{nlon} @ {abs(dlat):g}deg x {abs(dlon):g}deg   "
           f"lat {lat[0]:g}..{lat[-1]:g}   lon {lon[0]:g}..{lon[-1]:g}"
           + ("   (wraps)" if lon_wrap else ""))
+    print(f"  reading     {per_batch} frame(s) per batch "
+          f"({per_batch * nlat * nlon * 4 / (1 << 20):.0f} MiB, decoded in parallel)")
     total_bytes = nt * frame_bytes
     if len(chunks) > 1:
         print(f"  split       {len(chunks)} files of <= {args.max_mib:g} MiB "
@@ -341,21 +355,37 @@ def main() -> None:
               f"over the {args.max_mib:g} MiB limit")
 
     # --- read, convert, quantise -----------------------------------------
-    # One frame at a time: the source is dask-backed and a global cube is ~1 GB
-    # as float32, so materialising it whole just to rescale it is avoidable.
+    # A batch at a time, never the whole cube: a year of global hourly frames is
+    # ~36 GB as float32, so materialising it just to rescale it is out of the
+    # question. The batch is what makes this fast as well as small -- one dask
+    # compute over `per_batch` frames decodes them in parallel and pays the
+    # scheduler once, where a frame-at-a-time walk pays it 8760 times over a
+    # graph 8760 tasks long. See grib_utils.frame_block.
     scale, offset = 1.0, 0.0
+
+    def batches(lo: int, hi: int):
+        for start in range(lo, hi, per_batch):
+            yield start, min(hi, start + per_batch)
+
+    def read(lo: int, hi: int) -> np.ndarray:
+        """Frames [lo, hi) as a writable float32 cube, freshly allocated."""
+        return np.asarray(gu.frame_block(da, lo, hi).compute(), dtype="float32")
 
     if args.dtype == "u16":
         # Two passes. The quantiser needs the range up front, and holding the
         # float cube to avoid the second read is the very cost being dodged.
         lo_v, hi_v = np.inf, -np.inf
-        for i in range(nt):
-            frame = np.asarray(da.isel(time=i).values, dtype="float32")
-            finite = np.isfinite(frame)
-            if finite.any():
-                lo_v = min(lo_v, float(frame[finite].min()))
-                hi_v = max(hi_v, float(frame[finite].max()))
-            print(f"\r  scanning    {i + 1}/{nt}", end="", flush=True)
+        for lo, hi in batches(0, nt):
+            cube = read(lo, hi)
+            finite = np.isfinite(cube)
+            if finite.all():
+                # The usual case, and worth its own branch: the masked gather
+                # below copies the batch, min/max over the cube itself doesn't.
+                lo_v, hi_v = min(lo_v, float(cube.min())), max(hi_v, float(cube.max()))
+            elif finite.any():
+                vals = cube[finite]
+                lo_v, hi_v = min(lo_v, float(vals.min())), max(hi_v, float(vals.max()))
+            print(f"\r  scanning    {hi}/{nt}", end="", flush=True)
         print()
         if not np.isfinite(lo_v):
             raise SystemExit("every value is NaN; nothing to write")
@@ -394,17 +424,26 @@ def main() -> None:
         payload = np.empty((span, nlat, nlon),
                            dtype="uint16" if args.dtype == "u16" else "float32")
 
-        for i in range(span):
-            frame = np.asarray(da.isel(time=lo + i).values, dtype="float32")
+        # The conversion is vectorised over the batch and done in place, so the
+        # only arrays alive here are the batch, its finite mask and the payload.
+        for a, b in batches(lo, hi):
+            cube = read(a, b)
             if convert:
-                frame = frame / np.float32(step_s)
+                cube /= np.float32(step_s)
             if args.dtype == "u16":
-                q = np.rint((frame - offset) / scale)
-                np.clip(q, 0, U16_MAX, out=q)
-                payload[i] = np.where(np.isfinite(frame), q, U16_FILL).astype("uint16")
-            else:
-                payload[i] = frame
-            done += 1
+                finite = np.isfinite(cube)      # taken before cube is overwritten
+                cube -= np.float32(offset)
+                cube /= np.float32(scale)
+                np.rint(cube, out=cube)
+                np.clip(cube, 0, U16_MAX, out=cube)
+                # `where=` on the negated mask, negated into itself, and a cast
+                # straight into the payload: no copy of the batch is made at any
+                # step, which is the difference between one batch of headroom
+                # and three.
+                np.copyto(cube, np.float32(U16_FILL),
+                          where=np.logical_not(finite, out=finite))
+            payload[a - lo:b - lo] = cube
+            done += b - a
             print(f"\r  converting  {done}/{nt + len(chunks) - 1}", end="", flush=True)
 
         members = dict(

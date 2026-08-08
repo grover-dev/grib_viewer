@@ -12,6 +12,8 @@ read path, and that is the point:
 * **Reading a frame** is a seek to that offset plus one message decode, wrapped
   in dask so the xarray API downstream (.sel, subsetting, unit conversion) still
   works and stays lazy. Frames are decoded only when something asks for them.
+  A tool that walks the whole time axis should pull batches through
+  `frame_block` rather than slicing frame by frame; see its docstring for why.
 
 * **Subsetting** (write_subset) copies messages verbatim. Going through xarray
   would be lossy -- cfgrib's writer needs the original GRIB_* attrs intact, and
@@ -227,6 +229,35 @@ def _index_key(path: str) -> str:
     return hashlib.sha1(stamp.encode()).hexdigest()[:16]
 
 
+def _time_key(t) -> int:
+    """A valid time as whole seconds, so a lookup can't miss on datetime64 units.
+
+    The index keys frames by datetime64[m]; xarray hands back datetime64[ns].
+    Both round-trip through seconds exactly, and an int is an unambiguous key.
+    """
+    return int(np.asarray(t).astype("datetime64[s]").astype("int64"))
+
+
+def _as_index(idx: np.ndarray):
+    """`idx` as a slice if it is an arithmetic progression, else unchanged.
+
+    Every spatial selection in this project is a stride -- a bbox crop, a thin,
+    the latitude flip -- so the gather below is nearly always a view rather than
+    a fancy-index copy. The exception is a rolled longitude axis, which is a
+    genuine permutation and stays an array.
+    """
+    idx = np.asarray(idx, dtype="int64")
+    if idx.size == 0:
+        return idx
+    step = int(idx[1] - idx[0]) if idx.size > 1 else 1
+    if step == 0 or not np.array_equal(idx, idx[0] + step * np.arange(idx.size)):
+        return idx
+    stop = int(idx[-1]) + step
+    # stop < 0 means a descending run that ends at column 0; slice() reads a
+    # negative stop as "from the end", so it has to be None instead.
+    return slice(int(idx[0]), stop if stop >= 0 else None, step)
+
+
 def _read_frame(path: str, offset: int, shape: tuple[int, int]) -> np.ndarray:
     """Decode one message's values by seeking straight to it.
 
@@ -245,6 +276,22 @@ def _read_frame(path: str, offset: int, shape: tuple[int, int]) -> np.ndarray:
             return ec.codes_get_values(h).reshape(shape).astype("float32")
         finally:
             ec.codes_release(h)
+
+
+def _read_frame_sel(path: str, offset: int, shape: tuple[int, int], rows, cols) -> np.ndarray:
+    """One frame, cropped to `rows`/`cols` of the source grid, as a fresh array.
+
+    The crop is applied here rather than downstream so a cropped batch costs the
+    cropped size: the copy is what lets the full decoded message be freed
+    immediately instead of being pinned alive by a view for as long as the batch
+    is held.
+    """
+    frame = _read_frame(path, offset, shape)
+    if isinstance(rows, slice) and isinstance(cols, slice):
+        return np.ascontiguousarray(frame[rows, cols])
+    r = np.arange(shape[0])[rows] if isinstance(rows, slice) else rows
+    c = np.arange(shape[1])[cols] if isinstance(cols, slice) else cols
+    return frame[np.ix_(r, c)]
 
 
 def index_grib(path: str) -> dict:
@@ -367,13 +414,69 @@ def open_grib(path: str, chunks: dict | None = None) -> dict[str, xr.DataArray]:
         da = xr.DataArray(
             data,
             dims=("time", "latitude", "longitude"),
-            coords={"time": times, "latitude": lats, "longitude": lons},
-            attrs=field["attrs"],
+            coords={
+                "time": times, "latitude": lats, "longitude": lons,
+                # Where each point sits in the *source message*. These ride along
+                # through every selection xarray applies -- a bbox crop, a thin,
+                # the latitude flip, the longitude roll below -- so `frame_block`
+                # can reproduce the same selection as a plain numpy gather
+                # without re-deriving it from coordinate values.
+                "_row": ("latitude", np.arange(nj)),
+                "_col": ("longitude", np.arange(ni)),
+            },
+            # Everything frame_block needs to read a frame itself. Copied, not
+            # aliased: the index it comes from is cached and shared.
+            attrs=dict(field["attrs"], _source={
+                "path": path,
+                "shape": (nj, ni),
+                "offsets": {_time_key(t): o for t, o in field["frames"].items()},
+            }),
             name=key,
         )
         fields[key] = normalize_lons(da)
 
     return fields
+
+
+def frame_block(da: xr.DataArray, lo: int = 0, hi: int | None = None):
+    """Frames [lo, hi) of `da` as a dask array whose graph is only that long.
+
+    Slicing the array returned by `open_grib` does *not* give you this. That one
+    carries a task per frame in the file, and dask culls the whole graph on every
+    compute -- so pulling frames one at a time costs O(nt) of scheduling per
+    frame and O(nt^2) overall. On a year of hourly ERA5 (8760 frames) that is
+    ~840 ms of bookkeeping to decode a 6 ms frame, and it is why extracting a
+    long run appeared to be I/O bound when almost none of it was I/O.
+
+    Rebuilding a graph over just the wanted frames removes the scheduling from
+    the inner loop entirely, and the batch is still read lazily and in parallel
+    by dask's threaded scheduler -- peak memory is one batch, set by the caller.
+
+    The selection already applied to `da` (bbox, thin, flip, roll) is carried by
+    the `_row`/`_col` coordinates and re-applied inside each worker. A DataArray
+    without them -- a derived field, say -- falls back to slicing its own graph.
+    """
+    hi = da.sizes["time"] if hi is None else hi
+    src = da.attrs.get("_source")
+    if src is None or "_row" not in da.coords or "_col" not in da.coords:
+        return da.isel(time=slice(lo, hi)).data
+
+    rows, cols = _as_index(da["_row"].values), _as_index(da["_col"].values)
+    shape = tuple(src["shape"])
+    ny, nx = da.sizes[ydim_of(da)], da.sizes[xdim_of(da)]
+
+    blocks = [
+        dask.array.from_delayed(
+            dask.delayed(_read_frame_sel)(
+                src["path"], src["offsets"][_time_key(t)], shape, rows, cols),
+            shape=(ny, nx),
+            dtype="float32",
+        )
+        for t in da["time"].values[lo:hi]
+    ]
+    if not blocks:  # an empty range is a legal slice; dask.stack won't take one
+        return dask.array.zeros((0, ny, nx), dtype="float32")
+    return dask.array.stack(blocks, axis=0)
 def derive_fields(fields: dict[str, xr.DataArray]) -> dict[str, xr.DataArray]:
     """Add wind speed for any u/v pair present (u10/v10, u100/v100, u/v, ...).
 
