@@ -53,6 +53,9 @@ predates the split still loads a part as the ordinary field it also is.
 from __future__ import annotations
 
 import argparse
+import threading
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -143,6 +146,24 @@ def chunk_path(dst: Path, index: int, total: int) -> Path:
     return dst.with_suffix(f".{index:03d}{dst.suffix}")
 
 
+def save_npz(path: Path, level: int, **members) -> None:
+    """`np.savez_compressed` with the deflate level exposed. Level 0 stores.
+
+    numpy hardcodes zlib's default (6), which is the wrong end of the curve for
+    this payload: on quantised ERA5 fields levels 1 and 6 both land within half a
+    percent of 2x, and 6 spends 20% longer getting there. That time is not free
+    -- compression is the one part of this pipeline that is strictly serial per
+    part, so it is the whole of the pause between parts.
+    """
+    kind = zipfile.ZIP_STORED if level == 0 else zipfile.ZIP_DEFLATED
+    with zipfile.ZipFile(path, "w", kind, allowZip64=True,
+                         compresslevel=None if level == 0 else level) as z:
+        for name, value in members.items():
+            # force_zip64: a part may legitimately exceed 4 GiB with --max-mib
+            with z.open(f"{name}.npy", "w", force_zip64=True) as fh:
+                np.lib.format.write_array(fh, np.asanyarray(value), allow_pickle=False)
+
+
 def list_fields(path: Path, fields: dict) -> None:
     """Every field in the file, with what it would cost to extract."""
     print(f"\n{path}")
@@ -196,6 +217,18 @@ def main() -> None:
                           "the batch in parallel, so this is both the peak read "
                           "buffer and the unit of parallelism -- lower it on a "
                           "memory-tight machine, raise it on a fast disk")
+    out.add_argument("--writers", type=int, default=2, metavar="N",
+                     help="parts compressed in the background at once (default 2). "
+                          "zlib runs at ~70 MiB/s on one core, so writing a 512 MiB "
+                          "part takes several seconds during which nothing is read; "
+                          "overlapping the writes with the next part's reads hides "
+                          "that, at the cost of N payload buffers in flight rather "
+                          "than one. 1 restores the old serial behaviour")
+    out.add_argument("--compress-level", type=int, default=1, metavar="1-9",
+                     choices=range(1, 10),
+                     help="zlib level for the payload (default 1). Levels above 1 "
+                          "are not worth their time on quantised fields: on ERA5 "
+                          "radiation, 1 and 6 both compress ~2x")
     out.add_argument("--no-compress", action="store_true",
                      help="store members uncompressed (bigger, loads faster)")
     out.add_argument("--no-center", action="store_true",
@@ -345,6 +378,11 @@ def main() -> None:
           + ("   (wraps)" if lon_wrap else ""))
     print(f"  reading     {per_batch} frame(s) per batch "
           f"({per_batch * nlat * nlon * 4 / (1 << 20):.0f} MiB, decoded in parallel)")
+    if len(chunks) > 1:
+        print(f"  writing     zlib level {args.compress_level if not args.no_compress else 0}"
+              f", up to {min(args.writers, len(chunks))} part(s) compressed in the "
+              f"background ({min(args.writers, len(chunks)) * frame_bytes * chunks[0][1] / (1 << 20):.0f}"
+              " MiB of payload buffers)")
     total_bytes = nt * frame_bytes
     if len(chunks) > 1:
         print(f"  split       {len(chunks)} files of <= {args.max_mib:g} MiB "
@@ -412,15 +450,34 @@ def main() -> None:
     part_nt = np.array([hi - lo for lo, hi in chunks], dtype="int64")
 
     dst = Path(args.npz)
-    save = np.savez if args.no_compress else np.savez_compressed
-    written: list[tuple[Path, int, int]] = []
+    level = 0 if args.no_compress else args.compress_level
+    if args.writers < 1:
+        raise SystemExit(f"--writers must be >= 1, got {args.writers}")
+
+    # Compression is serial within a part but the parts are independent files, so
+    # it belongs on background threads -- zlib releases the GIL, and the reads
+    # that would otherwise be stalled behind it are what fill the next buffer.
+    # The semaphore is the memory bound: a part cannot start converting until a
+    # writer has finished with one of the N buffers, so peak payload memory is N
+    # parts and not however many the reader can run ahead by.
+    slots = threading.Semaphore(args.writers)
+    pool = ThreadPoolExecutor(max_workers=args.writers, thread_name_prefix="npz-write")
+    pending = []
     done = 0
+
+    def write_part(out_path: Path, members: dict) -> tuple[Path, int, int]:
+        try:
+            save_npz(out_path, level, **members)
+            return out_path, members["data"].nbytes, out_path.stat().st_size
+        finally:
+            slots.release()
 
     for index, (lo, hi) in enumerate(chunks):
         span = hi - lo
         # Allocated per part, not per selection: this buffer is what the byte
-        # limit actually bounds, and it is reused only in the sense that the
-        # previous one is freed before the next is taken.
+        # limit actually bounds. Ownership passes to the writer thread below, so
+        # the next iteration allocates a fresh one rather than reusing this.
+        slots.acquire()
         payload = np.empty((span, nlat, nlon),
                            dtype="uint16" if args.dtype == "u16" else "float32")
 
@@ -476,9 +533,17 @@ def main() -> None:
         )
 
         out_path = chunk_path(dst, index, len(chunks))
-        save(out_path, **members)
-        written.append((out_path, payload.nbytes, out_path.stat().st_size))
-        del payload
+        pending.append(pool.submit(write_part, out_path, members))
+        del payload, members  # the writer owns the buffer now
+
+    # Futures resolve in chunk order because they were submitted in it, so the
+    # report below still lines up with `chunks`. A writer that raised does so
+    # here, once, rather than being swallowed in its thread.
+    if len(pending) > 1:
+        print(f"\r  converting  {done}/{nt + len(chunks) - 1}, "
+              f"finishing {min(args.writers, len(pending))} write(s)", end="", flush=True)
+    written: list[tuple[Path, int, int]] = [f.result() for f in pending]
+    pool.shutdown()
     print()
 
     raw_total = sum(raw for _, raw, _ in written)
