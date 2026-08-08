@@ -16,6 +16,7 @@ endif()
 
 add_executable(boatforge_tests
     npz_field_test.cpp
+    npz_field_split_test.cpp
 )
 
 target_link_libraries(boatforge_tests

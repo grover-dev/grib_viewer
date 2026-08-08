@@ -1,5 +1,6 @@
 #include <npy_tools/npz_field.h>
 
+#include <algorithm>
 #include <cmath>
 #include <format>
 #include <limits>
@@ -57,12 +58,22 @@ std::size_t extent(const NpzArchive& npz, std::string_view name)
     return static_cast<std::size_t>(n);
 }
 
-}  // namespace
-
-NpzField NpzField::load(const std::filesystem::path& path)
+// Everything about a part except its payload. Read on its own so a directory
+// can be indexed without inflating a single cube.
+struct Axes
 {
-    NpzArchive npz = load_npz(path);
+    std::chrono::seconds t0{0};
+    std::chrono::seconds step{0};
+    std::size_t nt = 0;
+    double lat0 = 0.0, dlat = 0.0;
+    std::size_t nlat = 0;
+    double lon0 = 0.0, dlon = 0.0;
+    std::size_t nlon = 0;
+    bool wrap = false;
+};
 
+Axes read_axes(const NpzArchive& npz)
+{
     const int32_t version = scalar<int32_t>(npz, "version");
     if (version != supported_version)
     {
@@ -72,67 +83,199 @@ NpzField NpzField::load(const std::filesystem::path& path)
                         version, supported_version)};
     }
 
-    NpzField field;
-    field.t0_ = std::chrono::seconds{scalar<int64_t>(npz, "t0")};
-    field.step_ = std::chrono::seconds{scalar<int64_t>(npz, "dt")};
-    field.nt_ = extent(npz, "nt");
-    field.lat0_ = scalar<double>(npz, "lat0");
-    field.dlat_ = scalar<double>(npz, "dlat");
-    field.nlat_ = extent(npz, "nlat");
-    field.lon0_ = scalar<double>(npz, "lon0");
-    field.dlon_ = scalar<double>(npz, "dlon");
-    field.nlon_ = extent(npz, "nlon");
-    field.wrap_ = scalar<int32_t>(npz, "lon_wrap") != 0;
+    Axes axes;
+    axes.t0 = std::chrono::seconds{scalar<int64_t>(npz, "t0")};
+    axes.step = std::chrono::seconds{scalar<int64_t>(npz, "dt")};
+    axes.nt = extent(npz, "nt");
+    axes.lat0 = scalar<double>(npz, "lat0");
+    axes.dlat = scalar<double>(npz, "dlat");
+    axes.nlat = extent(npz, "nlat");
+    axes.lon0 = scalar<double>(npz, "lon0");
+    axes.dlon = scalar<double>(npz, "dlon");
+    axes.nlon = extent(npz, "nlon");
+    axes.wrap = scalar<int32_t>(npz, "lon_wrap") != 0;
 
-    if (field.step_ <= std::chrono::seconds{0})
+    if (axes.step <= std::chrono::seconds{0})
     {
-        throw NpyError{std::format("time step is {} s; must be positive", field.step_.count())};
+        throw NpyError{std::format("time step is {} s; must be positive", axes.step.count())};
     }
-    if (!(field.dlat_ > 0.0) || !(field.dlon_ > 0.0))
+    if (!(axes.dlat > 0.0) || !(axes.dlon > 0.0))
     {
         throw NpyError{
-            std::format("grid steps must be positive and ascending, got dlat={} dlon={}", field.dlat_, field.dlon_)};
+            std::format("grid steps must be positive and ascending, got dlat={} dlon={}", axes.dlat, axes.dlon)};
+    }
+    return axes;
+}
+
+// Just the axis constants: every member except the payload, which is the one
+// that costs anything to read.
+NpzArchive load_axes_only(const std::filesystem::path& path)
+{
+    return load_npz(path, [](std::string_view name) { return name != "data"; });
+}
+
+// The window a part covers, last frame inclusive.
+std::chrono::seconds last_frame(const Axes& axes)
+{
+    return axes.t0 + axes.step * static_cast<int64_t>(axes.nt - 1);
+}
+
+}  // namespace
+
+NpzField NpzField::load(const std::filesystem::path& path)
+{
+    const Axes axes = read_axes(load_axes_only(path));
+
+    NpzField field;
+    field.step_ = axes.step;
+    field.lat0_ = axes.lat0;
+    field.dlat_ = axes.dlat;
+    field.nlat_ = axes.nlat;
+    field.lon0_ = axes.lon0;
+    field.dlon_ = axes.dlon;
+    field.nlon_ = axes.nlon;
+    field.wrap_ = axes.wrap;
+    field.parts_.push_back(Part{path, axes.t0, last_frame(axes), axes.nt});
+
+    // Loaded here rather than on first use: a single-file field has nothing to
+    // defer to, and a caller that got a field back has always been able to
+    // assume the file was readable.
+    field.make_resident(0);
+    return field;
+}
+
+NpzField NpzField::load_directory(const std::filesystem::path& dir)
+{
+    if (!std::filesystem::is_directory(dir))
+    {
+        throw NpyError{std::format("{} is not a directory", dir.string())};
     }
 
-    // Moved, not copied: a global month is gigabytes and the archive is dead
-    // after this point anyway.
+    std::vector<std::filesystem::path> files;
+    for (const auto& entry : std::filesystem::directory_iterator{dir})
+    {
+        if (entry.is_regular_file() && entry.path().extension() == ".npz")
+        {
+            files.push_back(entry.path());
+        }
+    }
+    if (files.empty())
+    {
+        throw NpyError{std::format("{} holds no .npz parts", dir.string())};
+    }
+    // directory_iterator has no defined order; parts are named to sort, but the
+    // real ordering happens on t0 below, so a renamed part still lands right.
+    std::sort(files.begin(), files.end());
+
+    NpzField field;
+    bool first = true;
+    for (const auto& path : files)
+    {
+        Axes axes;
+        try
+        {
+            axes = read_axes(load_axes_only(path));
+        }
+        catch (const NpyError& e)
+        {
+            throw NpyError{std::format("{}: {}", path.string(), e.what())};
+        }
+
+        if (first)
+        {
+            field.step_ = axes.step;
+            field.lat0_ = axes.lat0;
+            field.dlat_ = axes.dlat;
+            field.nlat_ = axes.nlat;
+            field.lon0_ = axes.lon0;
+            field.dlon_ = axes.dlon;
+            field.nlon_ = axes.nlon;
+            field.wrap_ = axes.wrap;
+            first = false;
+        }
+        else if (axes.step != field.step_ || axes.lat0 != field.lat0_ || axes.dlat != field.dlat_ ||
+                 axes.nlat != field.nlat_ || axes.lon0 != field.lon0_ || axes.dlon != field.dlon_ ||
+                 axes.nlon != field.nlon_ || axes.wrap != field.wrap_)
+        {
+            // Only the time window may differ between parts. Anything else and
+            // the parts are not one field, and a sample would silently mean a
+            // different thing depending on which one happened to be resident.
+            throw NpyError{std::format("{} does not match the other parts in {}: the grid and time step "
+                                       "must be identical across a split field",
+                                       path.string(), dir.string())};
+        }
+
+        field.parts_.push_back(Part{path, axes.t0, last_frame(axes), axes.nt});
+    }
+
+    std::sort(field.parts_.begin(), field.parts_.end(),
+              [](const Part& a, const Part& b) { return a.t0 < b.t0; });
+
+    // Deliberately not loaded: the point of a directory is that the first
+    // sample decides which part is worth reading.
+    return field;
+}
+
+void NpzField::make_resident(std::size_t index) const
+{
+    if (index == resident_)
+    {
+        return;
+    }
+
+    const Part& part = parts_[index];
+    NpzArchive npz = load_npz(part.path);
+
     const auto data_it = npz.find("data");
     if (data_it == npz.end())
     {
-        throw NpyError{"not a gridded field npz: no 'data' array"};
+        throw NpyError{std::format("{}: not a gridded field npz: no 'data' array", part.path.string())};
     }
-    field.data_ = std::move(data_it->second);
 
-    const std::vector<std::size_t>& shape = field.data_.shape();
-    if (shape.size() != 3 || shape[0] != field.nt_ || shape[1] != field.nlat_ || shape[2] != field.nlon_)
+    // Assigned, not swapped in beside the old one: the previous payload is
+    // released here, so peak memory stays at one part rather than two. Moved
+    // rather than copied because the archive is dead after this point anyway.
+    data_ = std::move(data_it->second);
+    t0_ = part.t0;
+    nt_ = part.nt;
+
+    const std::vector<std::size_t>& shape = data_.shape();
+    if (shape.size() != 3 || shape[0] != nt_ || shape[1] != nlat_ || shape[2] != nlon_)
     {
-        throw NpyError{std::format("'data' has shape {}, but the axes say ({}, {}, {})", field.data_.shape_string(),
-                                   field.nt_, field.nlat_, field.nlon_)};
+        resident_ = npos;
+        throw NpyError{std::format("{}: 'data' has shape {}, but the axes say ({}, {}, {})", part.path.string(),
+                                   data_.shape_string(), nt_, nlat_, nlon_)};
     }
-    if (field.data_.fortran_order())
+    if (data_.fortran_order())
     {
-        throw NpyError{"'data' is Fortran-ordered; the sampler indexes it C-order"};
+        resident_ = npos;
+        throw NpyError{std::format("{}: 'data' is Fortran-ordered; the sampler indexes it C-order",
+                                   part.path.string())};
     }
 
     // The dtype the writer chose is what says whether values are quantised;
-    // scale/offset/fill are only meaningful for the integer payload.
-    switch (field.data_.dtype())
+    // scale/offset/fill are only meaningful for the integer payload. Read per
+    // part, not once for the field: each part carries its own, and while
+    // grib_npz.py quantises a split field against one shared range, a directory
+    // assembled by other means need not.
+    switch (data_.dtype())
     {
         case DType::UInt16:
-            field.quantised_ = true;
-            field.scale_ = scalar<double>(npz, "scale");
-            field.offset_ = scalar<double>(npz, "offset");
-            field.fill_ = static_cast<uint16_t>(scalar<int64_t>(npz, "fill"));
+            quantised_ = true;
+            scale_ = scalar<double>(npz, "scale");
+            offset_ = scalar<double>(npz, "offset");
+            fill_ = static_cast<uint16_t>(scalar<int64_t>(npz, "fill"));
             break;
         case DType::Float32:
-            field.quantised_ = false;
+            quantised_ = false;
             break;
         default:
-            throw NpyError{
-                std::format("'data' is {}; expected uint16 (quantised) or float32", to_string(field.data_.dtype()))};
+            resident_ = npos;
+            throw NpyError{std::format("{}: 'data' is {}; expected uint16 (quantised) or float32",
+                                       part.path.string(), to_string(data_.dtype()))};
     }
 
-    return field;
+    resident_ = index;
 }
 
 float NpzField::at(std::size_t i, std::size_t j, std::size_t k) const
@@ -152,6 +295,32 @@ float NpzField::at(std::size_t i, std::size_t j, std::size_t k) const
 
 bool NpzField::sample(std::chrono::seconds when, double lat, double lon, float& value) const
 {
+    // --- which part answers this ------------------------------------------
+    // The resident part is tried first, and on a forward walk it keeps
+    // answering until the field steps off its end -- so the scan below, and the
+    // load after it, happen once per boundary crossed rather than once per
+    // sample. The scan being linear costs nothing next to the load it precedes.
+    if (resident_ == npos || when < t0_ || when > parts_[resident_].end)
+    {
+        std::size_t found = npos;
+        for (std::size_t i = 0; i < parts_.size(); ++i)
+        {
+            if (when >= parts_[i].t0 && when <= parts_[i].end)
+            {
+                found = i;
+                break;
+            }
+        }
+        if (found == npos)
+        {
+            // Before the first part, after the last, or in a gap between two.
+            // A miss either way, and the same miss as falling off the end of a
+            // single-file field -- nothing is loaded to find that out.
+            return false;
+        }
+        make_resident(found);
+    }
+
     if (nt_ == 0)
     {
         return false;

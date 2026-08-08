@@ -60,6 +60,11 @@ std::vector<std::byte> read_member(zip_t* archive, zip_uint64_t index,
 }  // namespace
 
 NpzArchive load_npz(const std::filesystem::path& path) {
+    return load_npz(path, [](std::string_view) { return true; });
+}
+
+NpzArchive load_npz(const std::filesystem::path& path,
+                    const std::function<bool(std::string_view)>& keep) {
     int code = 0;
     ZipHandle archive{zip_open(path.c_str(), ZIP_RDONLY, &code)};
     if (!archive) {
@@ -95,6 +100,9 @@ NpzArchive load_npz(const std::filesystem::path& path) {
             continue;  // numpy writes only .npy members; ignore anything else
         }
         name.remove_suffix(4);
+        if (!keep(name)) {
+            continue;  // never read, so a skipped payload costs nothing to inflate
+        }
 
         const auto image = read_member(archive.get(),
                                        static_cast<zip_uint64_t>(i), stat.name,

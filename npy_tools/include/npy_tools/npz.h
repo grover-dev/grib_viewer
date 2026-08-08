@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -16,6 +17,14 @@ using NpzArchive = std::map<std::string, NpyArray, std::less<>>;
 // Load every array from a .npz archive. Handles ZIP64 (which numpy's savez
 // emits unconditionally) and both stored and deflated members.
 NpzArchive load_npz(const std::filesystem::path& path);
+
+// The same, but only the members `keep` accepts -- the rest are not read or
+// decompressed at all, just skipped in the central directory. A gridded field's
+// axis constants are a few hundred bytes next to a payload that can be
+// gigabytes, so reading the metadata of many files costs about what opening
+// them does. `keep` sees the member name without its ".npy" suffix.
+NpzArchive load_npz(const std::filesystem::path& path,
+                    const std::function<bool(std::string_view)>& keep);
 
 // Store matches numpy.savez, Deflate matches numpy.savez_compressed. Either
 // loads with a plain numpy.load; the trade is write time against file size,
