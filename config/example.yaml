@@ -74,9 +74,18 @@ defaults:
   current_v_field: ../sample_data/vo
 
   # Degrees, WGS84. Approximately LA
-  start: { lat: 33.5, lon: -120.0 }
+  # start: { lat: 33.5, lon: -120.0 }
+  # # Approx Hawaii
+  # end: { lat: 19.0, lon: -154.0 }
+
+  # drake passage
+  # start: { lat: -58, lon: -55.0 }
+  # # ...to further off the coast of spain.
+  # end: { lat: -58.0, lon: -72.0 }
+
+  start: { lat: -58, lon: -72.0 }
   # ...to further off the coast of spain.
-  end: { lat: 19.0, lon: -154.0 }
+  end: { lat: -58.0, lon: -55.0 }
 
   # Steps of blackboard::time_step (1 h) before a run gives up.
   max_steps: 1000
