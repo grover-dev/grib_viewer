@@ -87,6 +87,9 @@ struct blackboard
     double environment_heading{};
     double environment_velocity{};
 
+    double ocean_current_heading{};
+    double ocean_current_velocity{};
+
     /* This creates our vector */
     double combined_heading{};
     double combined_velocity{};
@@ -139,6 +142,76 @@ public:
 private:
     blackboard& bb_;
     boatforge::NpzField& field_;
+};
+
+class OceanCurrentField  // TODO: Generalize to environment models
+{
+public:
+    // FIXME: This will need to load and sample data...
+    OceanCurrentField(blackboard& bb, boatforge::NpzField& uo_field, boatforge::NpzField& vo_field)
+        : bb_(bb), uo_field_(uo_field), vo_field_(vo_field)
+    {
+    }
+
+    void sample()
+    {
+        // FIXME: Add future optimization to cache data for parallel runs
+        /* Both are sampled even if the first misses: they are separate files
+         * and only agree on coverage by construction, so asking each is the
+         * only way to know the pair is usable. On a miss the heading and
+         * velocity keep their last values, which nothing reads -- the sim ends
+         * the run on the cleared flag before the step that would have used
+         * them. */
+        float uo{};
+        float vo{};
+        const bool have_uo = uo_field_.sample(bb_.time, bb_.current_lat, bb_.current_lon, uo);
+        const bool have_vo = vo_field_.sample(bb_.time, bb_.current_lat, bb_.current_lon, vo);
+
+        bb_.data_valid &= have_uo && have_vo;
+        if (!have_uo || !have_vo)
+        {
+            return;
+        }
+
+        /* Components first, polar second -- never the other way round. Each
+         * field interpolates its own component, and the pair is turned into a
+         * heading and a speed here, once, from the result.
+         *
+         * Interpolating a stored speed and bearing instead would be wrong at
+         * every point the flow turns. Across a shear where u runs +1 -> -1 the
+         * true midpoint is slack water, but interpolated speed stays 1 m/s and
+         * the bearing has two equally short arcs to choose between; a stored
+         * bearing also has a seam at 0/360 that linear interpolation puts 180
+         * degrees out. The components have no seam and pass through zero
+         * correctly, so the vector below is the real one. */
+        const double u = static_cast<double>(uo);
+        const double v = static_cast<double>(vo);
+
+        /* hypot rather than sqrt(u*u + v*v): it holds precision at the ends of
+         * the range instead of squaring its way into an overflow or a
+         * denormal. */
+        bb_.ocean_current_velocity = std::hypot(u, v);
+
+        /* The set: where the current flows *to*, which is the direction that
+         * carries the boat. (Wind is named the opposite way, by where it comes
+         * from -- do not carry this convention across to a wind field.)
+         *
+         * atan2(u, v), east over north, rather than the usual atan2(y, x):
+         * that puts 0 at true north and turns clockwise through east, which is
+         * the convention powered_heading and initial_bearing_deg already use.
+         * Slack water leaves this at 0 -- a heading is meaningless with no
+         * speed behind it, and every consumer weights it by the velocity. */
+        bb_.ocean_current_heading = std::fmod(rad_to_deg(std::atan2(u, v)) + 360.0, 360.0);
+
+        // TODO: Add other effects
+        bb_.environment_heading = bb_.ocean_current_heading;
+        bb_.environment_velocity = bb_.ocean_current_velocity;
+    }
+
+private:
+    blackboard& bb_;
+    boatforge::NpzField& uo_field_;
+    boatforge::NpzField& vo_field_;
 };
 
 class EnvironmentField
@@ -232,9 +305,36 @@ public:
 
     void step()
     {
-        // FIXME: eventually combine the powered and environment vectors
-        bb_.combined_heading = bb_.powered_heading;
-        bb_.combined_velocity = bb_.powered_velocity;
+        /* What the boat drives and what the world carries it through are two
+         * velocities over the ground, so they add as vectors -- through their
+         * components, never by averaging the two headings. An average ignores
+         * which of the two is stronger, and it carries the 0/360 seam: a boat
+         * on 350 in a current setting 010 would come out on 180, pointing back
+         * the way it came.
+         *
+         * The decomposition is the same one OceanCurrentField uses coming the
+         * other way. A compass bearing puts east on sin and north on cos, so
+         * the pair below is (east, north) in m/s. */
+        const double powered_rad = deg_to_rad(bb_.powered_heading);
+        const double environment_rad = deg_to_rad(bb_.environment_heading);
+
+        const double east =
+            bb_.powered_velocity * std::sin(powered_rad) + bb_.environment_velocity * std::sin(environment_rad);
+        const double north =
+            bb_.powered_velocity * std::cos(powered_rad) + bb_.environment_velocity * std::cos(environment_rad);
+
+        bb_.combined_velocity = std::hypot(east, north);
+        /* atan2(east, north) rather than the usual atan2(y, x): 0 at true
+         * north, turning clockwise, which is the convention every heading on
+         * the blackboard carries. Dead in the water leaves this at 0 and
+         * nothing minds -- the step below is scaled by the velocity, so a
+         * heading with no speed behind it moves the boat nowhere.
+         *
+         * Note this can be *slower* than powered_velocity, and should be: a
+         * current on the nose subtracts, and a beam-on current turns the track
+         * off the heading the solver asked for. Both fall straight out of the
+         * addition. */
+        bb_.combined_heading = std::fmod(rad_to_deg(std::atan2(east, north)) + 360.0, 360.0);
 
         /* meters per second * seconds = meters */
         double step = bb_.combined_velocity * static_cast<double>(bb_.time_step.count());

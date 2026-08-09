@@ -40,12 +40,25 @@ TRACK = "#eb6834"  # the one warm accent, reserved for the boat
 INK = "#ffffff"
 
 # Categorical slots for comparing runs, taken in this fixed order and never
-# cycled: the order is the colourblind-safety mechanism, not decoration. These
-# are the dark-surface steps of the eight-hue set, validated as a set for
-# adjacent pairs -- which is the pairlist that applies to lines -- at worst CVD
-# dE 8.4 and normal-vision dE 19.3 (OKLab x100). Identity never rests on colour
-# alone: a legend is drawn whenever there is more than one run, and up to four
-# runs are labelled on the lines as well.
+# cycled: the order is the colourblind-safety mechanism, not decoration. The
+# first eight are the dark-surface steps of the standard eight-hue set; slots 9
+# and 10 were added for the ten-departure sweeps and are not from it.
+#
+# Validated as a set against this module's own SURFACE (#0d0d0d, darker than the
+# reference #1a1a19, so the contrast check had to be re-run) on the adjacent
+# pairlist, which is the one that applies to lines: worst CVD dE 8.4 and
+# normal-vision dE 19.3 (OKLab x100), both unchanged by the two additions --
+# the binding pair is yellow/aqua, and was already there at eight. The added
+# steps were searched rather than picked: in-gamut, inside the dark lightness
+# band, above the chroma floor, at or under the incumbents' own chroma ceiling,
+# and chosen, out of every candidate clearing those, to maximise their worst
+# separation from all eight.
+#
+# Honest about the limit: on the ALL-pairs list (which is what a panel of ten
+# overlaid lines really is, since every line can cross every other) the set
+# fails, worst CVD dE 1.6 at magenta/aqua and normal dE 7.1 at red/orange. That
+# failure is inherited from the original eight, not introduced here, and it is
+# why the legend and the direct labels are not optional.
 SERIES = (
     "#3987e5",  # blue
     "#d95926",  # orange
@@ -55,8 +68,10 @@ SERIES = (
     "#008300",  # green
     "#9085e9",  # violet
     "#e66767",  # red
+    "#025ac3",  # deep blue
+    "#a82a7b",  # plum
 )
-# Past the eight slots there is no ninth hue to reach for -- a generated one
+# Past the ten slots there is no eleventh hue to reach for -- a generated one
 # would not have been validated against the rest. Extra runs are dropped, and
 # said so out loud rather than silently folded in.
 MAX_RUNS = len(SERIES)

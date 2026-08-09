@@ -130,6 +130,14 @@ void overlay_run(Sim::run_t& run, const YAML::Node& node, const std::filesystem:
     {
         run.solar_field = resolve(base, node["solar_field"].as<std::string>());
     }
+    if (node["current_u_field"])
+    {
+        run.current_u_field = resolve(base, node["current_u_field"].as<std::string>());
+    }
+    if (node["current_v_field"])
+    {
+        run.current_v_field = resolve(base, node["current_v_field"].as<std::string>());
+    }
     if (node["max_steps"])
     {
         run.max_steps = node["max_steps"].as<std::uint32_t>();
@@ -229,6 +237,14 @@ Sim::config_t load_config(const std::filesystem::path& config_path)
             if (entry.solar_field.empty())
             {
                 throw std::runtime_error(entry.name + ": no solar_field, in the run or in defaults");
+            }
+            /* Both or neither: one component is not a current, and a run that
+             * named only half of one would otherwise sail through a field that
+             * silently flows due east or due north. */
+            if (entry.current_u_field.empty() != entry.current_v_field.empty())
+            {
+                throw std::runtime_error(entry.name + ": current_u_field and current_v_field go together; "
+                                                      "one component on its own is not a current");
             }
             if (!names.insert(entry.name).second)
             {

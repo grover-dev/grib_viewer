@@ -3,8 +3,9 @@
 #
 #   boatforge config/example.yaml
 #
-# Relative paths (out_directory, solar_field) resolve against this file's
-# directory, so a config travels with the data it names.
+# Relative paths (out_directory, solar_field, current_u_field, current_v_field)
+# resolve against this file's directory, so a config travels with the data it
+# names.
 
 out_directory: ../out
 
@@ -17,7 +18,10 @@ out_directory: ../out
 # wider and raise this, at one part's worth of memory each (whatever --max-mib
 # grib_npz.py was given, so 512 MiB by default).
 #
-# Ignored when solar_field is a single npz -- there is nothing to evict.
+# Applies to every field a run names, the currents included, and is counted per
+# field rather than across all of them -- three split fields at 2 is six parts
+# resident, not two. Ignored by a field that is a single npz: there is nothing
+# to evict.
 field_cache_parts: 2
 
 # Applied to every run below. A run repeating one of these keys overrides it
@@ -37,7 +41,37 @@ defaults:
   # solar_field: ../data/ssrd_global_20250101_10.npz
   # solar_field: ../data/ssrd_global_2025          # a directory of parts
   # solar_field: ../data/ssrd_global_2025_jan.npz
-  solar_field: ../data3
+  solar_field: ../sample_data/ssrd
+
+  # Ocean current, as two components rather than a speed and a bearing:
+  # current_u_field is eastward (uo), current_v_field is northward (vo). Same
+  # form as solar_field and the same cache, so a path named twice is loaded
+  # once -- but give each component its own directory. A directory is read as
+  # the parts of *one* field, and u and v share a grid and a time step, so a
+  # directory holding both would load as one field with every frame duplicated
+  # and half of them pointing the wrong way.
+  #
+  # They are stored as components because that is the only way they interpolate
+  # correctly. A stored bearing has a seam at 0/360 that linear interpolation
+  # puts 180 degrees out, and a stored speed cannot pass through zero: across a
+  # shear where the flow reverses, the truth is slack water but interpolated
+  # speed stays at full strength. The sim samples each component and derives
+  # the heading and speed from the pair, once, in OceanCurrentField::sample.
+  #
+  # Written by scripts/netcdf4_npz.py from a CMEMS physics product, one
+  # directory per component:
+  #   mkdir -p data/current_u data/current_v
+  #   netcdf4_npz.py <file>.nc uo data/current_u/uo.npz --at depth=0
+  #   netcdf4_npz.py <file>.nc vo data/current_v/vo.npz --at depth=0
+  # Each writes uo.000.npz, uo.001.npz, ... into its directory once the cube
+  # passes --max-mib, and a selection small enough not to split leaves a single
+  # npz there, which loads the same way. --at depth=0 takes the shallowest
+  # level; say it explicitly so the config records which level is being sailed.
+  #
+  # Both or neither -- a run naming one without the other is refused. Omit both
+  # and the run simply has no current: ocean_current_* stay at zero.
+  current_u_field: ../sample_data/uo
+  current_v_field: ../sample_data/vo
 
   # Degrees, WGS84. Approximately LA
   start: { lat: 33.5, lon: -120.0 }
@@ -71,8 +105,8 @@ runs:
   # the shape of a start-day study: same route, same boat, different weather.
   # Writes jan_00.npz .. jan_05.npz.
   - name: jan
-    start_time: 2025-01-02T12:00:00Z
-    count: 10
+    start_time: 2025-01-01T12:00:00Z
+    count: 1
     every: 1d
 
   # Twice a day for three days, from the same departure. Overlaps the sweep
