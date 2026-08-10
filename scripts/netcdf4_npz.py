@@ -3,6 +3,20 @@
     uv run netcdf4_npz.py data/cmems.nc --list
     uv run netcdf4_npz.py data/cmems.nc uo current.npz --at depth=0
     uv run netcdf4_npz.py data/cmems.nc usi ice.npz --bbox -40 5 20 60
+    uv run netcdf4_npz.py raw_data/ uo current.npz          # every .nc in there
+    uv run netcdf4_npz.py raw_data/currents_2025*.nc vo v.npz
+
+Several sources are joined along time, which is how a product that is downloaded
+a month at a time -- `raw_data/currents_20250201-20250303.nc` and its siblings --
+becomes one field. The files are ordered by their own first stamp rather than by
+name or by the order given, timestamps present in more than one are kept once
+(download windows usually share an endpoint), and the joined axis then has to be
+uniform like any other: a gap between two files is a hard error naming them,
+because `t0 + i*dt` cannot express a hole. Everything else -- the grid, the
+dimension layout, the units -- must match across the files, and the packing
+attributes need not: each file is unpacked with its own `scale_factor` /
+`add_offset` / `_FillValue`, which for a product packed per delivery is the
+difference between correct values and quietly wrong ones.
 
 Same output as `grib_npz.py`, same reader on the other side -- see that file for
 what the format promises and `npz_out.py` for the members that promise it. This
@@ -49,6 +63,7 @@ from __future__ import annotations
 
 import argparse
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 import h5py
@@ -332,15 +347,248 @@ def is_accumulated(dset: h5py.Dataset, units: str) -> bool:
     return units.strip().lower() in ACCUMULATED_UNITS
 
 
+# What a directory argument picks up. NetCDF4 has no single blessed extension,
+# and these are the ones products in the wild actually ship with.
+NC_SUFFIXES = (".nc", ".nc4", ".netcdf", ".cdf")
+
+
+def collect_paths(given: list[str]) -> list[Path]:
+    """The files behind the arguments: a directory expands to the NetCDF in it.
+
+    Names are only a sorting key here, and a weak one -- the real order comes
+    from the time axes once the files are open. Sorting the expansion of a
+    directory anyway keeps the "which file is which" reporting stable between
+    runs, and a repeat (a shell glob overlapping an explicit name) is dropped
+    rather than joined to itself.
+    """
+    found: list[Path] = []
+    for name in given:
+        path = Path(name)
+        if path.is_dir():
+            inside = sorted(c for c in path.iterdir()
+                            if c.is_file() and c.suffix.lower() in NC_SUFFIXES)
+            if not inside:
+                raise SystemExit(
+                    f"no NetCDF files in {path}/ (looking for "
+                    f"{', '.join(NC_SUFFIXES)})"
+                )
+            found.extend(inside)
+        elif path.exists():
+            found.append(path)
+        else:
+            raise SystemExit(f"no such file or directory: {path}")
+
+    seen, unique = set(), []
+    for path in found:
+        key = path.resolve()
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
+
+
+def open_hdf5(path: Path) -> h5py.File:
+    try:
+        return h5py.File(path, "r")
+    except OSError as exc:
+        raise SystemExit(
+            f"{path} is not readable as HDF5 ({exc}). NetCDF *3* files are a different "
+            "format entirely and this tool cannot open them; convert with "
+            "`nccopy -k nc4 in.nc out.nc` first."
+        )
+
+
+@dataclass
+class Source:
+    """One open file's share of the field, decoded far enough to be joined.
+
+    The packing attributes live here rather than at the top of `main` because
+    they are per file: a product delivered in monthly parts is packed against
+    each part's own range, so unpacking every file with the first one's
+    `scale_factor` would be off by whatever the ranges differ by.
+    """
+    path: Path
+    f: h5py.File
+    dset: h5py.Dataset
+    names: list[str]
+    times: np.ndarray            # int64 epoch seconds, this file's own axis
+    scale_factor: np.ndarray | None
+    add_offset: np.ndarray | None
+    fill_raw: np.ndarray | None
+    missing_raw: np.ndarray | None
+
+    def decode(self, raw: np.ndarray) -> np.ndarray:
+        """Raw values as float32, sentinels turned into NaN, unpacked."""
+        cube = raw.astype("float32")
+        # Sentinels are matched against the raw values, before unpacking: that is
+        # what CF specifies, and it is the only point where the comparison is
+        # exact. A NaN sentinel needs no test -- it is already NaN in the cast.
+        for sentinel in (self.fill_raw, self.missing_raw):
+            if sentinel is not None and not (sentinel.dtype.kind == "f"
+                                             and np.isnan(sentinel)):
+                cube[raw == sentinel] = np.nan
+        if self.scale_factor is not None:
+            cube *= np.float32(self.scale_factor)
+        if self.add_offset is not None:
+            cube += np.float32(self.add_offset)
+        return cube
+
+
+def open_source(path: Path, var: str) -> Source:
+    """One file, with `var` found in it and its time axis decoded."""
+    f = open_hdf5(path)
+    fields = find_fields(f)
+    if not fields:
+        raise SystemExit(f"no (time, lat, lon) field found in {path}")
+    if var not in fields:
+        raise SystemExit(
+            f"{var!r} is not in {path}.\n"
+            f"  available: {', '.join(sorted(fields))}"
+        )
+    dset, names = fields[var]
+
+    t_axis = axis_of(names, T_NAMES)
+    for dim in (names[t_axis], names[axis_of(names, Y_NAMES)],
+                names[axis_of(names, X_NAMES)]):
+        if dim not in f:
+            raise SystemExit(
+                f"dimension {dim!r} has no coordinate variable in {path}, so its "
+                "axis values are unknown and the grid cannot be described"
+            )
+
+    tvar = f[names[t_axis]]
+    return Source(
+        path=path, f=f, dset=dset, names=names,
+        times=decode_time(tvar[:], text(tvar, "units"), text(tvar, "calendar")),
+        scale_factor=number(dset, "scale_factor"),
+        add_offset=number(dset, "add_offset"),
+        fill_raw=number(dset, "_FillValue", dtype=dset.dtype),
+        missing_raw=number(dset, "missing_value", dtype=dset.dtype),
+    )
+
+
+def check_compatible(sources: list[Source], var: str) -> None:
+    """That the files describe the same field on the same grid.
+
+    Only the properties the joined cube actually depends on are compared. The
+    packing is deliberately not among them -- see `Source.decode` -- and neither
+    is anything cosmetic, because refusing a file over a reworded `long_name`
+    would help nobody.
+    """
+    head = sources[0]
+    t_axis = axis_of(head.names, T_NAMES)
+    shape = tuple(n for a, n in enumerate(head.dset.shape) if a != t_axis)
+    units = text(head.dset, "units")
+    lat = head.f[head.names[axis_of(head.names, Y_NAMES)]][:]
+    lon = head.f[head.names[axis_of(head.names, X_NAMES)]][:]
+
+    for s in sources[1:]:
+        where = f"{s.path} disagrees with {head.path}"
+        if s.names != head.names:
+            raise SystemExit(f"{where}: dims are ({', '.join(s.names)}), not "
+                             f"({', '.join(head.names)})")
+        other = tuple(n for a, n in enumerate(s.dset.shape) if a != t_axis)
+        if other != shape:
+            raise SystemExit(f"{where}: {var} is {other} outside time, not {shape}")
+        if text(s.dset, "units") != units:
+            raise SystemExit(f"{where}: units are {text(s.dset, 'units')!r}, "
+                             f"not {units!r}; these are not the same quantity")
+        for axis, mine, theirs in (("latitude", lat, s.f[s.names[axis_of(s.names, Y_NAMES)]][:]),
+                                   ("longitude", lon, s.f[s.names[axis_of(s.names, X_NAMES)]][:])):
+            if not np.array_equal(mine, theirs):
+                raise SystemExit(
+                    f"{where}: the {axis} axis is a different grid "
+                    f"({theirs.min():g}..{theirs.max():g} against "
+                    f"{mine.min():g}..{mine.max():g}); this tool joins along time "
+                    "only and does not regrid"
+                )
+
+
+def order_sources(sources: list[Source]) -> list[Source]:
+    """Time order, which is the only order the join is defined in.
+
+    Not the order given and not the filenames: a name is a convention, and
+    `currents_20250201-20250303.nc` sorts as intended only until someone drops a
+    file named differently into the same directory.
+    """
+    return sorted(sources, key=lambda s: (int(s.times[0]), str(s.path)))
+
+
+def join_time(sources: list[Source]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The joined time axis, and where each of its frames comes from.
+
+    Returns `(times, src_of, row_of)`: frame i of the joined selection is row
+    `row_of[i]` of `sources[src_of[i]]`. `sources` must already be in time order
+    (`order_sources`); a stamp already covered by an earlier file is dropped --
+    consecutive downloads normally share an endpoint, and keeping both would put
+    a zero-length step in an axis that has to be uniform.
+    """
+    times, src_of, row_of = [], [], []
+    for i, s in enumerate(sources):
+        if uniform_step(s.times, f"time in {s.path}", tol=0.0) <= 0:
+            raise SystemExit(f"the time axis in {s.path} does not increase")
+        rows = np.flatnonzero(s.times > times[-1][-1]) if times \
+            else np.arange(s.times.size)
+        if rows.size == 0:
+            print(f"note: {s.path.name} adds nothing, "
+                  "every stamp in it is already covered by an earlier file")
+            continue
+        times.append(s.times[rows])
+        src_of.append(np.full(rows.size, i, dtype="int64"))
+        row_of.append(rows.astype("int64"))
+    return (np.concatenate(times), np.concatenate(src_of), np.concatenate(row_of))
+
+
+def check_joined(times: np.ndarray, src_of: np.ndarray, sources: list[Source]) -> float:
+    """The step of the joined axis, or an error pointing at the file boundary.
+
+    `uniform_step` would catch a gap on its own, but it can only say that the
+    steps disagree. With several files the useful half of the answer is *which*
+    ones, since the fix is usually a missing download rather than anything about
+    the data.
+    """
+    if len(sources) == 1:
+        return uniform_step(times, "time", tol=0.0)
+    steps = np.diff(times)
+    if steps.min() != steps.max():
+        bad = int(np.argmax(np.abs(steps - np.median(steps))))
+        left, right = sources[int(src_of[bad])], sources[int(src_of[bad + 1])]
+        gap = f"{fmt_time(np.datetime64(int(times[bad]), 's'))} .. " \
+              f"{fmt_time(np.datetime64(int(times[bad + 1]), 's'))}"
+        raise SystemExit(
+            f"the joined time axis is not uniform: steps span "
+            f"{steps.min() / 3600:g}..{steps.max() / 3600:g} h, the worst at {gap} "
+            f"({left.path.name} -> {right.path.name}). The npz format addresses time "
+            "as t0 + i*dt, so a hole cannot be represented -- fetch the missing "
+            "span, or extract each run separately with --start/--end"
+        )
+    return float(steps[0])
+
+
+def same_source_runs(src: np.ndarray):
+    """[a, b) ranges over which `src` does not change."""
+    if src.size == 0:
+        return
+    edges = [0, *(np.flatnonzero(np.diff(src)) + 1).tolist(), src.size]
+    for a, b in zip(edges, edges[1:]):
+        yield a, b
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("nc", help="source NetCDF4 file")
-    p.add_argument("var", nargs="?", help="field to extract; see --list")
-    p.add_argument("npz", nargs="?", help="output .npz")
+    # One list, split by hand below. argparse cannot do "many sources then two
+    # more things": a greedy nargs='+' followed by optional positionals simply
+    # eats them, and making them required would break --list, which takes
+    # sources alone.
+    p.add_argument("rest", nargs="+", metavar="NC [NC ...] VAR NPZ",
+                   help="source NetCDF4 files, or directories of them, then the "
+                        "field to extract and the output .npz. Several sources "
+                        "are joined along time, ordered by their own first stamp. "
+                        "With --list, the sources alone")
     p.add_argument("--list", action="store_true",
-                   help="show every field in the file and exit")
+                   help="show every field in the first file and exit")
 
     sel = add_selection_args(p)
     sel.add_argument("--at", action="append", default=[], metavar="DIM=INDEX",
@@ -362,49 +610,40 @@ def main() -> None:
     if args.frames and (args.start or args.end):
         raise SystemExit("choose either --frames or --start/--end, not both")
 
-    src = Path(args.nc)
-    if not src.exists():
-        raise SystemExit(f"no such file: {src}")
-
-    try:
-        f = h5py.File(src, "r")
-    except OSError as exc:
+    if args.list:
+        args.var = args.npz = None
+        paths = collect_paths(args.rest)
+    elif len(args.rest) < 3:
         raise SystemExit(
-            f"{src} is not readable as HDF5 ({exc}). NetCDF *3* files are a different "
-            "format entirely and this tool cannot open them; convert with "
-            "`nccopy -k nc4 in.nc out.nc` first."
+            "give one or more sources, then a field and an output path:\n"
+            "  netcdf4_npz.py raw_data/ uo current.npz --at depth=0\n"
+            "or --list with the sources alone to see what is available"
         )
-
-    fields = find_fields(f)
-    if not fields:
-        raise SystemExit(f"no (time, lat, lon) field found in {src}")
+    else:
+        *given, args.var, args.npz = args.rest
+        paths = collect_paths(given)
 
     if args.list:
-        list_fields(src, f, fields)
+        # The fields of the first file. The rest are only checked against it once
+        # a field has been named, and listing them all would repeat one table.
+        head = open_hdf5(paths[0])
+        fields = find_fields(head)
+        if not fields:
+            raise SystemExit(f"no (time, lat, lon) field found in {paths[0]}")
+        list_fields(paths[0], head, fields)
+        if len(paths) > 1:
+            print(f"  {len(paths)} files given; the other {len(paths) - 1} are "
+                  "checked against this one and joined along time\n")
         return
-    if not args.var or not args.npz:
-        raise SystemExit(
-            "give a field and an output path, or --list to see what is available\n"
-            f"  fields in this file: {', '.join(sorted(fields))}"
-        )
-    if args.var not in fields:
-        raise SystemExit(
-            f"{args.var!r} is not in this file.\n"
-            f"  available: {', '.join(sorted(fields))}"
-        )
 
-    dset, names = fields[args.var]
+    sources = order_sources([open_source(path, args.var) for path in paths])
+    check_compatible(sources, args.var)
+    head = sources[0]
+    f, dset, names = head.f, head.dset, head.names
     t_axis = axis_of(names, T_NAMES)
     y_axis = axis_of(names, Y_NAMES)
     x_axis = axis_of(names, X_NAMES)
     units = text(dset, "units")
-
-    for dim in (names[t_axis], names[y_axis], names[x_axis]):
-        if dim not in f:
-            raise SystemExit(
-                f"dimension {dim!r} has no coordinate variable in this file, so its "
-                "axis values are unknown and the grid cannot be described"
-            )
 
     # Whether the two accumulation conversions apply. Deciding once, here, keeps
     # the unit change and the time shift from drifting apart -- they describe the
@@ -442,11 +681,12 @@ def main() -> None:
         )
 
     # --- time selection ---------------------------------------------------
-    tvar = f[names[t_axis]]
-    all_times = decode_time(tvar[:], text(tvar, "units"), text(tvar, "calendar"))
+    # One axis across every file, with the frame -> (file, row) map that the read
+    # below walks. Both are over the *joined* source, before any selection.
+    all_times, src_of, row_of = join_time(sources)
     # Accumulation length comes from the *source* spacing, before any striding:
     # each frame still covers one model step no matter how many we keep.
-    step_s = uniform_step(all_times, "time", tol=0.0)
+    step_s = check_joined(all_times, src_of, sources)
 
     if args.frames:
         lo, hi = parse_frames(args.frames, all_times.size)
@@ -535,7 +775,16 @@ def main() -> None:
                          max_mib=args.max_mib, batch_mib=args.batch_mib)
     level = 0 if args.no_compress else args.compress_level
 
-    print(f"\n{src}")
+    if len(sources) == 1:
+        print(f"\n{head.path}")
+    else:
+        # In the order they are read, which is by time and not as given.
+        print(f"\n{len(sources)} files, joined along time:")
+        for s in sources:
+            print(f"    {s.path}  "
+                  f"{fmt_time(np.datetime64(int(s.times[0]), 's'))} .. "
+                  f"{fmt_time(np.datetime64(int(s.times[-1]), 's'))}  "
+                  f"({s.times.size} frames)")
     print(f"  field       {args.var}  "
           f"({text(dset, 'long_name') or text(dset, 'standard_name') or '?'}) "
           f"[{units or '?'}]" + (f" -> [{out_units}]" if convert else ""))
@@ -556,13 +805,12 @@ def main() -> None:
     # ~36 GB as float32, so materialising it just to rescale it is out of the
     # question.
     #
-    # `source` is the read the whole selection reduces to -- a slice per axis,
-    # an integer for each collapsed dim -- built once because it is the same
-    # every batch but the time bounds. HDF5 walks it in one pass.
-    scale_factor = number(dset, "scale_factor")
-    add_offset = number(dset, "add_offset")
-    fill_raw = number(dset, "_FillValue", dtype=dset.dtype)
-    missing_raw = number(dset, "missing_value", dtype=dset.dtype)
+    # Which file each selected frame lives in, and which of its rows. A batch is
+    # cut on those boundaries and no finer: a run inside one file is still the
+    # single strided read it was before, so joining costs one extra read per
+    # boundary crossed and nothing per frame.
+    sel_src = src_of[t_sel]
+    sel_row = row_of[t_sel]
 
     # Where (time, lat, lon) end up once the collapsed dims are gone, so a file
     # that stores its axes in another order is transposed back rather than read
@@ -572,31 +820,24 @@ def main() -> None:
 
     def read(lo: int, hi: int) -> np.ndarray:
         """Frames [lo, hi) as a writable float32 cube, unpacked, fill -> NaN."""
-        source = [slice(None)] * dset.ndim
-        source[y_axis], source[x_axis] = y_sel, x_sel
-        # lo/hi count frames of the *selection*; the file is strided, so they are
-        # mapped back onto source rows before the read.
-        source[t_axis] = slice(t_sel.start + lo * args.stride,
-                               t_sel.start + hi * args.stride, args.stride)
-        for axis, index in extra.items():
-            source[axis] = index
-        raw = dset[tuple(source)]
-        if order != (0, 1, 2):
-            raw = np.transpose(raw, order)
-
-        cube = raw.astype("float32")
-        # Sentinels are matched against the raw values, before unpacking: that is
-        # what CF specifies, and it is the only point where the comparison is
-        # exact. A NaN sentinel needs no test -- it is already NaN in the cast.
-        for sentinel in (fill_raw, missing_raw):
-            if sentinel is not None and not (sentinel.dtype.kind == "f"
-                                             and np.isnan(sentinel)):
-                cube[raw == sentinel] = np.nan
-        if scale_factor is not None:
-            cube *= np.float32(scale_factor)
-        if add_offset is not None:
-            cube += np.float32(add_offset)
-        return cube[:, ::-1, :] if flip_lat else cube
+        cube = np.empty((hi - lo, grid.nlat, grid.nlon), dtype="float32")
+        for a, b in same_source_runs(sel_src[lo:hi]):
+            s = sources[int(sel_src[lo + a])]
+            rows = sel_row[lo + a:lo + b]
+            source = [slice(None)] * s.dset.ndim
+            source[y_axis], source[x_axis] = y_sel, x_sel
+            # Rows within one file are the selection's stride apart, so the run
+            # is a slice rather than a fancy index -- HDF5 satisfies it in one
+            # pass, where a list of indices would be a gather.
+            source[t_axis] = slice(int(rows[0]), int(rows[-1]) + 1, args.stride)
+            for axis, index in extra.items():
+                source[axis] = index
+            raw = s.dset[tuple(source)]
+            if order != (0, 1, 2):
+                raw = np.transpose(raw, order)
+            block = s.decode(raw)
+            cube[a:b] = block[:, ::-1, :] if flip_lat else block
+        return cube
 
     write_field(Path(args.npz), read, grid, layout,
                 level=level, writers=args.writers,

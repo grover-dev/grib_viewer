@@ -61,8 +61,11 @@ defaults:
   # Written by scripts/netcdf4_npz.py from a CMEMS physics product, one
   # directory per component:
   #   mkdir -p data/current_u data/current_v
-  #   netcdf4_npz.py <file>.nc uo data/current_u/uo.npz --at depth=0
-  #   netcdf4_npz.py <file>.nc vo data/current_v/vo.npz --at depth=0
+  #   netcdf4_npz.py raw_data/ uo data/current_u/uo.npz --at depth=0
+  #   netcdf4_npz.py raw_data/ vo data/current_v/vo.npz --at depth=0
+  # The source can be one .nc, several, or a directory of them: a product
+  # downloaded a month at a time is joined along time into one field, provided
+  # the months leave no gap.
   # Each writes uo.000.npz, uo.001.npz, ... into its directory once the cube
   # passes --max-mib, and a selection small enough not to split leaves a single
   # npz there, which loads the same way. --at depth=0 takes the shallowest
@@ -113,8 +116,8 @@ runs:
   # Six departures, one a day apart, starting at noon on 2 January -- which is
   # the shape of a start-day study: same route, same boat, different weather.
   # Writes jan_00.npz .. jan_05.npz.
-  - name: jan
-    start_time: 2025-01-01T12:00:00Z
+  - name: feb
+    start_time: 2025-02-01T12:00:00Z
     count: 20
     every: 1d
 
