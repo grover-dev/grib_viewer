@@ -22,7 +22,7 @@ out_directory: ../out
 # field rather than across all of them -- three split fields at 2 is six parts
 # resident, not two. Ignored by a field that is a single npz: there is nothing
 # to evict.
-field_cache_parts: 2
+field_cache_parts: 4
 
 # Applied to every run below. A run repeating one of these keys overrides it
 # for itself, so a sweep only has to write the field that varies -- which for a
@@ -85,7 +85,7 @@ defaults:
 
   start: { lat: -58, lon: -72.0 }
   # ...to further off the coast of spain.
-  end: { lat: -58.0, lon: -55.0 }
+  end: { lat: -58.0, lon: -27.0 }
 
   # Steps of blackboard::time_step (1 h) before a run gives up.
   max_steps: 1000
@@ -115,7 +115,7 @@ runs:
   # Writes jan_00.npz .. jan_05.npz.
   - name: jan
     start_time: 2025-01-01T12:00:00Z
-    count: 1
+    count: 20
     every: 1d
 
   # Twice a day for three days, from the same departure. Overlaps the sweep

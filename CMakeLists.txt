@@ -53,7 +53,29 @@ add_library(boatforge::options ALIAS boatforge_options)
 target_compile_options(boatforge_options INTERFACE
     -march=x86-64-v2
     -Wall -Wextra -Wpedantic
+
+    # Release optimisation. CMake's own Release flags are already -O3 -DNDEBUG
+    # on GCC, but stating it here means the level is a property of the repo
+    # rather than of whichever CMake default happens to be in play.
+    #
+    # -fno-math-errno lets GCC inline sqrt and friends as single instructions
+    # instead of calls that have to set errno; nothing here reads errno after
+    # a maths call. It is the one piece of -ffast-math that costs no accuracy:
+    # the rest (reassociation, finite-math-only) is deliberately left off,
+    # since great-circle and interpolation code wants IEEE semantics.
+    $<$<CONFIG:Release>:-O3;-fno-math-errno;-fno-semantic-interposition>
 )
+
+# Link-time optimisation for Release, so inlining crosses the npy_tools /
+# boatforge boundary. Checked rather than assumed: a toolchain without a
+# working LTO plugin should warn, not fail to link.
+include(CheckIPOSupported)
+check_ipo_supported(RESULT boatforge_ipo_supported OUTPUT boatforge_ipo_error)
+if(boatforge_ipo_supported)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+else()
+    message(WARNING "LTO unavailable, building Release without it: ${boatforge_ipo_error}")
+endif()
 
 add_subdirectory(npy_tools)
 add_subdirectory(include)

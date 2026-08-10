@@ -132,6 +132,12 @@ public:
             }
         }
 
+        static uint32_t count = 0;
+        if (count % 10 == 0)
+        {
+            std::println("Completed run {}", count++);
+        }
+        count++;
         return running;
     }
 

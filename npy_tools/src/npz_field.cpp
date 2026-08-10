@@ -4,6 +4,7 @@
 #include <cmath>
 #include <format>
 #include <limits>
+#include <print>
 #include <string_view>
 #include <utility>
 
@@ -298,6 +299,7 @@ void NpzField::make_active(std::size_t index) const
     if (cache_.size() < cache_limit_)
     {
         active_ = cache_.size();
+        std::println(stderr, "npz_field: slot {}/{} <- {} (loaded)", active_, cache_limit_, part.path.string());
         cache_.push_back(std::move(loaded));
     }
     else
@@ -306,6 +308,8 @@ void NpzField::make_active(std::size_t index) const
         // assignment, so peak memory is the limit plus the part being read, not
         // the limit doubled.
         active_ = next_slot_;
+        std::println(stderr, "npz_field: slot {}/{} <- {} (evicting {})", active_, cache_limit_, part.path.string(),
+                     parts_[cache_[next_slot_].part].path.string());
         cache_[next_slot_] = std::move(loaded);
     }
     next_slot_ = (active_ + 1) % cache_limit_;
